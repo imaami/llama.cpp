@@ -399,6 +399,14 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
+        // optional path to a per-layer K-cache mean-centering bias file (GGUF), or NULL to disable.
+        // the bias is subtracted from the K vector for each (kv-head, channel) right before it is
+        // written into the K cache, which improves quantization fidelity for GGML_TYPE_Q4_0 without
+        // changing attention results (the same constant is added to every logit in a query's row,
+        // which softmax is invariant to). currently only supported when type_k == GGML_TYPE_Q4_0.
+        // see tools/kv-mean-center to generate this file and docs/kv-mean-center.md for details.
+        const char * path_kv_mean_center;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
