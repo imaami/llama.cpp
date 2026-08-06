@@ -254,6 +254,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
 
     llama_build(test-fusion.cpp)
+    llama_build_and_test(test-kv-mean-center.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
