@@ -9,7 +9,9 @@
 
 bool common_kv_mean_center_write(
         const std::string & fname,
-        const std::vector<common_kv_mean_center_layer> & layers) {
+        const std::vector<common_kv_mean_center_layer> & layers,
+        bool k_rot,
+        uint32_t n_rot_k) {
     size_t n_with_bias = 0;
     for (const auto & layer : layers) {
         if (!layer.bias.empty()) {
@@ -46,6 +48,10 @@ bool common_kv_mean_center_write(
     }
 
     gguf_set_val_str(ctx_gguf, "general.type", "kv-mean-center");
+    gguf_set_val_bool(ctx_gguf, "kv_mean_center.k_rot", k_rot);
+    if (n_rot_k > 0 || !k_rot) {
+        gguf_set_val_u32(ctx_gguf, "kv_mean_center.n_rot_k", n_rot_k);
+    }
 
     for (const auto & layer : layers) {
         if (layer.bias.empty()) {

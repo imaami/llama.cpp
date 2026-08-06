@@ -129,13 +129,12 @@ static std::vector<llama_token> make_tokens(uint32_t n_tokens, uint32_t n_vocab,
 static std::vector<float> decode_and_get_logits(llama_context * ctx, const std::vector<llama_token> & tokens) {
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
 
-    llama_batch batch = llama_batch_init((int32_t) tokens.size(), 0, 1);
+    common_batch batch(ctx);
     for (size_t i = 0; i < tokens.size(); i++) {
-        common_batch_add(batch, tokens[i], (llama_pos) i, { 0 }, true);
+        batch.add(tokens[i], (llama_pos) i, { 0 }, true);
     }
 
-    if (llama_decode(ctx, batch)) {
-        llama_batch_free(batch);
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         throw std::runtime_error("llama_decode failed");
     }
 
@@ -145,8 +144,6 @@ static std::vector<float> decode_and_get_logits(llama_context * ctx, const std::
         const float * li = llama_get_logits_ith(ctx, (int32_t) i);
         logits.insert(logits.end(), li, li + n_vocab);
     }
-
-    llama_batch_free(batch);
 
     return logits;
 }
@@ -229,14 +226,26 @@ static void test_q4_0_gate() {
         layers.push_back(std::move(layer));
     }
 
+    // this synthetic model has a 64-wide K head, so a Q4_0 K cache activates the Hadamard
+    // rotation; the bias must be marked as measured in the rotated basis to be accepted there
     const std::string tmp_path = "test-kv-mean-center-gate.gguf";
-    TEST_ASSERT(common_kv_mean_center_write(tmp_path, layers));
+    TEST_ASSERT(common_kv_mean_center_write(tmp_path, layers, /*k_rot=*/true));
 
     // F16 K cache + --kv-mean-center must be rejected outright (llama_init_from_model returns
     // nullptr), matching this codebase's convention for other cache-type-gated mismatches (e.g.
-    // "V cache quantization requires flash_attn")
-    llama_context_ptr ctx_bad = build_context(model.get(), GGML_TYPE_F16, tmp_path.c_str());
+    // "V cache quantization requires flash_attn"). use a basis-matching file (F16 cache means
+    // the rotation is off, so k_rot=false matches) so this exercises the cache-type gate
+    // specifically, not the basis check
+    const std::string tmp_path_unrot = "test-kv-mean-center-gate-unrot.gguf";
+    TEST_ASSERT(common_kv_mean_center_write(tmp_path_unrot, layers, /*k_rot=*/false));
+    llama_context_ptr ctx_bad = build_context(model.get(), GGML_TYPE_F16, tmp_path_unrot.c_str());
     TEST_ASSERT(ctx_bad == nullptr);
+
+    // a bias measured in the unrotated basis must be rejected by a rotated (Q4_0) K cache:
+    // a basis mismatch degrades quantization quality instead of improving it
+    llama_context_ptr ctx_mismatch = build_context(model.get(), GGML_TYPE_Q4_0, tmp_path_unrot.c_str());
+    TEST_ASSERT(ctx_mismatch == nullptr);
+    remove(tmp_path_unrot.c_str());
 
     // Q4_0 K cache + --kv-mean-center must succeed end-to-end, through the real public entry
     // point (not the require_q4_0=false test seam used in test_softmax_invariance)

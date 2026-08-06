@@ -29,6 +29,9 @@ public:
 
     std::vector<common_kv_mean_center_layer> finalize() const;
 
+    bool saw_k_rot() const { return m_n_rot_k > 0; }
+    uint32_t n_rot_k() const { return m_n_rot_k; }
+
 private:
     std::mutex m_mutex;
     std::vector<uint8_t> m_host_buf;
@@ -36,7 +39,34 @@ private:
 
     std::unordered_map<int32_t, std::vector<double>> m_sum;   // il -> [n_embd_head * n_head]
     std::unordered_map<int32_t, int64_t>              m_count; // il -> total tokens seen
+
+    // whether the captured K tensors were produced with the Hadamard K-cache rotation
+    // active, detected from the graph itself: the rotation is a mul_mat against the
+    // "attn_inp_k_rot" input, so it shows up in the ancestry of "k_cache_in-<il>".
+    // recorded in the output file so the loader can reject a basis mismatch.
+    uint32_t m_n_rot_k = 0;
 };
+
+// look for the "attn_inp_k_rot" input within a few links of the captured tensor. matched as a
+// substring: views append a suffix ("attn_inp_k_rot (reshaped)") and the backend scheduler
+// decorates split inputs with a backend prefix and split index ("MTL0#attn_inp_k_rot#0")
+static uint32_t tensor_k_rot_size(const struct ggml_tensor * t, int depth = 8) {
+    if (t == nullptr || depth < 0) {
+        return 0;
+    }
+    if (strstr(t->name, "attn_inp_k_rot") != nullptr) {
+        if (t->ne[0] == t->ne[1]) {
+            return (uint32_t) t->ne[0];
+        }
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const uint32_t size = tensor_k_rot_size(t->src[i], depth - 1);
+        if (size > 0) {
+            return size;
+        }
+    }
+    return 0;
+}
 
 // "k_cache_in-<il>" -> il, as formatted by llm_graph_context::cb() (ggml_format_name("%s-%d", ...))
 static bool parse_k_cache_in_layer(const char * name, int32_t & il) {
@@ -69,6 +99,10 @@ bool kv_mean_collector::collect(struct ggml_tensor * t, bool ask) {
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_n_rot_k == 0) {
+        m_n_rot_k = tensor_k_rot_size(t);
+    }
 
     // cpy_k() can be fed an F32, F16, or BF16 Kcur depending on backend/compute settings.
     GGML_ASSERT(t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16);
@@ -227,7 +261,7 @@ int main(int argc, char ** argv) {
 
     LOG_INF("%s: collecting K-cache statistics over %d chunk(s) of %d tokens\n", __func__, n_chunk, n_ctx);
 
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
 
     for (int i = 0; i < n_chunk; ++i) {
         const int start = i*n_ctx;
@@ -238,22 +272,19 @@ int main(int argc, char ** argv) {
         for (int j = 0; j < n_ctx; j += n_batch) {
             const int n_tok = std::min(n_batch, n_ctx - j);
 
-            common_batch_clear(batch);
+            batch.clear();
             for (int k = 0; k < n_tok; ++k) {
-                common_batch_add(batch, tokens[start + j + k], j + k, { 0 }, false);
+                batch.add(tokens[start + j + k], j + k, 0, false);
             }
 
-            if (llama_decode(ctx, batch)) {
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
                 LOG_ERR("%s: failed to decode chunk %d\n", __func__, i);
-                llama_batch_free(batch);
                 return 1;
             }
         }
 
         LOG_INF("%s: processed chunk %d / %d\n", __func__, i + 1, n_chunk);
     }
-
-    llama_batch_free(batch);
 
     auto layers = g_collector.finalize();
     if (layers.empty()) {
@@ -262,12 +293,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!common_kv_mean_center_write(params.out_file, layers)) {
+    if (!common_kv_mean_center_write(params.out_file, layers, g_collector.saw_k_rot(), g_collector.n_rot_k())) {
         return 1;
     }
 
-    LOG_INF("%s: wrote K-cache mean-centering bias for %zu layer(s) to %s\n",
-            __func__, layers.size(), params.out_file.c_str());
+    LOG_INF("%s: wrote K-cache mean-centering bias for %zu layer(s) to %s (measured with K rotation %s)\n",
+            __func__, layers.size(), params.out_file.c_str(), g_collector.saw_k_rot() ? "active" : "inactive");
 
     llama_backend_free();
 
