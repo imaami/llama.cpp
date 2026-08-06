@@ -101,6 +101,8 @@ typedef sycl::half2 ggml_half2;
 
 #define QI_PTQ1_0 (QK_PTQ1_0 / 32)
 #define QR_PTQ1_0 1
+#define QI_PQ2_0 (QK_PQ2_0 / 32)
+#define QR_PQ2_0 1
 
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -193,6 +195,16 @@ typedef struct {
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+// PQ2_0: Prism-private Q2_0 at group size 128. Same 2-bit codec as Q2_0
+// (group 64) but one fp16 scale per 128 weights (~5% smaller). Distinct ggml
+// type (142) so it coexists with upstream's group-64 Q2_0 (type 42).
+#define QK_PQ2_0 128
+typedef struct {
+    ggml_half d;                   // delta (scale)
+    uint8_t qs[QK_PQ2_0 / 4];    // 2 bits per element
+} block_pq2_0;
+static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {
