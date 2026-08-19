@@ -8054,6 +8054,7 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
         }, pc, { (uint32_t)ne03, (uint32_t)ne01, (uint32_t)ne12 });
 }
 
+// keep in sync with the width list in ggml_vk_load_shaders and GGML_VK_FWHT_NUM_SIZES
 static int ggml_vk_fwht_pipeline_idx(int64_t n) {
     switch (n) {
         case 64:  return 0;
