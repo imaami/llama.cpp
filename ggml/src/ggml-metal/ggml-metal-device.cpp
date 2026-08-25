@@ -1073,6 +1073,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nsg = N_SG_Q2_0;
                 nr0 = N_R0_Q2_0;
             } break;
+        case GGML_TYPE_PQ2_0:
+            {
+                nsg = N_SG_PQ2_0;
+                nr0 = N_R0_PQ2_0;
+            } break;
         case GGML_TYPE_Q4_0:
             {
                 nsg = N_SG_Q4_0;
@@ -1367,6 +1372,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q2_0;
                 nr0 = N_R0_Q2_0;
+            } break;
+        case GGML_TYPE_PQ2_0:
+            {
+                nsg = N_SG_PQ2_0;
+                nr0 = N_R0_PQ2_0;
             } break;
         case GGML_TYPE_Q4_0:
             {
