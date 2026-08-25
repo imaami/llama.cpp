@@ -316,6 +316,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // fill the input tensors from the given recurrent context. The hybrid
+    // input wrappers own an inner llm_graph_input_rs but track the current
+    // memory context themselves, so they pass it in explicitly.
+    void set_input_rs(const llama_memory_recurrent_context * mctx_cur, const llama_ubatch * ubatch);
+    bool can_reuse_rs(const llama_memory_recurrent_context * mctx_cur, const llm_graph_params & params);
+
     ggml_tensor * s_copy;  // I32 [n_rs]
 
     // views of s_copy, computed once per graph

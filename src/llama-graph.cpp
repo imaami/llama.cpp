@@ -535,7 +535,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
+            data[i] = mctx_cur->s_copy(i);
         }
     }
 
@@ -573,16 +573,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
-    bool res = true;
-
-    res &= s_copy->ne[0] == mctx->get_n_rs();
-
-    res &= s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= head == mctx->get_head();
-    res &= rs_z == mctx->get_rs_z();
-
-    return res;
+    return can_reuse_rs(mctx, params);
 }
 
 void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
@@ -1303,12 +1294,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
     return res;
 }
@@ -1350,12 +1336,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
     return res;
 }
@@ -1510,12 +1491,7 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_rs(mctx->get_recr(), params);
 
     return res;
 }
