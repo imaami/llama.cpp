@@ -494,6 +494,11 @@ static bool htp_kparams_solve_gated_delta_net(
         return false;
     }
 
+    // rows-indexed state read (src[6]) not implemented here
+    if (op->src[6] != NULL) {
+        return false;
+    }
+
     memset(kparams, 0, sizeof(*kparams));
 
     const struct ggml_tensor * q     = op->src[0];
