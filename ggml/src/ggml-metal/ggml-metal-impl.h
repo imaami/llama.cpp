@@ -136,6 +136,7 @@
 #define FC_LIGHTNING_INDEXER           2200
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
+#define FC_GATED_DELTA_NET_WRITE_ROWS  (FC_GATED_DELTA_NET + 4)
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
