@@ -716,6 +716,12 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
+    // dspark GIDD log-SNR conditioning (only when hparams.dspark_log_snr_conditioning)
+    struct ggml_tensor * dspark_log_snr_fc1_w = nullptr; // [128 -> n_embd]
+    struct ggml_tensor * dspark_log_snr_fc1_b = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc2_w = nullptr; // [n_embd -> n_embd]
+    struct ggml_tensor * dspark_log_snr_fc2_b = nullptr;
+
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
