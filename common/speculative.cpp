@@ -1047,6 +1047,19 @@ protected:
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
         GGML_ASSERT(target_layer_ids_n > 0 && "DFlash model has no target_layer_ids");
 
+        // Both lineages declare general.architecture = dflash, so the requested type cannot
+        // pick the draft path. The Markov head is the on-disk marker and is already loaded.
+        is_dspark = llama_model_has_dspark_markov_head(model_dft);
+        const bool type_says_dspark = (type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+        if (type_says_dspark != is_dspark) {
+            LOG_WRN("%s: draft model carries %s, but --spec-type requested %s. Using %s, which is "
+                    "what the model needs. The wrong path drops confidence truncation, and for "
+                    "sample_from_anchor models it also reads the drafts one row late.\n", __func__,
+                    is_dspark ? "a DSpark Markov head" : "no DSpark Markov head",
+                    common_speculative_type_to_str(type).c_str(),
+                    is_dspark ? "DSpark" : "DFlash");
+        }
+
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
