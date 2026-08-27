@@ -3963,6 +3963,10 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
     }
 }
 
+bool llama_model_has_dspark_markov_head(const struct llama_model * model) {
+    return model->dspark_markov_w1 != nullptr;
+}
+
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
     if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
         return 0;
