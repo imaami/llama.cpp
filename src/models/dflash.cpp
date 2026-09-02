@@ -60,6 +60,18 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
 
+    // AngelSpec DFly fuses the target context once per DRAFT layer, so the encoder emits
+    // [n_embd, n_layer] per token instead of a single [n_embd] row. Detected from the fusion
+    // tensor rather than a KV so a DFly export cannot load as plain DFlash.
+    if (ml.get_tensor_meta("layer_fusion")) {
+        // both ends must widen: a dflash draft context is not MTP-typed, so it sizes its embd batch
+        // from n_embd_inp, and setting only n_embd_out gives the graph one layer's context plus junk
+        hparams.n_embd_out_impl = hparams.n_layer() * hparams.n_embd;
+        hparams.n_embd_inp_impl = hparams.n_layer() * hparams.n_embd;
+        LLAMA_LOG_INFO("%s: DFly per-layer context fusion (n_layer = %u, n_embd_out = %u)\n",
+                __func__, hparams.n_layer(), hparams.n_embd_out());
+    }
+
     // dspark GIDD log-SNR conditioning (drafters trained with the GIDD bundle);
     // absent on every other drafter, so it must default off
     ml.get_key(LLM_KV_LOG_SNR_CONDITIONING, hparams.dspark_log_snr_conditioning, false);
@@ -229,11 +241,44 @@ template <>
 llama_model_dflash::graph<true>::graph(const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
 
-    cur = build_lora_mm(model.fc, cur, model.fc_s);
+    ggml_tensor * cur = build_lora_mm(model.fc, inp, model.fc_s);
     cb(cur, "fc_out", -1);
 
-    cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
-    cb(cur, "enc_norm_out", -1);
+    if (model.dfly_layer_fusion) {
+        // DFly: the shared projection is only the base context. Each draft layer adds its own
+        // softmax-weighted mix of the raw per-target-layer features, so the encoder emits one
+        // context per draft layer. Reference: Qwen3DFlyModel.project_target_hidden.
+        const int64_t n_feat = model.dfly_layer_fusion->ne[0];
+        const int64_t n_lyr  = model.dfly_layer_fusion->ne[1];
+
+        GGML_ASSERT(n_feat*n_embd == (int64_t) hparams.n_embd_inp_enc());
+        GGML_ASSERT(n_lyr == n_layer);
+
+        // softmax over each draft layer's n_feat mixing logits (torch: softmax(dim=-1) on [L, T])
+        ggml_tensor * probs = ggml_soft_max(ctx0, model.dfly_layer_fusion); // [n_feat, n_layer]
+
+        // [n_feat*n_embd, n_tokens] -> [n_feat, n_embd, n_tokens]: put the contracted axis first
+        ggml_tensor * feats = ggml_cont(ctx0, ggml_permute(ctx0,
+                    ggml_reshape_3d(ctx0, inp, n_embd, n_feat, n_tokens), 1, 0, 2, 3));
+
+        ggml_tensor * resid = ggml_mul_mat(ctx0, probs,
+                    ggml_reshape_2d(ctx0, feats, n_feat, n_embd*n_tokens)); // [n_layer, n_embd*n_tokens]
+
+        resid = ggml_cont(ctx0, ggml_permute(ctx0,
+                    ggml_reshape_3d(ctx0, resid, n_lyr, n_embd, n_tokens), 1, 0, 2, 3)); // [n_embd, n_layer, n_tokens]
+
+        // broadcast the base context across draft layers
+        cur = ggml_add(ctx0, resid, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens));
+        cur = build_norm(cur, model.dfly_ctx_norm, NULL, LLM_NORM_RMS, -1);
+
+        // flatten layer-major within each token: the host round-trips this as one
+        // n_embd_out()-wide row per token and the decoder views layer il back out of it
+        cur = ggml_reshape_2d(ctx0, cur, n_embd*n_lyr, n_tokens);
+        cb(cur, "dfly_ctx_out", -1);
+    } else {
+        cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+        cb(cur, "enc_norm_out", -1);
+    }
 
     ggml_set_output(cur);
     res->t_h_nextn = cur;
@@ -470,6 +515,12 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
     cb(inpL, "inp_noise_embd", -1);
+
+    // the DFly chain conditions position 1 on the block anchor's embedding; reuse the rows
+    // gathered here instead of re-fetching by id, so the chain never indexes the embedding
+    // table with the caller's id_last (which is -1 before the first commit, and which a
+    // build-time check cannot catch once graphs start being reused across batches)
+    ggml_tensor * inp_embd_raw = inpL;
 
     // dspark GIDD log-SNR conditioning (LogSnrEmbed): added to the draft noise
     // embedding before the layer loop, matching the training reference. The

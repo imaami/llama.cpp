@@ -65,6 +65,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "DeepseekV32ForCausalLM": "deepseek",
     "Xing4_0ForCausalLM": "xing",
     "DFlashDraftModel": "qwen",
+    "Qwen3DFlyModel": "qwen",
+    "Qwen3DSparkDFlareV2Model": "qwen",
     "DFlash2DraftModel": "qwen",
     "LiLiCorrDraftModel": "nemotron",
     "Qwen3DSparkModel": "qwen",
