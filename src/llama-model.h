@@ -722,6 +722,15 @@ struct llama_model {
     struct ggml_tensor * dspark_log_snr_fc2_w = nullptr; // [n_embd -> n_embd]
     struct ggml_tensor * dspark_log_snr_fc2_b = nullptr;
 
+    // AngelSpec DFly: per-draft-layer target-context fusion + TreeFlash predecessor correction.
+    // dfly_layer_fusion is the discriminant: present => DFly, absent => plain DFlash/DSpark.
+    struct ggml_tensor * dfly_layer_fusion  = nullptr; // [n_ctx_feat, n_layer] fusion logits
+    struct ggml_tensor * dfly_ctx_norm      = nullptr; // post-fusion context norm (replaces output_norm_enc)
+    struct ggml_tensor * dfly_hc_hidden_norm = nullptr;
+    struct ggml_tensor * dfly_hc_embed_norm  = nullptr;
+    struct ggml_tensor * dfly_hc_gate        = nullptr; // [2*n_embd, n_ff_hc]
+    struct ggml_tensor * dfly_hc_up          = nullptr; // [2*n_embd, n_ff_hc]
+    struct ggml_tensor * dfly_hc_down        = nullptr; // [n_ff_hc, n_embd]
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
