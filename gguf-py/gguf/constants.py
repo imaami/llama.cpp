@@ -1376,6 +1376,14 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_MASK_EMBD       = auto()  # per-slot mask embeddings
     ENGRAM_KV              = auto()
     ENGRAM_GATE            = auto()
+    # dfly
+    DFLY_LAYER_FUSION      = auto()  # per-draft-layer context mixing logits
+    DFLY_CTX_NORM          = auto()  # post-fusion context norm
+    DFLY_HC_HIDDEN_NORM    = auto()  # predecessor correction, hidden branch
+    DFLY_HC_EMBED_NORM     = auto()  # predecessor correction, embedding branch
+    DFLY_HC_GATE           = auto()
+    DFLY_HC_UP             = auto()
+    DFLY_HC_DOWN           = auto()
     DFLASH_ATTN_CONV_BASE  = auto()
     DFLASH_ATTN_CONV_PROJ  = auto()
     DFLASH_FFN_CONV_BASE   = auto()
@@ -2251,6 +2259,13 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HC_HEAD_UP:          "blk.{bid}.nextn.hc_head_up",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
+    MODEL_TENSOR.DFLY_LAYER_FUSION:         "layer_fusion",
+    MODEL_TENSOR.DFLY_CTX_NORM:             "context_norm",
+    MODEL_TENSOR.DFLY_HC_HIDDEN_NORM:       "hidden_correction.hidden_norm",
+    MODEL_TENSOR.DFLY_HC_EMBED_NORM:        "hidden_correction.embed_norm",
+    MODEL_TENSOR.DFLY_HC_GATE:              "hidden_correction.gate",
+    MODEL_TENSOR.DFLY_HC_UP:                "hidden_correction.up",
+    MODEL_TENSOR.DFLY_HC_DOWN:              "hidden_correction.down",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
     MODEL_TENSOR.DSPARK_JOINT_PROJ:         "joint_proj",
@@ -5913,6 +5928,13 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.D2T,
         # optional DSpark heads
         MODEL_TENSOR.DSPARK_MARKOV_W1,
+        MODEL_TENSOR.DFLY_LAYER_FUSION,
+        MODEL_TENSOR.DFLY_CTX_NORM,
+        MODEL_TENSOR.DFLY_HC_HIDDEN_NORM,
+        MODEL_TENSOR.DFLY_HC_EMBED_NORM,
+        MODEL_TENSOR.DFLY_HC_GATE,
+        MODEL_TENSOR.DFLY_HC_UP,
+        MODEL_TENSOR.DFLY_HC_DOWN,
         MODEL_TENSOR.DSPARK_MARKOV_W2,
         MODEL_TENSOR.DSPARK_CONF_PROJ,
         MODEL_TENSOR.DSPARK_JOINT_PROJ,
