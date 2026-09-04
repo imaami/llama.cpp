@@ -445,6 +445,21 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 1, FLOAT_TYPEV2((bits & 0x04u) != 0u ? d : -d, (bits & 0x08u) != 0u ? d : -d));
         store_a(col, k_pair + 2, FLOAT_TYPEV2((bits & 0x10u) != 0u ? d : -d, (bits & 0x20u) != 0u ? d : -d));
         store_a(col, k_pair + 3, FLOAT_TYPEV2((bits & 0x40u) != 0u ? d : -d, (bits & 0x80u) != 0u ? d : -d));
+    } else if (MmTypeA == GGML_TYPE_PTQ1_0) {
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+
+        const uint ib  = idx / 16;
+        const uint grp = idx & 0xfu;      // which 8-element group inside the block
+        const uint e0  = grp * 8u;
+
+        const float d = float(a_ptq1_0.data[ib].d);
+
+        const uint k_pair = row * mm_load_vec_a() / 2;
+        [[unroll]] for (uint l = 0; l < 4; ++l) {
+            store_a(col, k_pair + l, FLOAT_TYPEV2(
+                ptq1_0_trit(ib, 0u, e0 + 2u*l)      * d,
+                ptq1_0_trit(ib, 0u, e0 + 2u*l + 1u) * d));
+        }
     } else if (MmTypeA == GGML_TYPE_Q2_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 2;
