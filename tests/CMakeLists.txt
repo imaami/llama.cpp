@@ -355,6 +355,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-conv-1d.cpp LINK ggml)
     llama_build_and_test(test-gelu-quick.cpp LINK ggml)
     llama_build_and_test(test-pq2-row-shapes.cpp LINK ggml)
+    llama_build_and_test(test-ptq1_0-cuda-dot.cpp LINK ggml)
+    llama_build_and_test(test-ptq1_0-element-map.cpp LINK ggml)
 endif()
 
 # libmtmd
