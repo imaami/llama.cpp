@@ -50,6 +50,7 @@ const std::vector<std::string> type_names = {
     "f32",
     "f16",
     "q1_0",
+    "ptq1_0",
     "q2_0",
     "q4_0",
     "q4_1",
@@ -597,6 +598,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
     for (const auto& tname : type_names) {
         if (tname == "bf16") {
+            continue;
+        }
+        // PTQ1_0 uses the scalar or coopmat1 decoder.
+        if (coopmat2 && tname == "ptq1_0") {
             continue;
         }
 
