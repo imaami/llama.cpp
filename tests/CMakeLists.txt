@@ -395,6 +395,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-conv-1d.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-gelu-quick.cpp  LABEL "main behavior backend"  LINK ggml)
     llama_build_and_test(test-pq2-row-shapes.cpp  LABEL "main behavior"  LINK ggml)
+    llama_build_and_test(test-ptq1_0-cuda-dot.cpp  LABEL "main behavior"  LINK ggml)
+    llama_build_and_test(test-ptq1_0-element-map.cpp  LABEL "main behavior"  LINK ggml)
 endif()
 
 # libmtmd
