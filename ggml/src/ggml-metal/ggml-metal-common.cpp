@@ -5,6 +5,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -36,9 +38,14 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
 
+    // Keep the Q1 multi-column decode path up to its measured break-even point.
+    // supports_op and dispatch share this predicate, including for F16 activations.
+    static const int q1_0_mv_max = getenv("GGML_METAL_Q1_0_MV_MAX") ? atoi(getenv("GGML_METAL_Q1_0_MV_MAX")) : 16;
+    const int ne11_mm_min = op->src[0]->type == GGML_TYPE_Q1_0 ? std::max(8, q1_0_mv_max) : 8;
+
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
-           has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
+           has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min;
 }
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
