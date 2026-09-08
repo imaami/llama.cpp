@@ -230,6 +230,59 @@ static __global__ void rms_norm_f32(const float * x,
 }
 
 template <int block_size>
+static __global__ void add_rms_norm_f32(
+        const float * a, const float * b, const float * weight, float * sum, float * dst,
+        const int ncols, const float eps) {
+    const int64_t row = (int64_t) blockIdx.z*gridDim.y*gridDim.x +
+                        (int64_t) blockIdx.y*gridDim.x + blockIdx.x;
+    const int tid = threadIdx.x;
+    a   += row*ncols;
+    b   += row*ncols;
+    sum += row*ncols;
+    dst += row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = __fadd_rn(a[col], b[col]);
+        sum[col] = xi;
+        tmp += xi*xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp/ncols + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale*sum[col]*weight[col];
+    }
+}
+
+template <int block_size>
+static __global__ void add_rms_norm_scale_f32(
+        const float * a, const float * b, float * sum, float * row_scale,
+        const int ncols, const float eps) {
+    const int64_t row = (int64_t) blockIdx.z*gridDim.y*gridDim.x +
+                        (int64_t) blockIdx.y*gridDim.x + blockIdx.x;
+    const int tid = threadIdx.x;
+    a   += row*ncols;
+    b   += row*ncols;
+    sum += row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = __fadd_rn(a[col], b[col]);
+        sum[col] = xi;
+        tmp += xi*xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    if (tid == 0) {
+        row_scale[row] = rsqrtf(tmp/ncols + eps);
+    }
+}
+
+template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
@@ -411,6 +464,20 @@ static void rms_norm_f32_dispatch(
     const float * x   = (const float *) x_t->data;
     const float * mul = mul_t ? (const float *) mul_t->data : nullptr;
     const float * add = add_t ? (const float *) add_t->data : nullptr;
+
+    // Keep the GB10 small-row specialization in the common dispatcher so it uses
+    // the same argument and template layout as the vectorized kernels.
+    if constexpr (!do_add) {
+        static const bool rms128_enabled = [] {
+            const char * env = getenv("GGML_CUDA_GB10_RMS128");
+            return !env || std::atoi(env) != 0;
+        }();
+        if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+                ncols <= 128 && rms128_enabled) {
+            RMS_NORM_LAUNCH(128, 1, false);
+            return;
+        }
+    }
 
     // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here
     bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
@@ -635,6 +702,71 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t s03 = nb03 / ts0;
 
     rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
+}
+
+void ggml_cuda_op_add_rms_norm_fused(
+        ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    GGML_ASSERT(a && b && rms_norm->src[0] == add && mul);
+    const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    GGML_ASSERT(mul->src[0] == rms_norm || mul->src[1] == rms_norm);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                add->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32 &&
+                weight->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, add) &&
+                ggml_are_same_shape(add, rms_norm) && ggml_are_same_shape(rms_norm, mul));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                ggml_is_contiguous(add) && ggml_is_contiguous(rms_norm) &&
+                ggml_is_contiguous(weight) && ggml_is_contiguous(mul));
+    GGML_ASSERT(weight->ne[0] == add->ne[0] && ggml_nrows(weight) == 1);
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = add->ne[0];
+    const dim3 grid(add->ne[1], add->ne[2], add->ne[3]);
+    cudaStream_t stream = ctx.stream();
+    if (ncols < 1024) {
+        add_rms_norm_f32<256><<<grid, 256, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (const float *) weight->data,
+            (float *) add->data, (float *) mul->data, ncols, eps);
+    } else {
+        add_rms_norm_f32<1024><<<grid, 1024, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (const float *) weight->data,
+            (float *) add->data, (float *) mul->data, ncols, eps);
+    }
+}
+
+void ggml_cuda_op_add_rms_norm_scale_fused(
+        ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, float * row_scale) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    GGML_ASSERT(a && b && rms_norm->src[0] == add && row_scale);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                add->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, add) &&
+                ggml_are_same_shape(add, rms_norm));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                ggml_is_contiguous(add));
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = add->ne[0];
+    const dim3 grid(add->ne[1], add->ne[2], add->ne[3]);
+    cudaStream_t stream = ctx.stream();
+    if (ncols < 1024) {
+        add_rms_norm_scale_f32<256><<<grid, 256, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (float *) add->data,
+            row_scale, ncols, eps);
+    } else {
+        add_rms_norm_scale_f32<1024><<<grid, 1024, 32*sizeof(float), stream>>>(
+            (const float *) a->data, (const float *) b->data, (float *) add->data,
+            row_scale, ncols, eps);
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
