@@ -125,6 +125,7 @@
 #define FC_MUL_MM                      700
 #define FC_ROPE                        800
 #define FC_SSM_CONV                    900
+#define FC_SSM_CONV_SILU               (FC_SSM_CONV + 1)
 #define FC_SOLVE_TRI                   1000
 #define FC_COUNT_EQUAL                 1100
 #define FC_UNARY                       1200
@@ -1340,6 +1341,7 @@ typedef struct {
 
 typedef struct {
     int32_t nrows;
+    int32_t n_blk; // sign rows per activation row (K / N); 0 = no sign flip fused in
 } ggml_metal_kargs_fwht;
 
 typedef struct {
