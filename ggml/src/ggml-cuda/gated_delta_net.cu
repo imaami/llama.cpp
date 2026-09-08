@@ -3,9 +3,16 @@
 
 constexpr int gdn_cols_per_warp = 4;
 
+static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n;
+         i += (int64_t) blockDim.x*gridDim.x) {
+        g_exp[i] = expf(g[i]);
+    }
+}
+
 // RAW: beta and g arrive pre-activation (ggml_gated_delta_net_set_raw_gates); the kernel applies
 // sigmoid(beta) and raw_a[h] * softplus(g + raw_dt_bias[h]) with the unary kernels' formulas
-template <int S_v, bool KDA, bool keep_rs_t, bool RAW, int cols_per_warp = gdn_cols_per_warp>
+template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, int cols_per_warp = gdn_cols_per_warp>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -98,12 +105,13 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
+            static_assert(!(RAW && G_PRECOMPUTED), "exp(g) precompute is only defined for activated gates");
             float g0 = *g_t;
             if constexpr (RAW) {
                 const float x = g0 + raw_dt_bias[h_idx];
                 g0 = raw_a[h_idx] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
             }
-            const float g_val = expf(g0);
+            const float g_val = G_PRECOMPUTED ? g0 : expf(g0);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -187,7 +195,7 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <bool KDA, bool keep_rs_t, bool RAW>
+template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * rb_d, const float * ra_d, const float * s_d,
@@ -218,26 +226,26 @@ static void launch_gated_delta_net(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
         case 16:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 32:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 64: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         }
         case 128: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
@@ -328,17 +336,36 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float * ra_d = raw ? (const float *) dst->src[8]->data : nullptr;
     GGML_ASSERT(!(raw && kda)); // raw gates are defined for the scalar gate only
 
-#define GDN_LAUNCH(KDA_, KEEP_, RAW_)                                                             \
-    launch_gated_delta_net<KDA_, KEEP_, RAW_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
+    // GB10 long-prompt path: exp(g) once per (token, head) instead of once per column-warp.
+    // Only for activated gates; with raw gates (#165) the activation happens inside the kernel.
+    ggml_cuda_pool_alloc<float> g_exp_alloc(ctx.pool());
+    bool g_precomputed = false;
+    if (!kda && !raw && S_v == 128 && n_tokens >= 32 &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK) {
+        const int64_t n_g = ggml_nelements(src_g);
+        g_exp_alloc.alloc(n_g);
+        const int block = 256;
+        const int grid = std::min<int64_t>((n_g + block - 1)/block, 4096);
+        gdn_precompute_exp<<<grid, block, 0, stream>>>(g_d, g_exp_alloc.ptr, n_g);
+        g_d = g_exp_alloc.ptr;
+        g_precomputed = true;
+    }
+
+#define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
+    launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \
         sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream)
 
     if (kda) {
-        if (keep_rs) { GDN_LAUNCH(true,  true,  false); } else { GDN_LAUNCH(true,  false, false); }
+        if (keep_rs) { GDN_LAUNCH(true,  true,  false, false); } else { GDN_LAUNCH(true,  false, false, false); }
     } else if (raw) {
-        if (keep_rs) { GDN_LAUNCH(false, true,  true);  } else { GDN_LAUNCH(false, false, true);  }
+        if (keep_rs) { GDN_LAUNCH(false, true,  true,  false); } else { GDN_LAUNCH(false, false, true,  false); }
     } else {
-        if (keep_rs) { GDN_LAUNCH(false, true,  false); } else { GDN_LAUNCH(false, false, false); }
+        if (g_precomputed) {
+            if (keep_rs) { GDN_LAUNCH(false, true,  false, true);  } else { GDN_LAUNCH(false, false, false, true);  }
+        } else {
+            if (keep_rs) { GDN_LAUNCH(false, true,  false, false); } else { GDN_LAUNCH(false, false, false, false); }
+        }
     }
 #undef GDN_LAUNCH
 }

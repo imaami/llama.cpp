@@ -140,12 +140,57 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     }
     return GGML_PREC_Q4;
 }
+struct ggml_cuda_mmq_launch_config {
+    int J;
+    size_t src1_padding;
+};
+
+static ggml_cuda_mmq_launch_config ggml_cuda_mmq_select_launch_config(
+        ggml_type type, bool fallback, int cc, size_t smpbo, int64_t ncols_opt, ggml_prec prec_src1) {
+    int J_best = 0;
+    int nthreads_best = 0;
+    int ntiles_J_best = INT_MAX;
+
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+        if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+
+        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            nthreads_best = config.nthreads;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    GGML_ASSERT(J_best > 0);
+
+    // A tile can read J - 1 extra columns. Round a full tile's padding up to
+    // the number of bytes that its threads can load in parallel.
+    const size_t load_chunk_size = nthreads_best * sizeof(int);
+    const size_t padding = ((J_best * sizeof(block_q8_1_mmq) + load_chunk_size - 1) / load_chunk_size)
+        * load_chunk_size;
+    return { J_best, padding };
+}
+
+static size_t ggml_cuda_mmq_q8_buffer_size(
+        size_t padding, int64_t ne10_padded, int64_t ne11, int64_t ne12, int64_t ne13) {
+    return ne13*ne12*ne11*ne10_padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ + padding;
+}
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst, const ggml_tensor * gate,
+        const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
+        void * external_q8, bool quantize_external, const float * external_norm_scale) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    GGML_ASSERT(!gate || (!ids && gate->type == GGML_TYPE_F32));
+    GGML_ASSERT((norm_weight == nullptr) == (norm_scale == nullptr && external_norm_scale == nullptr));
+    GGML_ASSERT(!norm_weight || (!ids && !gate && norm_weight->type == GGML_TYPE_F32 &&
+                ((norm_scale && norm_scale->type == GGML_TYPE_F32) || external_norm_scale)));
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -196,59 +241,32 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
-    int J_best        = 0;
-    int nthreads_best = 0;
-    {
-        int64_t ncols_opt = ne11;
-        if (ids) {
-            const int64_t n_expert_used = ids->ne[0];
-            ncols_opt = ne12;
+    int64_t ncols_opt = ne11;
+    if (ids) {
+        const int64_t n_expert_used = ids->ne[0];
+        ncols_opt = ne12;
 
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-            }
-        }
-
-        int ntiles_J_best = INT_MAX;
-
-        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
-            if (config.type == GGML_TYPE_COUNT) {
-                continue;
-            }
-
-            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-                continue;
-            }
-
-            const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
-
-            if (ntiles_x < ntiles_J_best) {
-                J_best = J;
-                nthreads_best = config.nthreads;
-                ntiles_J_best = ntiles_x;
-            }
+        // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+        // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
         }
     }
-    GGML_ASSERT(J_best > 0);
-
-    // A tile of size J can read in at most J - 1 extra columns.
-    // For simplicity, round up the padding of a full tile to a multiple of the number of bytes that nthreads can load in parallel.
-    const size_t src1_load_chunk_size = nthreads_best * sizeof(int);
-    const size_t src1_q8_1_padding = ((J_best * sizeof(block_q8_1_mmq) + src1_load_chunk_size - 1) / src1_load_chunk_size)
-        * src1_load_chunk_size;
+    const auto config = ggml_cuda_mmq_select_launch_config(src0->type, fallback, cc, smpbo, ncols_opt, prec_src1);
+    const int J_best = config.J;
+    const size_t src1_q8_1_padding = config.src1_padding;
 
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        const size_t nbytes_src1_q8_1 = ne13*ne12*ne11*ne10_padded*y_block_size/y_values_per_block + src1_q8_1_padding;
+        GGML_ASSERT(!external_q8 || (!gate && !use_native_fp4));
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        char * src1_q8_ptr = external_q8 ? (char *) external_q8 : src1_q8_1.alloc(nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        if (!external_q8 || quantize_external) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -256,12 +274,28 @@ void ggml_cuda_mul_mat_q(
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_ptr, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, stream);
+                if (norm_weight) {
+                    GGML_ASSERT(norm_weight->ne[0] == src1->ne[0] && ggml_nrows(norm_weight) == 1);
+                    GGML_ASSERT(ggml_is_contiguous(norm_weight));
+                    GGML_ASSERT(external_norm_scale || (ggml_is_contiguous(norm_scale) &&
+                                ggml_nelements(norm_scale) >= ggml_nrows(src1)));
+                    quantize_mmq_q8_1_rms_cuda(src1_d, (const float *) norm_weight->data,
+                                               external_norm_scale ? external_norm_scale : (const float *) norm_scale->data,
+                                               src1_q8_ptr, src0->type,
+                                               ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                } else if (gate) {
+                    GGML_ASSERT(ggml_are_same_shape(src1, gate));
+                    GGML_ASSERT(ggml_is_contiguous(gate));
+                    quantize_mmq_q8_1_swiglu_cuda(src1_d, (const float *) gate->data, src1_q8_ptr, src0->type,
+                                                  ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                } else {
+                    quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
+                                           ne11, ne12, ne13, stream);
+                }
             }
             CUDA_CHECK(cudaGetLastError());
         }
@@ -273,7 +307,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -360,6 +394,77 @@ void ggml_cuda_mul_mat_q(
         ne12, J_best};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+}
+
+size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor * src1) {
+    GGML_ASSERT(src0 && src1 && src1->type == GGML_TYPE_F32);
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+
+    // The external Q8 cache is shared by projections with the same activation
+    // and weight type, which can have different output-row fallback geometry.
+    const auto config = ggml_cuda_mmq_select_launch_config(src0->type, false, cc, smpbo, src1->ne[1], GGML_PREC_Q8);
+    const auto fallback_config = ggml_cuda_mmq_select_launch_config(src0->type, true, cc, smpbo, src1->ne[1], GGML_PREC_Q8);
+    return ggml_cuda_mmq_q8_buffer_size(std::max(config.src1_padding, fallback_config.src1_padding),
+        GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING), src1->ne[1], src1->ne[2], src1->ne[3]);
+}
+
+void ggml_cuda_mul_mat_q_fused_two(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0_a, const ggml_tensor * src0_b, const ggml_tensor * src1,
+        ggml_tensor * dst_a, ggml_tensor * dst_b,
+        const ggml_tensor * norm_weight, const float * norm_scale) {
+    GGML_ASSERT(src0_a && src0_b && src1 && dst_a && dst_b && norm_weight && norm_scale);
+    GGML_ASSERT(src0_a->type == src0_b->type && src1->type == GGML_TYPE_F32 &&
+                dst_a->type == GGML_TYPE_F32 && dst_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0_a->ne[0] == src1->ne[0] && src0_b->ne[0] == src1->ne[0]);
+    GGML_ASSERT(src0_a->ne[2] == src0_b->ne[2] && src0_a->ne[3] == src0_b->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous(src1) && ggml_is_contiguous(norm_weight));
+    GGML_ASSERT(norm_weight->type == GGML_TYPE_F32 && norm_weight->ne[0] == src1->ne[0] &&
+                ggml_nrows(norm_weight) == 1);
+
+    cudaStream_t stream = ctx.stream();
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const auto config_a = ggml_cuda_mmq_select_launch_config(src0_a->type,
+        ggml_cuda_mmq_needs_fallback(src0_a->ne[1]), cc, smpbo, ne11, GGML_PREC_Q8);
+    const auto config_b = ggml_cuda_mmq_select_launch_config(src0_b->type,
+        ggml_cuda_mmq_needs_fallback(src0_b->ne[1]), cc, smpbo, ne11, GGML_PREC_Q8);
+
+    const size_t nbytes_src1_q8_1 = ggml_cuda_mmq_q8_buffer_size(
+        std::max(config_a.src1_padding, config_b.src1_padding), ne10_padded, ne11, ne12, ne13);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    const int64_t s11 = src1->nb[1] / sizeof(float);
+    const int64_t s12_src = src1->nb[2] / sizeof(float);
+    const int64_t s13_src = src1->nb[3] / sizeof(float);
+    quantize_mmq_q8_1_rms_cuda((const float *) src1->data, (const float *) norm_weight->data,
+                               norm_scale, src1_q8_1.get(), src0_a->type,
+                               ne10, s11, s12_src, s13_src, ne10_padded, ne11, ne12, ne13, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    const int64_t stride_q_channel = ne11*ne10_padded*sizeof(block_q8_1_mmq)/(QK8_1_MMQ*sizeof(int));
+    const int64_t stride_q_sample = ne12*stride_q_channel;
+    auto launch_one = [&](const ggml_tensor * src0, ggml_tensor * dst, const ggml_cuda_mmq_launch_config & config) {
+        GGML_ASSERT(src0->type == src0_a->type && src0->ne[0] == ne10);
+        const size_t ts0 = ggml_type_size(src0->type);
+        const mmq_args args = {
+            (const char *) src0->data, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, (float *) dst->data,
+            nullptr,
+            src0->ne[0], src0->ne[1], dst->ne[1], (int64_t)(src0->nb[1]/ts0), ne11, (int64_t)(dst->nb[1]/sizeof(float)),
+            src0->ne[2], ne12, (int64_t)(src0->nb[2]/ts0), stride_q_channel, (int64_t)(dst->nb[2]/sizeof(float)),
+            src0->ne[3], ne13, (int64_t)(src0->nb[3]/ts0), stride_q_sample, (int64_t)(dst->nb[3]/sizeof(float)),
+            dst->ne[1], config.J};
+        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
+    };
+    launch_one(src0_a, dst_a, config_a);
+    launch_one(src0_b, dst_b, config_b);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
