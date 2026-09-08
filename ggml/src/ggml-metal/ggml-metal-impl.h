@@ -122,6 +122,7 @@
 #define FC_MUL_MM                      700
 #define FC_ROPE                        800
 #define FC_SSM_CONV                    900
+#define FC_SSM_CONV_SILU               (FC_SSM_CONV + 1)
 #define FC_SOLVE_TRI                   1000
 #define FC_COUNT_EQUAL                 1100
 #define FC_UNARY                       1200
@@ -138,6 +139,7 @@
 #define FC_LIGHTNING_INDEXER           2200
 #define FC_MUL_MV_MMA                  2300
 #define FC_GATED_DELTA_NET_WRITE_ROWS  (FC_GATED_DELTA_NET + 4)
+#define FC_GATED_DELTA_NET_RAW_GATES   (FC_GATED_DELTA_NET + 5)
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -1302,6 +1304,7 @@ typedef struct {
 
 typedef struct {
     int32_t nrows;
+    int32_t n_blk; // sign rows per activation row (K / N); 0 = no sign flip fused in
 } ggml_metal_kargs_fwht;
 
 typedef struct {
