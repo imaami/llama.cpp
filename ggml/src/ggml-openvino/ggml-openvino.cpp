@@ -1642,8 +1642,8 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_GATED_DELTA_NET: {
-        if (op->src[6] != nullptr) {
-            return {false, "GATED_DELTA_NET with indexed state rows is not supported"};
+        if (op->src[6] != nullptr || ggml_get_op_params_i32(op, 1) != 0) {
+            return {false, "GATED_DELTA_NET with indexed state rows or raw gates is not supported"};
         }
         // enable after https://github.com/openvinotoolkit/openvino/pull/35917 is included in OV release
         // return true;

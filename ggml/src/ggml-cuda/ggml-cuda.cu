@@ -5853,9 +5853,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // rows-indexed state read (src[6]) not implemented on CUDA yet;
-            // reject so it falls back instead of silently reading src[5] as a scratch
-            if (op->src[6] != NULL) {
+            // Indexed state and raw gates require CPU fallback.
+            if (op->src[6] != NULL || ggml_get_op_params_i32(op, 1) != 0) {
                 return false;
             }
             return true;
