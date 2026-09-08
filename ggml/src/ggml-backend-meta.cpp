@@ -157,7 +157,7 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
-    if (op->op == GGML_OP_GATED_DELTA_NET && op->src[6] != nullptr) {
+    if (op->op == GGML_OP_GATED_DELTA_NET && (op->src[6] != nullptr || ggml_get_op_params_i32(op, 1) != 0)) {
         return false;
     }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
