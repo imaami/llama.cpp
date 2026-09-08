@@ -146,10 +146,21 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
         const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-        if (reg_name == nullptr || (strcmp(reg_name, "CPU") != 0 && strcmp(reg_name, "Vulkan") != 0)) {
+        if (reg_name == nullptr) {
             gdn_state_rows_dev_ok = false;
             gdn_raw_gates_dev_ok  = false;
             break;
+        }
+        // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
+        const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        if (is_gpu && strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "Vulkan") != 0) {
+            gdn_state_rows_dev_ok = false;
+        }
+        if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
+            strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 &&
+            strcmp(reg_name, "Vulkan") != 0 && strcmp(reg_name, "CPU") != 0) {
+            gdn_raw_gates_dev_ok = false;
         }
     }
 
