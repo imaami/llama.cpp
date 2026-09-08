@@ -15929,8 +15929,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GATED_DELTA_NET:
             {
-                // rows-indexed state read (src[6]) not implemented on Vulkan yet
-                if (op->src[6] != nullptr) {
+                // Indexed state and raw gates require CPU fallback.
+                if (op->src[6] != nullptr || ggml_get_op_params_i32(op, 1) != 0) {
                     return false;
                 }
                 const uint32_t S_v = op->src[2]->ne[0];
