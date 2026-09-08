@@ -494,8 +494,8 @@ static bool htp_kparams_solve_gated_delta_net(
         return false;
     }
 
-    // rows-indexed state read (src[6]) not implemented here
-    if (op->src[6] != NULL) {
+    // rows-indexed state read (src[6]) and folded raw gates (op param 1) not implemented here
+    if (op->src[6] != NULL || ggml_get_op_params_i32(op, 1) != 0) {
         return false;
     }
 
