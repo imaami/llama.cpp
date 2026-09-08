@@ -278,9 +278,9 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
-    ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
-    return ggml_mul(ctx0, normalized, gated_silu);
+    // silu(gate) * normalized as one GLU op instead of a unary and a mul
+    return ggml_swiglu_split(ctx0, gate, normalized);
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
@@ -397,6 +397,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(beta, "beta", il);
     cb(alpha, "alpha", il);
 
+    ggml_tensor * beta_raw = beta;
+
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
@@ -420,18 +422,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     // Read a single sequence's recurrent state inside GDN. Other backends retain the gather.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
-    bool gdn_state_rows_dev_ok = true;
-    for (const auto & ldev : model.devices) {
-        if (ldev.dev == nullptr) {
-            continue;
-        }
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
-        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-        if (reg_name == nullptr || strcmp(reg_name, "CPU") != 0) {
-            gdn_state_rows_dev_ok = false;
-            break;
-        }
-    }
     const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && n_seqs == 1;
 
     ggml_tensor * state;
@@ -482,8 +472,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // q and k are adjacent head groups of the same width in the conv output, so one
+    // l2_norm over the joint view normalises both; q and k are then views into its result
+    ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim),
+            nb1_qkv,
+            nb1_qkv * n_seq_tokens,
+            0);
+    qk_conv = build_gdn_l2_norm(ctx0, qk_conv, eps_norm);
+    cb(qk_conv, "qk_conv_l2", il);
+
+    q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);
+    k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+            qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], num_k_heads * qk_conv->nb[1]);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
