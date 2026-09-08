@@ -2,8 +2,7 @@
 #include "convert.cuh"
 #include "fwht.cuh"
 
-// wide FWHT blocks use one row per thread block with this many threads
-#define GGML_CUDA_FWHT_BLOCK_NT 256
+#include <cstdlib>
 
 template <int N, typename T, bool has_signs>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
@@ -120,9 +119,12 @@ __global__ void fwht_cuda_smem(const T * src, float * dst, const int64_t n_rows,
     }
 }
 
-// Wide blocks: one row per thread block instead of per warp, so each thread keeps N/NT
-// values rather than N/32. Stages below the warp width still shuffle, those up to the
-// block width go through shared memory, and the rest stay in registers.
+
+// Wide rows at small row counts (decode): one row per block instead of per warp.
+// The warp kernel serialises every stage on one warp, and the shared-memory kernel above synchronises on each stage.
+// Both leave most of the GPU idle at these shapes.
+#define FWHT_BLOCK_THREADS 256
+
 template <int N, int NT, typename T, bool has_signs>
 __launch_bounds__(NT, 1)
 __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale,
@@ -145,7 +147,6 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     const int lane = tid % warp_size;
 
     ggml_cuda_pdl_sync();
-
     const float * signs_row = has_signs ? signs + (r % n_blk) * N : nullptr;
 
     float reg[NE];
@@ -232,11 +233,12 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         FWHT_CASE(64)
         FWHT_CASE(128)
         FWHT_CASE(256)
-        FWHT_CASE(512)
-#undef FWHT_CASE
-
-    // Beyond 2048 the register path spills, so these run the shared-memory kernel: one row per
-    // block, N floats of shared (16 KiB at 4096, 32 KiB at 8192 -- both inside the 48 KiB default).
+        default:
+            break;
+    }
+    // From 512 up, one block of FWHT_BLOCK_THREADS per row (fwht_cuda_block).
+    // The older kernels were the largest single kernel of a decode step at these widths.
+    // GGML_CUDA_FWHT_LEGACY=1 restores them for A/B.
 #define FWHT_SMEM_CASE(NN) \
         case NN: { \
             const dim3 g((unsigned) rows, 1, 1), b(FWHT_SMEM_THREADS, 1, 1); \
@@ -248,55 +250,46 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             } \
             return true; \
         }
-#undef FWHT_SMEM_CASE
-        default:
-            break;
-    }
-
-    // wide blocks: one row per thread block
-    {
-        constexpr int nt = GGML_CUDA_FWHT_BLOCK_NT;
-
-        dim3 grid_dims_w(rows, 1, 1);
-        dim3 block_dims_w(nt, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params_w =
-            ggml_cuda_kernel_launch_params(grid_dims_w, block_dims_w, 0, stream);
-
+#define FWHT_BLOCK_CASE(NN) \
+        case NN: { \
+            const dim3 g((unsigned) rows, 1, 1), b(FWHT_BLOCK_THREADS, 1, 1); \
+            const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(g, b, 0, stream); \
+            if (signs) { \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, true>,  lp, src_d, dst_d, rows, scale, signs, n_blk); \
+            } else { \
+                ggml_cuda_kernel_launch(fwht_cuda_block<NN, FWHT_BLOCK_THREADS, T, false>, lp, src_d, dst_d, rows, scale, nullptr, 1); \
+            } \
+            return true; \
+        }
+    static const bool legacy = getenv("GGML_CUDA_FWHT_LEGACY") != nullptr;
+    if (legacy) {
         switch (n) {
-            case 1024:
-                if (signs) {
-                    ggml_cuda_kernel_launch(fwht_cuda_block<1024, nt, T, true>, launch_params_w, src_d, dst_d, rows, scale, signs, n_blk);
-                } else {
-                    ggml_cuda_kernel_launch(fwht_cuda_block<1024, nt, T, false>, launch_params_w, src_d, dst_d, rows, scale, nullptr, 1);
-                }
-                return true;
-            case 2048:
-                if (signs) {
-                    ggml_cuda_kernel_launch(fwht_cuda_block<2048, nt, T, true>, launch_params_w, src_d, dst_d, rows, scale, signs, n_blk);
-                } else {
-                    ggml_cuda_kernel_launch(fwht_cuda_block<2048, nt, T, false>, launch_params_w, src_d, dst_d, rows, scale, nullptr, 1);
-                }
-                return true;
-            case 4096:
-                if (signs) {
-                    ggml_cuda_kernel_launch(fwht_cuda_block<4096, nt, T, true>, launch_params_w, src_d, dst_d, rows, scale, signs, n_blk);
-                } else {
-                    ggml_cuda_kernel_launch(fwht_cuda_block<4096, nt, T, false>, launch_params_w, src_d, dst_d, rows, scale, nullptr, 1);
-                }
-                return true;
+            FWHT_CASE(512)
+            FWHT_CASE(1024)
+            FWHT_CASE(2048)
+            FWHT_SMEM_CASE(4096)
 #if !defined(GGML_USE_MUSA)
-            // 32 KB of shared memory, above the MUSA limit; falls back there
-            case 8192:
-                if (signs) {
-                    ggml_cuda_kernel_launch(fwht_cuda_block<8192, nt, T, true>, launch_params_w, src_d, dst_d, rows, scale, signs, n_blk);
-                } else {
-                    ggml_cuda_kernel_launch(fwht_cuda_block<8192, nt, T, false>, launch_params_w, src_d, dst_d, rows, scale, nullptr, 1);
-                }
-                return true;
-#endif // !defined(GGML_USE_MUSA)
+            // 32 KiB of shared memory exceeds the MUSA launch limit.
+            FWHT_SMEM_CASE(8192)
+#endif
             default:
                 return false;
         }
+    }
+    switch (n) {
+        FWHT_BLOCK_CASE(512)
+        FWHT_BLOCK_CASE(1024)
+        FWHT_BLOCK_CASE(2048)
+        FWHT_BLOCK_CASE(4096)
+#if !defined(GGML_USE_MUSA)
+        // 32 KiB of shared memory exceeds the MUSA launch limit.
+        FWHT_BLOCK_CASE(8192)
+#endif
+#undef FWHT_CASE
+#undef FWHT_SMEM_CASE
+#undef FWHT_BLOCK_CASE
+        default:
+            return false;
     }
 }
 
