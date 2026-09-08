@@ -31,6 +31,8 @@ gated_delta_net_cuda(const float * q,
                                      const float * v,
                                      const float * g,
                                      const float * beta,
+                                     const float * raw_dt_bias,
+                                     const float * raw_a,
                                      const float * curr_state,
                                      float *       dst,
                                      float *       state,
@@ -147,7 +149,10 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        float beta_val = *beta_t;
+        if constexpr (RAW) {
+            beta_val = 1.0f / (1.0f + expf(-beta_val));
+        }
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -181,7 +186,13 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            static_assert(!(RAW && G_PRECOMPUTED), "exp(g) precompute is only defined for activated gates");
+            float g0 = *g_t;
+            if constexpr (RAW) {
+                const float x = g0 + raw_dt_bias[h_idx];
+                g0 = raw_a[h_idx] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
+            }
+            const float g_val = G_PRECOMPUTED ? g0 : expf(g0);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -276,7 +287,7 @@ gated_delta_net_cuda(const float * q,
 template <bool KDA, bool keep_rs_t, bool replay = false>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
-        const float * g_d, const float * b_d, const float * s_d,
+        const float * g_d, const float * b_d, const float * rb_d, const float * ra_d, const float * s_d,
         float * dst_d, float * state_d,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1,   int64_t sq2, int64_t sq3,
@@ -368,7 +379,10 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
         (int64_t) (beta->nb[2] / sizeof(float)),
         (int64_t) (beta->nb[3] / sizeof(float)),
         1.0f / sqrtf((float) S_v),
-        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
+        // MMA consumes activated gates and contiguous state, and writes only the final snapshot.
+        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) == 1 &&
+            ggml_get_op_params_i32(dst, 1) == 0 && dst->src[6] == nullptr &&
+            S_v == 128 && q->ne[0] == 128,
     };
 }
 
