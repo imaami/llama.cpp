@@ -253,6 +253,16 @@ llama_context::llama_context(
         }
     }
 
+    hdmd = std::make_unique<llama_hadamard>();
+    hdmd->rot = model.hdmd.rot;
+    hdmd->inv = model.hdmd.inv;
+    if (cparams.ctx_other) {
+        // Transform entries are keyed by tensor pointer, so borrowed target tensors remain distinct.
+        const auto & other = cparams.ctx_other->model;
+        hdmd->rot.insert(other.hdmd.rot.begin(), other.hdmd.rot.end());
+        hdmd->inv.insert(other.hdmd.inv.begin(), other.hdmd.inv.end());
+    }
+
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }
@@ -2843,8 +2853,8 @@ ggml_cgraph * llama_context::graph_reserve(
     auto * gf = model.build_graph(gparams);
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
-    if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+    if (!hadamard_verified && gf && (!hdmd->rot.empty() || !hdmd->inv.empty())) {
+        llama_verify_hadamard_graph(gf, hdmd->rot, hdmd->inv, moe_cache.get());
         hadamard_verified = true;
     }
 
@@ -2890,7 +2900,7 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_ctx_rows =*/ dspark_ctx.n_ctx_rows,
         /*.dspark_ctx_width =*/ dspark_ctx.n_embd_cap,
         /*.prec_policy =*/ &model.prec_policy,
-        /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.hdmd        =*/ hdmd->rot.empty() && hdmd->inv.empty() ? nullptr : hdmd.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
