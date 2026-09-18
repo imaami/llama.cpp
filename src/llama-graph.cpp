@@ -67,6 +67,37 @@ static bool can_reuse_kq_mask(
 
 // impl
 
+void llm_graph_input_dspark_ctx::set_input(const llama_ubatch * ubatch) {
+    if (correction_prefix_rows > 0) {
+        if (!ctx_feat || !dctx || dctx->n_ctx_rows != ctx_feat->ne[1]) {
+            throw std::runtime_error("DSpark correction prefix requires staged context inputs");
+        }
+        for (int64_t row = 0; row < ubatch->n_tokens; ++row) {
+            const bool expected = row >= dctx->n_ctx_rows && row < dctx->n_ctx_rows + correction_prefix_rows;
+            if (!ubatch->output || (ubatch->output[row] != 0) != expected) {
+                throw std::runtime_error("DSpark correction prefix requires matching output rows");
+            }
+        }
+    }
+    if (reuse_mask_id >= 0) {
+        if (!ubatch->token || !dctx || dctx->n_ctx_rows != ctx_feat->ne[1]) {
+            throw std::runtime_error("DSpark mask reuse requires staged token inputs");
+        }
+        for (int64_t i = dctx->n_ctx_rows + 1; i < ubatch->n_tokens; ++i) {
+            if (ubatch->token[i] != reuse_mask_id) {
+                throw std::runtime_error("DSpark mask reuse requires an anchor followed by MASK tokens");
+            }
+        }
+    }
+    // ignores ubatch entirely (like llm_graph_input_cross_embd): the context
+    // feature row count (n_ctx_rows) is independent of the current ubatch's
+    // token count and comes purely from the staged llama_dspark_ctx.
+    if (ctx_feat && dctx && !dctx->v_ctx_feat.empty()) {
+        GGML_ASSERT((int64_t) dctx->v_ctx_feat.size() == ggml_nelements(ctx_feat));
+        ggml_backend_tensor_set(ctx_feat, dctx->v_ctx_feat.data(), 0, ggml_nbytes(ctx_feat));
+    }
+}
+
 void llm_graph_input_dspark_logsnr::set_input(const llama_ubatch * ubatch) {
     // v_feat was precomputed at graph-build time and does not depend on the ubatch
     GGML_UNUSED(ubatch);
@@ -1354,11 +1385,13 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_h_capture   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
     t_sampled.clear();
+    t_dspark_greedy.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
@@ -1396,6 +1429,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    if (t_h_capture != nullptr) {
+        ggml_set_output(t_h_capture);
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
@@ -1518,6 +1554,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    dspark_ctx(params.dspark_ctx),
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses (params.hadamard_inverses),
     prec_policy      (params.prec_policy),
@@ -4130,7 +4167,10 @@ void llm_graph_context::build_sampling() const {
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
     // the padding row gives the chains without a row of the ubatch a valid input, even with no output at all
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    // DSpark reserve graphs can expose fewer draft rows than the output budget.
+    const int64_t pad_rows =
+        res->t_dspark_greedy.empty() ? 1 : std::max<int64_t>(1, int64_t(n_rows) - res->t_logits->ne[1]);
+    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, pad_rows, 0, 0);
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
@@ -4145,6 +4185,15 @@ void llm_graph_context::build_sampling() const {
     for (const auto & [seq_id, sampler] : samplers) {
         const auto it = sampling_rows.find(seq_id);
         const auto & rows = it != sampling_rows.end() ? it->second : no_rows;
+
+        if (!rows.empty() && res->t_dspark_greedy.size() == n_rows && llama_sampler_chain_n(sampler) == 1 &&
+            std::strcmp(llama_sampler_name(llama_sampler_chain_get(sampler, 0)), "greedy") == 0) {
+            for (uint32_t row : rows) {
+                res->t_sampled[row] = res->t_dspark_greedy[row];
+                ggml_build_forward_expand(gf, res->t_sampled[row]);
+            }
+            continue;
+        }
 
         for (uint32_t i = 0; i < cparams.n_outputs_max_per_seq; ++i) {
             const bool     active = i < rows.size();
