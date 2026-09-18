@@ -461,6 +461,18 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
         store_a(col, k_pair + 2, FLOAT_TYPEV2(v1.xy));
         store_a(col, k_pair + 3, FLOAT_TYPEV2(v1.zw));
+    } else if (MmTypeA == GGML_TYPE_PQ2_0) {
+        const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
+
+        const uint ib = idx / 32;
+        const uint iqs = idx & 0x1fu;
+
+        const FLOAT_TYPE d = FLOAT_TYPE(a_pq2_0.data[ib].d);
+        const uint bits = uint(a_pq2_0.data[ib].qs[iqs]);
+
+        const uint k_pair = row * mm_load_vec_a() / 2;
+        store_a(col, k_pair,     d * (FLOAT_TYPEV2(bits & 3u, (bits >> 2u) & 3u) - FLOAT_TYPEV2(1.0f)));
+        store_a(col, k_pair + 1, d * (FLOAT_TYPEV2((bits >> 4u) & 3u, bits >> 6u) - FLOAT_TYPEV2(1.0f)));
     } else if (MmTypeA == GGML_TYPE_Q2_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
         const uint k_pair = row * mm_load_vec_a() / 2;
