@@ -5268,7 +5268,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 
     // instance for Q1_0
 
-    // instance for Q2_0
+    // instance for PQ2_0
     static const ggml::cpu::repack::tensor_traits<block_pq2_0, 8, 4, GGML_TYPE_Q8_0> pq2_0_4x8_q8_0;
 
     // instances for RISC-V
@@ -5460,7 +5460,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         }
     } else if (cur->type == GGML_TYPE_PQ2_0) {
         if (ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni()) {
-            if (cur->ne[1] % 4 == 0) {
+            if (cur->ne[0] % QK_PQ2_0 == 0 && cur->ne[1] % 4 == 0) {
                 return &pq2_0_4x8_q8_0;
             }
         }
@@ -5482,9 +5482,28 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
-    auto OK            = tensor_traits->repack(tensor, data, size);
+    if (tensor_traits == nullptr) {
+        // The repack buffer can be selected as the preferred CPU buffer even
+        // for tensors which have no optimized layout. Keep those tensors in
+        // their original format instead of dereferencing a null trait.
+        GGML_LOG_DEBUG("%s: copying tensor %s without a repack trait\n", __func__, tensor->name);
+        if (size > 0) {
+            memcpy(tensor->data, data, size);
+        }
+        GGML_UNUSED(buffer);
+        return;
+    }
+
+    auto OK = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_repack_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
+                                                       void * data, size_t offset, size_t size) {
+    memcpy(data, (const char *) tensor->data + offset, size);
+
     GGML_UNUSED(buffer);
 }
 
@@ -5504,7 +5523,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
     buffer->buft              = buft;
     buffer->iface.init_tensor = ggml_backend_cpu_repack_buffer_init_tensor;
     buffer->iface.set_tensor  = ggml_backend_cpu_repack_buffer_set_tensor;
-    buffer->iface.get_tensor  = nullptr;
+    buffer->iface.get_tensor  = ggml_backend_cpu_repack_buffer_get_tensor;
     buffer->iface.cpy_tensor  = nullptr;
     return buffer;
 }
