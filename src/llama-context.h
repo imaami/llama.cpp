@@ -444,6 +444,9 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // Model transforms plus those of any borrowed target tensors.
+    std::unique_ptr<llama_hadamard> hdmd;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
