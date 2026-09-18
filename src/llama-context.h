@@ -122,6 +122,17 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+
+    // register the ordered set of intermediate layers to capture. pass an empty
+    // list to disable. the concatenation order follows the order of layer_ids.
+    void set_capture_layers(const std::vector<int32_t> & layer_ids);
+
+    // dspark drafter: stage the target-tap context window consumed by the next
+    // decode() call. feat is [n_ctx_rows * n_embd_cap] row-major (row i is
+    // position pos[i]'s raw concatenated multi-layer tap feature, pre dspark.fc).
+    // pass n_ctx_rows <= 0 (or feat == nullptr) to clear the staged context.
+    void set_dspark_ctx(const float * feat, int64_t n_ctx_rows, int64_t n_embd_cap, const int32_t * pos);
+
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_dev(bool value);
 
@@ -345,6 +356,10 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    // dspark drafter: staged target-tap context window for the next decode call.
+    // see llama_dspark_ctx in llama-graph.h for why this needs its own side channel
+    // instead of riding batch.token/embd.
+    llama_dspark_ctx dspark_ctx;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -362,6 +377,11 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+
+    // concatenated multi-layer hidden states (2-dimensional array:
+    // [n_outputs][n_capture_layers * n_embd]). populated only when
+    // cparams.n_capture_layers > 0 and the model graph filled t_h_capture.
+    buffer_view<float> embd_capture = { nullptr, 0 };
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
