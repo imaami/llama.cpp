@@ -51,6 +51,7 @@ const std::vector<std::string> type_names = {
     "f16",
     "q1_0",
     "ptq1_0",
+    "pq2_0",
     "q2_0",
     "q4_0",
     "q4_1",
@@ -600,8 +601,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (tname == "bf16") {
             continue;
         }
-        // PTQ1_0 uses the scalar or coopmat1 decoder.
-        if (coopmat2 && tname == "ptq1_0") {
+        // PTQ1_0 and PQ2_0 use the scalar or coopmat1 decoder.
+        if (coopmat2 && (tname == "ptq1_0" || tname == "pq2_0")) {
             continue;
         }
 
@@ -820,7 +821,7 @@ void process_shaders() {
 
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs" || tname == "ptq1_0") {
+        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs" || tname == "ptq1_0" || tname == "pq2_0") {
             // PTQ1_0 has its own integer-dot shader (two lanes per 128-element block)
             const std::string mmvq_shader = (tname == "ptq1_0") ? "mul_mat_vecq_ptq1_0.comp" : "mul_mat_vecq.comp";
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", mmvq_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
@@ -1359,7 +1360,7 @@ void write_output_files() {
 
     for (const std::string& btype : btypes) {
     for (const auto& tname : type_names) {
-        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs" && tname != "ptq1_0") {
+        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs" && tname != "ptq1_0" && tname != "pq2_0") {
             continue;
         }
         hdr << "extern const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3];\n";
