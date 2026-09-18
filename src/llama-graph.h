@@ -871,6 +871,9 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
     const llama_dspark_ctx *         dspark_ctx;
+    bool                             dspark_has_context;
+    int64_t                          dspark_ctx_rows;
+    int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
@@ -932,6 +935,12 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
+            return false;
+        }
+
+        if ((dspark_ctx == nullptr) != (other.dspark_ctx == nullptr) ||
+            dspark_has_context != other.dspark_has_context || dspark_ctx_rows != other.dspark_ctx_rows ||
+            dspark_ctx_width != other.dspark_ctx_width) {
             return false;
         }
 
@@ -1131,6 +1140,9 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
     const llama_dspark_ctx *         dspark_ctx;
+    bool                             dspark_has_context;
+    int64_t                          dspark_ctx_rows;
+    int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 

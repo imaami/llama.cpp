@@ -191,7 +191,10 @@ static int test_cuda_dcut() {
         for (size_t i = 0; i < base.size(); ++i) {
             base[i] = std::sin((float) i) * 3.0f;
         }
-        auto * ctx = dspark_markov_cuda_init(a.data(), b.data(), vocab, rank);
+        for (int k = 0; k < 4; ++k) {
+            base[k * vocab + vocab - 1] = 1000.0f;
+        }
+        auto * ctx = dspark_markov_cuda_init(a.data(), b.data(), vocab, rank, vocab - 1);
         if (!ctx) {
             fail("CUDA D-cut init");
         }
@@ -224,6 +227,7 @@ static int test_cuda_dcut() {
                             logits[v] += (double) a[prev * rank + r] * b[v * rank + r];
                         }
                     }
+                    logits[vocab - 1] = -std::numeric_limits<double>::infinity();
                     const int winner = std::max_element(logits.begin(), logits.end()) - logits.begin();
                     double    sum    = 0;
                     for (double logit : logits) {
@@ -413,7 +417,7 @@ int main(int argc, char ** argv) {
         common_speculative_draft_params & dp = common_speculative_get_draft_params(spec, 0);
         dp.drafting                          = true;
         dp.n_max                             = -1;
-        dp.n_past                            = start;
+        dp.pos0                            = start;
         dp.id_last                           = id_last;
         dp.prompt                            = nullptr;  // unused by dspark
         llama_tokens result;
