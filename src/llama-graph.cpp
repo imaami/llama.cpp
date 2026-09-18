@@ -1559,7 +1559,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     dspark_ctx_rows(params.dspark_ctx_rows),
     dspark_ctx_width(params.dspark_ctx_width),
     hadamard_rotations(params.hadamard_rotations),
-    hadamard_inverses (params.hadamard_inverses),
+    hadamard_inverses(params.hadamard_inverses),
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2551,6 +2551,24 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     cb(slots, "ffn_moe_slots", il);
 
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+}
+
+ggml_tensor * llm_graph_context::build_embd_rows(ggml_tensor * tok_embd, ggml_tensor * ids) const {
+    ggml_tensor * cur = ggml_get_rows(ctx0, tok_embd, ids);
+
+    // a Hadamard-latent embedding table stores rotated rows; restore the
+    // primal basis right after the lookup: h = s * (H z)
+    if (hadamard_inverses) {
+        const auto it = hadamard_inverses->find(tok_embd);
+        if (it != hadamard_inverses->end()) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+            if (it->second.signs) {
+                cur = ggml_mul(ctx0, cur, it->second.signs);
+            }
+        }
+    }
+
+    return cur;
 }
 
 // input embeddings with optional lora

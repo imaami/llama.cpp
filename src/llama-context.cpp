@@ -242,6 +242,16 @@ llama_context::llama_context(
         }
     }
 
+    hadamard_rotations = model.hadamard_rotations;
+    hadamard_inverses  = model.hadamard_inverses;
+    if (cparams.ctx_other) {
+        // tensors borrowed from the target are looked up by pointer, so the
+        // target's entries never collide with this model's
+        const auto & other = cparams.ctx_other->model;
+        hadamard_rotations.insert(other.hadamard_rotations.begin(), other.hadamard_rotations.end());
+        hadamard_inverses .insert(other.hadamard_inverses .begin(), other.hadamard_inverses .end());
+    }
+
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }
@@ -2821,8 +2831,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // verify transform coverage on the pristine graph: after scheduling,
     // cross-backend copies break the producer chain the check follows
-    if (!hadamard_verified && gf && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
-        llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
+    if (!hadamard_verified && gf && (!hadamard_rotations.empty() || !hadamard_inverses.empty())) {
+        llama_verify_hadamard_graph(gf, hadamard_rotations, hadamard_inverses);
         hadamard_verified = true;
     }
 
@@ -2867,8 +2877,8 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_has_context =*/!dspark_ctx.v_ctx_feat.empty(),
         /*.dspark_ctx_rows =*/dspark_ctx.n_ctx_rows,
         /*.dspark_ctx_width =*/dspark_ctx.n_embd_cap,
-        /*.hadamard_rotations =*/&model.hadamard_rotations,
-        /*.hadamard_inverses  =*/&model.hadamard_inverses,
+        /*.hadamard_rotations =*/&hadamard_rotations,
+        /*.hadamard_inverses  =*/&hadamard_inverses,
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,

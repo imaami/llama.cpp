@@ -641,7 +641,7 @@ static void build_dfly_correction_head(llm_graph_context & g, const llama_model 
         //                         z = [rms(h_i); rms(embd(prev))]
         if (prev) {
             // chained positions condition on the previously drafted token: an argmax, always in range
-            prev_embd = ggml_get_rows(ctx0, tok_embd, prev); // [n_embd, n_blocks]
+            prev_embd = g.build_embd_rows(tok_embd, prev); // [n_embd, n_blocks]
         }
 
         ggml_tensor * h_i = ggml_cont(ctx0, ggml_view_2d(ctx0, hidden, n_embd, n_blocks,
@@ -1007,7 +1007,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inpL = build_embd_rows(tok_embd, inp->tokens);
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
@@ -1313,7 +1313,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inpL = build_embd_rows(tok_embd, inp->tokens);
     cb(inpL, "inp_noise_embd", -1);
     // the DSV4 hyper-connection backbone replicates inpL across hc lanes below, so
     // the log-SNR term would need to be added per lane. No such checkpoint exists
