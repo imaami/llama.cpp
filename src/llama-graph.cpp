@@ -2658,6 +2658,24 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
 }
 
+ggml_tensor * llm_graph_context::build_embd_rows(ggml_tensor * tok_embd, ggml_tensor * ids) const {
+    ggml_tensor * cur = ggml_get_rows(ctx0, tok_embd, ids);
+
+    // a Hadamard-latent embedding table stores rotated rows; restore the
+    // primal basis right after the lookup: h = s * (H z)
+    if (hdmd) {
+        const auto it = hdmd->inv.find(tok_embd);
+        if (it != hdmd->inv.end()) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+            if (it->second.signs) {
+                cur = ggml_mul(ctx0, cur, it->second.signs);
+            }
+        }
+    }
+
+    return cur;
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
