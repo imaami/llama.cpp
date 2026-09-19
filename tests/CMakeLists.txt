@@ -351,6 +351,7 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-quantize-perf.cpp LINK ggml)
     llama_build_and_test(test-rope.cpp LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp LINK ggml)
+    llama_build_and_test(test-pq2-row-shapes.cpp LINK ggml)
 endif()
 
 # libmtmd
