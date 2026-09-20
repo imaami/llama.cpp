@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "sampling.h"
+#include "../src/llama-context.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -339,6 +341,49 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+static void test_backend_sampled_id_fallback(llama_model * model) {
+    auto * backend = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(backend, llama_sampler_init_greedy());
+    llama_sampler_seq_config config = { 0, backend };
+    auto cparams = llama_context_default_params();
+    cparams.n_ctx = 64;
+    cparams.n_batch = 1;
+    cparams.n_ubatch = 1;
+    cparams.n_threads = 1;
+    cparams.n_threads_batch = 1;
+    cparams.samplers = &config;
+    cparams.n_samplers = 1;
+    auto * ctx = llama_init_from_model(model, cparams);
+    GGML_ASSERT(ctx);
+
+    common_batch batch(ctx);
+    batch.add(0, 0, 0, true);
+    GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+    llama_synchronize(ctx);
+    const llama_token expected = llama_get_sampled_token_ith(ctx, 0);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    GGML_ASSERT(expected >= 0 && expected < n_vocab);
+    auto * sampled = ctx->get_sampled_tokens();
+    GGML_ASSERT(sampled);
+
+    common_params_sampling params;
+    params.temp = 0.0f;
+    params.backend_sampling = true;
+    auto * sampler = common_sampler_init(model, params);
+    GGML_ASSERT(sampler);
+    for (llama_token invalid : { LLAMA_TOKEN_NULL, llama_token(-2), llama_token(n_vocab), llama_token(INT_MAX) }) {
+        sampled[0] = invalid;
+        GGML_ASSERT(common_sampler_sample(sampler, ctx, 0) == expected);
+    }
+    sampled[0] = (expected + 1) % n_vocab;
+    GGML_ASSERT(common_sampler_sample(sampler, ctx, 0) == sampled[0]);
+
+    common_sampler_free(sampler);
+    llama_free(ctx);
+    llama_sampler_free(backend);
+    printf("Invalid backend token ids fall back to CPU sampling\n");
+}
+
 static int test_common_top_k(const char * model_path) {
     if (!std::ifstream(model_path).good()) {
         fprintf(stderr, "Model fixture not found: %s\n", model_path);
@@ -467,6 +512,7 @@ static int test_common_top_k(const char * model_path) {
     }
 
     llama_free(ctx);
+    test_backend_sampled_id_fallback(model);
     llama_model_free(model);
     llama_backend_free();
     printf("Common top-k candidates, probabilities and tokens match\n");
