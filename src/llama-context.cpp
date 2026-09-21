@@ -245,8 +245,7 @@ llama_context::llama_context(
     hadamard_rotations = model.hadamard_rotations;
     hadamard_inverses  = model.hadamard_inverses;
     if (cparams.ctx_other) {
-        // tensors borrowed from the target are looked up by pointer, so the
-        // target's entries never collide with this model's
+        // Transform entries are keyed by tensor pointer, so borrowed target tensors remain distinct.
         const auto & other = cparams.ctx_other->model;
         hadamard_rotations.insert(other.hadamard_rotations.begin(), other.hadamard_rotations.end());
         hadamard_inverses .insert(other.hadamard_inverses .begin(), other.hadamard_inverses .end());
