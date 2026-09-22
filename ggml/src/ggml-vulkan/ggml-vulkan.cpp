@@ -15983,6 +15983,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[6] != nullptr) {
                     return false;
                 }
+                // raw gates (ggml_gated_delta_net_set_raw_gates): beta and g arrive
+                // pre-activation and need beta = sigmoid(beta) and
+                // g = a * softplus(g + dt_bias), with dt_bias in src[7] and a in src[8].
+                // gated_delta_net.comp has neither those bindings nor that math - it
+                // applies exp(g) unconditionally - so the shader silently returns wrong
+                // results for this case. Decline it and let it fall back to the CPU.
+                if (ggml_get_op_params_i32(op, 1) != 0) {
+                    return false;
+                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
