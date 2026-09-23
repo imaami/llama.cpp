@@ -54,6 +54,71 @@ static inline float vec_dot_ptq1_0_q8_1(const void* vbq, const block_q8_1* bq8_1
     return (float) bq->d * __low2float(bq8->ds) * sumi;
 }
 
+// ---- HIP vector idiom (transcribed from vecdotq.cuh HIP branch) -------------
+// Device-proven rule: each output byte uses the 3 low bits of its selector
+// BYTE (not nibble); sel bit2=0 picks the SECOND arg (inverted vs CUDA).
+static inline uint32_t hip_perm(uint32_t a, uint32_t b, uint32_t s) {
+    uint32_t r = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint32_t sel = (s >> (8*i)) & 7;
+        uint32_t byte = ((sel & 4) == 0) ? (b >> (8*(sel & 3))) : (a >> (8*(sel & 3)));
+        r |= (byte & 0xFFu) << (8*i);
+    }
+    return r;
+}
+
+static inline float vec_dot_ptq1_0_q8_1_vec(const void* vbq, const block_q8_1* bq8_1,
+                                            const int& kbx, const int& iqs, int * diff) {
+    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq + kbx;
+    int sumi[4] = { 0, 0, 0, 0 };
+    int sumu[4] = { 0, 0, 0, 0 };
+    const uint32_t * qs32 = (const uint32_t *) bq->qs;
+    for (int w = 0; w < 4; ++w) {
+        uint32_t v_lo = hip_perm(0, qs32[w], 0x0C010C00);
+        uint32_t v_hi = hip_perm(0, qs32[w], 0x0C030C02);
+        for (int t = 0; t < 5; ++t) {
+            uint32_t w_lo = v_lo * 3u, w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu; v_hi = w_hi & 0x00FF00FFu;
+            const int e = t * 16 + 4 * w;
+            const int u = get_int_b4(bq8_1[iqs + (e >> 5)].qs, (e & 31) >> 2);
+            const int q = (int) hip_perm(w_hi, w_lo, 0x07050301);
+            sumi[e >> 5] += ggml_cuda_dp4a(q, u, 0);
+            sumu[e >> 5] += ggml_cuda_dp4a(0x01010101, u, 0);
+        }
+    }
+    for (int w = 0; w < 2; ++w) {
+        uint32_t v_lo = hip_perm(0, qs32[4 + w], 0x0C010C00);
+        uint32_t v_hi = hip_perm(0, qs32[4 + w], 0x0C030C02);
+        for (int t = 0; t < 5; ++t) {
+            uint32_t w_lo = v_lo * 3u, w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu; v_hi = w_hi & 0x00FF00FFu;
+            const int e = 80 + t * 8 + 4 * w;
+            const int u = get_int_b4(bq8_1[iqs + (e >> 5)].qs, (e & 31) >> 2);
+            const int q = (int) hip_perm(w_hi, w_lo, 0x07050301);
+            sumi[e >> 5] += ggml_cuda_dp4a(q, u, 0);
+            sumu[e >> 5] += ggml_cuda_dp4a(0x01010101, u, 0);
+        }
+    }
+    for (int h = 0; h < 2; ++h) {
+        uint32_t v = bq->qh[h];
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = v * 3;
+            const int      q = (int) (w >> 8);
+            v                = w & 0xFF;
+            const int e      = 120 + t * 2 + h;
+            const int a      = (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+            sumi[e >> 5] += q * a;
+            sumu[e >> 5] += a;
+        }
+    }
+    float acc = 0.0f;
+    for (int k = 0; k < 4; ++k) {
+        if (diff) diff[k] = sumi[k] - sumu[k];
+        acc += __low2float(bq8_1[iqs + k].ds) * (float) (sumi[k] - sumu[k]);
+    }
+    return (float) bq->d * acc;
+}
+
 // ---- reference: dequantize the block, dequantize q8_1, dot in float ------
 static void ref_dequant(const block_ptq1_0* x, float* out) {
     const uint8_t pow3[6]={1,3,9,27,81,243}; const size_t st[3]={32,16,8};
@@ -88,12 +153,14 @@ int main(void) {
 
         // EXACT test: the kernel's integer accumulator per chunk must equal the
         // reference integer sum of trit*q8. This isolates logic from float rounding.
+        int ref_sumis[4];
         for (int c = 0; c < 4; ++c) {
             int ref_sumi = 0;
             for (int i = 0; i < 32; ++i) {
                 const int trit = (int) llround((double) wf[c*32+i] / (double) w.d);
                 ref_sumi += trit * (int) y[c].qs[i];
             }
+            ref_sumis[c] = ref_sumi;
             // recompute the kernel's sumi by dividing its float result back out
             const float got = vec_dot_ptq1_0_q8_1(&w, y, 0, c);
             const int got_sumi = (int) llround((double) got / ((double) w.d * (double) y[c].ds.lo));
@@ -121,12 +188,57 @@ int main(void) {
         if (rel > worst_rel) worst_rel = rel;
         if (mag > 0) { const double sc = fabs(got_total - ref_total)/mag; if (sc > worst_scaled) worst_scaled = sc; }
         ++checks;
+
+        // HIP vector idiom must agree with the scalar transcription. Integer
+        // diffs are exact; float totals may differ by 1 ulp (association order).
+        int vec_diff[4];
+        const float got_vec = vec_dot_ptq1_0_q8_1_vec(&w, y, 0, 0, vec_diff);
+        for (int c = 0; c < 4; ++c) {
+            if (vec_diff[c] != ref_sumis[c]) { ++int_bad;
+                if (int_bad < 8) printf("  VEC MISMATCH trial %d chunk %d: ref %d vec %d\n",
+                    trial, c, ref_sumis[c], vec_diff[c]); }
+        }
+        if (fabs(got_vec - (float) got_total) > 1e-6f * fmaxf(1.0f, fabsf((float) got_total))) { ++int_bad;
+            if (int_bad < 12) printf("  VEC FLOAT trial %d: scalar %.9g vec %.9g\n",
+                trial, got_total, (double) got_vec); }
+    }
+    // Exhaustive sweep: every packed-byte value at every word position, qh too.
+    // Exact per-chunk integer diffs (like the trial loop); any lane-packing
+    // or selector-order regression breaks equality here without a GPU.
+    long exh_checks = 0, exh_bad = 0;
+    for (int pos = 0; pos < 8; ++pos) {
+        for (int v = 0; v < 256; ++v) {
+            block_ptq1_0 w;
+            memset(&w, 0xA5, sizeof(w));
+            if (pos < 6) ((uint32_t *) w.qs)[pos] = v * 0x01010101u;
+            else         w.qh[pos - 6] = (uint8_t) v;
+            w.d = 0.03f;
+            block_q8_1 y[4];
+            for (int b = 0; b < 4; ++b) {
+                y[b].ds.lo = 0.02f; y[b].ds.hi = 0.f;
+                for (int i = 0; i < 32; ++i) y[b].qs[i] = (int8_t) ((i * 7 + b * 13 + v) % 251 - 125);
+            }
+            float wf[QK_PTQ1_0]; ref_dequant(&w, wf);
+            int vec_diff[4];
+            vec_dot_ptq1_0_q8_1_vec(&w, y, 0, 0, vec_diff);
+            for (int c = 0; c < 4; ++c) {
+                int ref_sumi = 0;
+                for (int i = 0; i < 32; ++i) {
+                    ref_sumi += (int) llround((double) wf[c*32+i] / (double) w.d) * (int) y[c].qs[i];
+                }
+                if (vec_diff[c] != ref_sumi) { ++exh_bad;
+                    if (exh_bad < 8) printf("  EXH MISMATCH pos %d val %d chunk %d: ref %d vec %d\n",
+                        pos, v, c, ref_sumi, vec_diff[c]); }
+                ++exh_checks;
+            }
+        }
     }
     printf("  dot products compared : %ld (4 chunks each)\n", checks);
     printf("  worst relative error  : %.3e\n", worst_rel);
     printf("  worst err / sum|terms| : %.3e   (immune to cancellation)\n", worst_scaled);
     printf("  exact integer checks  : %ld, mismatches %ld\n", int_checks, int_bad);
+    printf("  exhaustive vec==scalar: %ld, mismatches %ld\n", exh_checks, exh_bad);
     if (int_bad == 0) printf("  LOGIC EXACT: integer accumulator matches reference on every chunk\n");
     else              printf("  LOGIC BUG in the kernel\n");
-    return int_bad != 0;
+    return (int_bad != 0) || (exh_bad != 0);
 }
