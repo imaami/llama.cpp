@@ -1211,6 +1211,49 @@ static void mul_mat_vec_q1_0_q8_1_sycl_switch_ncols(
         vx, vy, dst, ncols, nrows, ncols_dst, stride_col_y, stride_col_dst, stream);
 }
 
+static void mul_mat_vec_ptq1_0_q8_1_sycl(const void * vx, const void * vy,
+                                         float * dst, const int ncols,
+                                         const int nrows,
+                                         dpct::queue_ptr stream) {
+    launch_mul_mat_vec_q<QK_PTQ1_0, QI_PTQ1_0, block_ptq1_0,
+                              VDR_PTQ1_0_Q8_1_MMVQ, vec_dot_ptq1_0_q8_1, QK_PTQ1_0>(
+        vx, vy, dst, ncols, nrows, 1, 0, 0, stream);
+}
+
+static void mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows, const int ncols_dst,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    if (ncols_dst < 1 || ncols_dst > 8) {
+        GGML_ABORT("unsupported ncols_dst=%d for PTQ1_0 multi-col MMVQ", ncols_dst);
+    }
+    launch_mul_mat_vec_q<QK_PTQ1_0, QI_PTQ1_0, block_ptq1_0,
+                              VDR_PTQ1_0_Q8_1_MMVQ, vec_dot_ptq1_0_q8_1, QK_PTQ1_0>(
+        vx, vy, dst, ncols, nrows, ncols_dst, stride_col_y, stride_col_dst, stream);
+}
+
+static void mul_mat_vec_pq2_0_q8_1_sycl(const void * vx, const void * vy,
+                                        float * dst, const int ncols,
+                                        const int nrows,
+                                        dpct::queue_ptr stream) {
+    launch_mul_mat_vec_q<QK_PQ2_0, MMVQ_PQ2_0_QI, block_pq2_0,
+                              VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1, QK_PQ2_0>(
+        vx, vy, dst, ncols, nrows, 1, 0, 0, stream);
+}
+
+static void mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows, const int ncols_dst,
+        const int stride_col_y, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    if (ncols_dst < 1 || ncols_dst > 8) {
+        GGML_ABORT("unsupported ncols_dst=%d for PQ2_0 multi-col MMVQ", ncols_dst);
+    }
+    launch_mul_mat_vec_q<QK_PQ2_0, MMVQ_PQ2_0_QI, block_pq2_0,
+                              VDR_PQ2_0_Q8_1_MMVQ, vec_dot_pq2_0_q8_1, QK_PQ2_0>(
+        vx, vy, dst, ncols, nrows, ncols_dst, stride_col_y, stride_col_dst, stream);
+}
 
 static void mul_mat_vec_q2_0_q8_1_sycl(const void * vx, const void * vy,
                                        float * dst, const int ncols,
@@ -2340,6 +2383,34 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 } else if (i == 0 || src1_ncols == 1) {
                     GGML_SYCL_DEBUG("Calling mul_mat_vec_q1_0_q8_1_sycl\n");
                     mul_mat_vec_q1_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                }
+                break;
+            case GGML_TYPE_PTQ1_0:
+                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    const int stride_col_y   = src1_padded_col_size / QK8_1;
+                    const int stride_col_dst = dst->ne[0];
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
+                    mul_mat_vec_ptq1_0_q8_1_sycl_switch_ncols(
+                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                        src1_ncols, stride_col_y, stride_col_dst, stream);
+                    return;
+                } else if (i == 0 || src1_ncols == 1) {
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_ptq1_0_q8_1_sycl\n");
+                    mul_mat_vec_ptq1_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                }
+                break;
+            case GGML_TYPE_PQ2_0:
+                if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    const int stride_col_y   = src1_padded_col_size / QK8_1;
+                    const int stride_col_dst = dst->ne[0];
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
+                    mul_mat_vec_pq2_0_q8_1_sycl_switch_ncols(
+                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                        src1_ncols, stride_col_y, stride_col_dst, stream);
+                    return;
+                } else if (i == 0 || src1_ncols == 1) {
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_pq2_0_q8_1_sycl\n");
+                    mul_mat_vec_pq2_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 }
                 break;
             case GGML_TYPE_Q2_0:
