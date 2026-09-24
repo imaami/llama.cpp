@@ -1413,6 +1413,8 @@ static int64_t get_row_rounding(ggml_type type, const std::array<float, GGML_SYC
 
     switch(type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_PTQ1_0:
+        case GGML_TYPE_PQ2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
             return max_compute_capability >= VER_GEN9 ? 128 : 64;
@@ -5145,7 +5147,7 @@ static bool can_use_xmx_batch(int device, const ggml_tensor * src0, const ggml_t
 }
 
 static bool can_use_mul_mat_vec_q(int device, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+    return ggml_sycl_supports_mmvq(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE || can_use_xmx_batch(device, src0, src1));
 }
 
@@ -7397,7 +7399,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     return false;
                 }
 
-                if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_PTQ1_0) {
+                if (ggml_is_quantized(src0_type) &&
+                    !ggml_sycl_supports_mmvq(src0_type) &&
+                    !ggml_sycl_supports_dmmv(src0_type) &&
+                    !ggml_sycl_supports_mmq(src0_type)) {
                     return false;
                 }
 
@@ -7422,6 +7427,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_PTQ1_0:
+                    case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_IQ2_XXS:
@@ -7462,7 +7469,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SET_ROWS:
             {
-                if (op->type == GGML_TYPE_TQ2_0 || op->type == GGML_TYPE_TQ1_0 || op->type == GGML_TYPE_PTQ1_0) {
+                if (op->type == GGML_TYPE_TQ2_0 || op->type == GGML_TYPE_TQ1_0 ||
+                    op->type == GGML_TYPE_PTQ1_0 || op->type == GGML_TYPE_PQ2_0) {
                     return false;
                 }
                 auto res = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
@@ -7495,6 +7503,16 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+
+                // Quantizing a float row into PTQ1_0 or PQ2_0 has no kernel: both are
+                // produced offline by the converter, which also applies the Hadamard
+                // rotation the packing assumes. ggml_sycl_cpy() would take the
+                // float -> quantized branch and assert, so decline the pair here and let
+                // the scheduler fall back. The quant -> same-quant copies are handled.
+                if ((src1_type == GGML_TYPE_PTQ1_0 || src1_type == GGML_TYPE_PQ2_0) &&
+                    src0_type != src1_type) {
+                    return false;
+                }
 
                 if (src0_type == GGML_TYPE_F16) {
                     if (src1_type == GGML_TYPE_Q2_K ||
@@ -7555,6 +7573,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
                 if (src1_type == GGML_TYPE_F32) {
                     if (src0_type == GGML_TYPE_Q1_0 ||
+                        src0_type == GGML_TYPE_PTQ1_0 ||
+                        src0_type == GGML_TYPE_PQ2_0 ||
                         src0_type == GGML_TYPE_NVFP4 ||
                         src0_type == GGML_TYPE_Q2_K ||
                         src0_type == GGML_TYPE_Q3_K ||
@@ -7584,15 +7604,13 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                         src1_type == GGML_TYPE_IQ1_S ||
                         src1_type == GGML_TYPE_IQ1_M ||
                         src1_type == GGML_TYPE_TQ2_0 ||
-                        src1_type == GGML_TYPE_TQ1_0 ||
-                        src1_type == GGML_TYPE_PTQ1_0) {
+                        src1_type == GGML_TYPE_TQ1_0) {
                         return false;
                     }
                 }
 
                 if (src0_type == GGML_TYPE_TQ2_0 || src1_type == GGML_TYPE_TQ2_0 ||
-                    src0_type == GGML_TYPE_TQ1_0 || src1_type == GGML_TYPE_TQ1_0 ||
-                    src0_type == GGML_TYPE_PTQ1_0 || src1_type == GGML_TYPE_PTQ1_0) {
+                    src0_type == GGML_TYPE_TQ1_0 || src1_type == GGML_TYPE_TQ1_0) {
                     return false;
                 }
 
