@@ -148,6 +148,17 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
     return vk_device_architecture::OTHER;
 }
 
+// BC-250 = AMD Cyan Skillfish APU: RDNA1 (gfx1013), no coopmat.
+static bool ggml_vk_is_bc250(const vk_device& device) {
+    return device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA1 &&
+           device->properties.deviceID == 0x13fe && !device->coopmat_support;
+}
+
+static bool ggml_vk_mmv_ext(const vk_device& device, ggml_type a_type) {
+    return ggml_vk_is_bc250(device) &&
+           (a_type == GGML_TYPE_PQ2_0 || a_type == GGML_TYPE_BF16 || a_type == GGML_TYPE_Q8_0);
+}
+
 bool ggml_vk_lightning_indexer_k_type_supported(ggml_type type) {
     return std::find(lightning_indexer_k_types.begin(), lightning_indexer_k_types.end(), type) != lightning_indexer_k_types.end();
 }
@@ -6697,12 +6708,17 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             return true;
         }
     case VK_VENDOR_ID_INTEL:
-        if (device->architecture == vk_device_architecture::INTEL_XE2) {
+        if (device->architecture == vk_device_architecture::INTEL_XE2 ||
+            (device->architecture == vk_device_architecture::INTEL_XE1 && device->integer_dot_product && src0_type == GGML_TYPE_PTQ1_0)) {
             // PTQ1_0 is listed here because it has a dedicated integer-dot mat-vec shader
             // (mul_mat_vecq_ptq1_0.comp); without it the blanket Intel-Windows opt-out below
             // keeps PTQ1_0 on the dequant path. Measured on Arc B390 (Bonsai 2 27B, tg128):
             // 1.62 -> 13.16 t/s. PQ2_0 is deliberately NOT listed - measured 11.56 -> 11.63 t/s,
             // i.e. no gain over its dequant mat-vec, so it stays on the existing path.
+            // INTEL_XE1-classified iGPUs (e.g. Intel Arc 140T, Arrow Lake-H, Xe-LPG+) also
+            // qualify for PTQ1_0 when integer_dot_product is set, since that classification
+            // already guarantees the accelerated 4x8 integer dot product the shader needs.
+            // Measured on Arc 140T (Bonsai 2 27B, tg): 1.3 -> 8.8 t/s.
             if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K ||
                 src0_type == GGML_TYPE_PTQ1_0) {
                 return true;
