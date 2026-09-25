@@ -15064,7 +15064,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // batched decode (several sequences per step) through the mat-vec path
     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0}) {
-        for (int n : {2, 4, 8}) {
+        for (int n : {2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
         }
     }
