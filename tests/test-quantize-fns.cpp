@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-quants.h"
 
 #undef NDEBUG
 #include <assert.h>
@@ -317,6 +318,52 @@ static int test_ptq1_0_roundtrip(bool verbose) {
     return failed;
 }
 
+static int test_vec_dot_ptq1_0(bool verbose) {
+    int num_failed = 0;
+    const ggml_type type = GGML_TYPE_PTQ1_0;
+    const auto * traits = ggml_get_type_traits(type);
+    const auto * cpu = ggml_get_type_traits_cpu(type);
+    for (int nb : {1, 3}) {
+        const int n = nb * 128;
+        std::vector<block_ptq1_0> ptq(nb);
+        std::vector<block_q8_0> q8(nb * 4);
+        std::vector<float> x(n), y(n);
+        const void * weights = ptq.data();
+        for (int pattern = 0; pattern < 256; ++pattern) {
+            for (int i = 0; i < nb; ++i) {
+                ptq[i].d = ggml_fp32_to_fp16(0.25f * (i + 1));
+                for (size_t j = 0; j < sizeof(ptq[i].qs); ++j) {
+                    ptq[i].qs[j] = (uint8_t) (pattern + 17*j + i);
+                }
+                for (size_t j = 0; j < sizeof(ptq[i].qh); ++j) {
+                    ptq[i].qh[j] = (uint8_t) (pattern + 37*j + i);
+                }
+            }
+            for (int i = 0; i < nb * 4; ++i) {
+                q8[i].d = ggml_fp32_to_fp16(0.125f * (i % 4 + 1));
+                for (int j = 0; j < QK8_0; ++j) {
+                    q8[i].qs[j] = (int8_t) ((pattern + 13*j + i) % 256 - 128);
+                }
+            }
+            const void * acts = q8.data();
+            traits->to_float(weights, x.data(), n);
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(acts, y.data(), n);
+            const float ref = dot_product(x.data(), y.data(), n);
+            float result = INFINITY;
+            cpu->vec_dot(n, &result, 0, weights, 0, acts, 0, 1);
+            // Binary-exact scales keep this comparison exact.
+            const bool failed = result != ref;
+            num_failed += failed;
+            if (failed) {
+                printf("%5s packed dot nb=%d pattern=%d: FAILED (ref=%f got=%f)\n", ggml_type_name(type), nb, pattern, ref, result);
+            }
+        }
+    }
+    if (num_failed || verbose) {
+        printf("PTQ1_0 packed dot products: %s (%d failures)\n", RESULT_STR[num_failed != 0], num_failed);
+    }
+    return num_failed;
+}
 int main(int argc, char * argv[]) {
     bool verbose = false;
 
@@ -340,6 +387,7 @@ int main(int argc, char * argv[]) {
     num_failed += test_vec_dot_q(verbose);
     num_failed += test_quantize_imatrix_degenerate(verbose);
     num_failed += test_ptq1_0_roundtrip(verbose);
+    num_failed += test_vec_dot_ptq1_0(verbose);
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);
