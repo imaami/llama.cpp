@@ -38,6 +38,20 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+// the Windows CRT has no POSIX setenv/unsetenv
+static int setenv(const char * name, const char * value, int overwrite) {
+    if (!overwrite && std::getenv(name)) {
+        return 0;
+    }
+    return _putenv_s(name, value);
+}
+
+static int unsetenv(const char * name) {
+    return _putenv_s(name, ""); // an empty value removes the variable
+}
+#endif
+
 static std::map<std::string, std::vector<float>> trace_values;
 
 static bool trace_node(ggml_tensor * tensor, bool ask, void *) {
@@ -169,35 +183,21 @@ static std::vector<float> run_forward(llama_context *              ctx,
     }
     llama_set_dspark_ctx(ctx, ctx_feat.data(), n_ctx_rows, n_embd_cap, ctx_pos.data());
 
-    const int32_t n_tokens = (int32_t) n_ctx_rows + block_size;
-    llama_batch   batch    = llama_batch_init(n_tokens, 0, 1);
-    batch.n_tokens         = n_tokens;
-
+    common_batch batch(ctx);
     for (int32_t i = 0; i < (int32_t) n_ctx_rows; ++i) {
-        batch.token[i]     = 0;  // dummy: unused (context rows never join the trunk/embedding path)
-        batch.pos[i]       = ctx_pos[i];
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = 0;
+        batch.add(0, ctx_pos[i], 0, false); // context rows use staged target features
     }
     for (int32_t j = 0; j < block_size; ++j) {
-        const int32_t i    = (int32_t) n_ctx_rows + j;
-        batch.token[i]     = draft_tokens[j];
-        batch.pos[i]       = draft_pos[j];
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = j < output_rows;
+        batch.add(draft_tokens[j], draft_pos[j], 0, j < output_rows);
     }
 
     int32_t rc;
     try {
-        rc = llama_decode(ctx, batch);
+        rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
     } catch (...) {
-        llama_batch_free(batch);
         llama_set_dspark_ctx(ctx, nullptr, 0, 0, nullptr);
         throw;
     }
-    llama_batch_free(batch);
     if (rc != 0) {
         fail("llama_decode returned " + std::to_string(rc));
     }
@@ -774,7 +774,7 @@ static int run_runtime_ab(const std::string & model_path, const char * backend =
                         auto & dp   = common_speculative_get_draft_params(spec, 0);
                         dp.drafting = true;
                         dp.n_max    = -1;
-                        dp.n_past   = 6;
+                        dp.pos0   = 6;
                         dp.id_last  = tokens[0];
                         dp.result   = &ids;
                         common_speculative_draft(spec);
@@ -1032,7 +1032,7 @@ static int run_prefix_ab(const std::string & model_path, const char * backend = 
                         auto & dp   = common_speculative_get_draft_params(spec, 0);
                         dp.drafting = true;
                         dp.n_max    = keep;
-                        dp.n_past   = 6;
+                        dp.pos0   = 6;
                         dp.id_last  = tokens[0];
                         dp.result   = &ids;
                         common_speculative_draft(spec);
@@ -1126,7 +1126,7 @@ static int run_prefix_ab(const std::string & model_path, const char * backend = 
         auto &                   dp = common_speculative_get_draft_params(spec, 0);
         dp.drafting                 = true;
         dp.n_max                    = keep;
-        dp.n_past                   = 6;
+        dp.pos0                   = 6;
         dp.id_last                  = tokens[0];
         dp.result                   = &ids;
         if (mode == "changed-after-init") {
