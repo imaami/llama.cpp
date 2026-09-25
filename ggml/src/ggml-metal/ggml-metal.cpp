@@ -15,6 +15,8 @@
 #include <string>
 #include <memory>
 
+#include <TargetConditionals.h>
+
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
 
@@ -673,6 +675,25 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
     ggml_metal_set_n_cb(ctx, n_cb);
+}
+
+// iOS discards a command buffer after ~5 s of GPU time when another GPU client waits (InnocentVictim), so split graphs into 4 there
+// GGML_METAL_N_CB=1..8 overrides the default
+static int ggml_backend_metal_default_n_cb(void) {
+#if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+    int n_cb = 4;
+#else
+    int n_cb = 1;
+#endif
+    if (const char * env = getenv("GGML_METAL_N_CB")) {
+        const int v = atoi(env);
+        if (v >= 1 && v <= 8) {
+            n_cb = v;
+        } else {
+            GGML_LOG_WARN("%s: ignoring GGML_METAL_N_CB=%s (expected 1..8)\n", __func__, env);
+        }
+    }
+    return n_cb;
 }
 
 static ggml_backend_i ggml_backend_metal_i = {
