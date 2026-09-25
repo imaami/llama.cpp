@@ -435,6 +435,23 @@ static void test_decision_escape(testing & t) {
     });
 }
 
+static void test_speculative_stats(testing & t) {
+    server_slot_stats stats;
+    t.assert_true("disabled counters absent", !stats.to_json().contains("draft_n"));
+
+    stats.speculative = true;
+    auto counters = stats.to_json();
+    t.assert_equal("enabled draft count", uint64_t(0), counters.at("draft_n").get<uint64_t>());
+    t.assert_equal("enabled acceptance count", uint64_t(0), counters.at("draft_n_accepted").get<uint64_t>());
+
+    stats.speculative = false;
+    stats.n_draft_tokens = 5;
+    stats.n_draft_accepted = 3;
+    counters = stats.to_json();
+    t.assert_equal("completed draft count", uint64_t(5), counters.at("draft_n").get<uint64_t>());
+    t.assert_equal("completed acceptance count", uint64_t(3), counters.at("draft_n_accepted").get<uint64_t>());
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -447,6 +464,7 @@ int main(int argc, char ** argv) {
         t.set_filter(argv[1]);
     }
 
+    t.test("speculative_stats", test_speculative_stats);
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);
