@@ -6673,7 +6673,8 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             return true;
         }
     case VK_VENDOR_ID_INTEL:
-        if (device->architecture == vk_device_architecture::INTEL_XE2) {
+        if (device->architecture == vk_device_architecture::INTEL_XE2 ||
+            (device->architecture == vk_device_architecture::INTEL_XE1 && device->integer_dot_product && src0_type == GGML_TYPE_PTQ1_0)) {
             if (src0_type == GGML_TYPE_Q2_0 || src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K || src0_type == GGML_TYPE_Q6_K ||
                 src0_type == GGML_TYPE_PTQ1_0) {
                 return true;
