@@ -1059,6 +1059,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+bool ggml_metal_ptq1_multicol_enabled(const ggml_tensor * op) {
+    static const bool enabled = getenv("GGML_METAL_PTQ1_MULTICOL") && atoi(getenv("GGML_METAL_PTQ1_MULTICOL")) == 1;
+    return enabled && op->src[0]->type == GGML_TYPE_PTQ1_0 && op->src[1]->type == GGML_TYPE_F32 &&
+           op->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_PTQ1_0) == 0 && op->src[1]->nb[0] == sizeof(float) &&
+           op->src[1]->ne[1] >= 2 && op->src[1]->ne[1] <= 4;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1076,6 +1083,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const ggml_type tsrc1 = op->src[1]->type;
 
     const char * suffix = "";
+    char ptq1_suffix[16];
 
     bool split = false;
 
@@ -1129,6 +1137,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_PTQ1_0;
                 nr0 = N_R0_PTQ1_0;
+                if (ggml_metal_ptq1_multicol_enabled(op)) {
+                    nr0 = 4;
+                    nsg = 1;
+                    nr1 = ne11;
+                    snprintf(ptq1_suffix, sizeof(ptq1_suffix), "_mc_c%d", nr1);
+                    suffix = ptq1_suffix;
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {
