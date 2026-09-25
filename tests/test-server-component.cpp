@@ -948,6 +948,7 @@ int main(int argc, char ** argv) {
         t.set_filter(argv[1]);
     }
 
+    t.test("speculative_stats", test_speculative_stats);
     t.test("server_tokens", test_server_tokens);
     t.test("utf8",          test_utf8);
     t.test("sse",           test_sse);
