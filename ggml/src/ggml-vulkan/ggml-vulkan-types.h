@@ -384,6 +384,8 @@ struct vk_queue {
 };
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Extra mat-vec pipelines are populated only for selected BC-250 formats.
+static constexpr uint32_t mul_mat_vec_ext_cols = 16;
 
 // dequant mul_mat_vec: rows with at least dmmv_tpb8_min_blocks blocks per row can use
 // the 8-invocations-per-block shader variant, and only up to dmmv_tpb8_max_cols columns
