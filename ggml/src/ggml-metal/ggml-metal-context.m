@@ -707,15 +707,11 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
-    // when fusion stats are collected the graph must be encoded by a single thread so the
-    // counters are race-free; override whatever the caller requested
+    // Fusion counters require one encoding thread.
     if (ggml_metal_fusion_info_stats(ctx->finfo)) {
         n_cb = 0;
     }
-
-    // with an abort callback, the encoders commit only command buffers 0 and 1 (later ones only when capturing);
-    // the main thread's buffer is index n_cb, so with n_cb > 1 it would never run and synchronize would wait
-    // forever
+    // With an abort callback only command buffers 0 and 1 are committed.
     if (ctx->abort_callback && n_cb > 1) {
         GGML_LOG_WARN("%s: an abort callback allows only 1 extra command buffer; using 1 instead of %d\n", __func__, n_cb);
         n_cb = 1;
