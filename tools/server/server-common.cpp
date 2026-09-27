@@ -1500,6 +1500,24 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // Replace unsupported effort values before a template can reject the request.
+    if (!opt.reasoning_effort_allow.empty()) {
+        auto it = inputs.chat_template_kwargs.find("reasoning_effort");
+        if (it != inputs.chat_template_kwargs.end()) {
+            std::string effort;
+            try {
+                effort = json::parse(it->second).get<std::string>();
+            } catch (...) {
+                effort = it->second;
+            }
+            const auto & allow = opt.reasoning_effort_allow;
+            if (std::find(allow.begin(), allow.end(), effort) == allow.end()) {
+                SRV_INF("reasoning_effort \"%s\" is not in --reasoning-effort-allow: using \"%s\"\n", effort.c_str(), opt.reasoning_effort_fallback.c_str());
+                it->second = json(opt.reasoning_effort_fallback).dump();
+            }
+        }
+    }
+
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
@@ -1554,6 +1572,20 @@ json oaicompat_chat_params_parse(
     if (!out_session.grammar().empty()) {
         llama_params.erase("grammar");
         llama_params.erase("json_schema");
+    }
+
+    // A small client output cap can end inside the thinking block without an answer.
+    if (opt.reasoning_max_tokens_floor > 0 && inputs.enable_thinking && !out_session.thinking_end_tags().empty()) {
+        for (const char * key : {"n_predict", "max_tokens", "max_completion_tokens"}) {
+            if (llama_params.contains(key) && llama_params.at(key).is_number_integer()) {
+                const uint64_t value = llama_params.at(key).get<uint64_t>();
+                if (value > 0 && value < (uint64_t) opt.reasoning_max_tokens_floor) {
+                    const int v = (int) value;
+                    SRV_INF("%s %d raised to %d (thinking on, --reasoning-max-tokens-floor)\n", key, v, opt.reasoning_max_tokens_floor);
+                    llama_params[key] = opt.reasoning_max_tokens_floor;
+                }
+            }
+        }
     }
 
     return llama_params;
