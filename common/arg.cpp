@@ -3761,6 +3761,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-effort-allow"}, "LIST",
+        "comma-separated reasoning_effort values accepted by the chat template; replace other request or chat_template_kwargs values with --reasoning-effort-fallback (empty = allow all)",
+        [](common_params & params, const std::string & value) {
+            params.reasoning_effort_allow = string_split<std::string>(value, ',');
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_EFFORT_ALLOW"));
+    add_opt(common_arg(
+        {"--reasoning-effort-fallback"}, "WORD",
+        string_format("reasoning_effort used in place of a value --reasoning-effort-allow rejects (default: %s)", params.reasoning_effort_fallback.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.reasoning_effort_fallback = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_EFFORT_FALLBACK"));
+    add_opt(common_arg(
+        {"--reasoning-max-tokens-floor"}, "N",
+        "with thinking enabled, raise positive client output caps below N to N; --reasoning-budget still limits thinking (0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.reasoning_max_tokens_floor = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_MAX_TOKENS_FLOOR"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: enabled)\n"
