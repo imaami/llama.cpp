@@ -13163,6 +13163,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 1024, 2048, 1024));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 4096, 2048, 4096));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 8192, 2048, 8192));
+    // SwiGLU -> signed FWHT at an ffn_down width (1024 blocks): decode, verify, prefill
+    for (bool swiglu : {false, true}) {
+        for (int64_t n_tokens : {1, 8, 512}) {
+            test_cases.emplace_back(new test_fwht_signed(1024, 17408, n_tokens, GGML_TYPE_F32, swiglu));
+        }
+    }
 
 #ifdef GGML_USE_SYCL
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 1, 384));    // m=12 (N=384)
