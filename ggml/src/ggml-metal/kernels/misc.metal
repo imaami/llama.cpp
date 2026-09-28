@@ -405,12 +405,15 @@ template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(const
 template [[host_name("kernel_snake_bf16")]] kernel void kernel_snake<bfloat>(constant ggml_metal_kargs_snake &, device const bfloat *, device const float *, device const float *, device bfloat *, uint, uint, uint);
 #endif
 
-template<int N, typename src_t>
+// SWIGLU: the transform input is the SwiGLU of src (gate) and up, computed on load with the
+// same formula as kernel_swiglu, so the GLU output never round-trips through memory.
+template<int N, typename src_t, bool SWIGLU = false>
 kernel void kernel_fwht(
         constant ggml_metal_kargs_fwht & args,
         device const src_t * src,
         device float * dst,
         device const float * signs,
+        device const src_t * up,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -433,13 +436,20 @@ kernel void kernel_fwht(
 
     src += r * N;
     dst += r * N;
+    if (SWIGLU) {
+        up += r * N;
+    }
 
     const int lane = tiisg;
 
     float reg[NE];
     for (int i = 0; i < NE; i++) {
         const float s = args.n_blk > 0 ? signs[i*NW + lane] : 1.0f;
-        reg[i] = float(src[i*NW + lane])*s*scale;
+        float x = float(src[i*NW + lane]);
+        if (SWIGLU) {
+            x = (x / (1.0f + exp(-x)))*float(up[i*NW + lane]);
+        }
+        reg[i] = x*s*scale;
     }
     for (int i = 1; i < NW; i *= 2) {
         for (int j = 0; j < NE; j++) {
@@ -466,17 +476,16 @@ kernel void kernel_fwht(
     }
 }
 
-// Wide blocks: one row per threadgroup instead of per simdgroup, so each thread keeps
-// N/NT values rather than N/32. Butterflies below the simdgroup width still shuffle;
-// those up to NT go through threadgroup memory; the rest stay in registers.
-// TODO: try avoiding branch https://github.com/ggml-org/llama.cpp/pull/29094#discussion_r4049563223
-// TODO: try to unroll loops
-template<int N, int NT, typename src_t>
+// Wide blocks: one row per threadgroup instead of per simdgroup, so each thread
+// keeps N/NT values rather than N/32. Butterflies below the simdgroup width still
+// shuffle; those up to NT go through threadgroup memory; the rest stay in registers.
+template<int N, int NT, typename src_t, bool SWIGLU = false>
 kernel void kernel_fwht_tg(
         constant ggml_metal_kargs_fwht & args,
         device const src_t * src,
         device float * dst,
         device const float * signs,
+        device const src_t * up,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -498,13 +507,20 @@ kernel void kernel_fwht_tg(
 
     src += r * N;
     dst += r * N;
+    if (SWIGLU) {
+        up += r * N;
+    }
 
     const int tid = sgitg * NW + tiisg;
 
     float reg[NE];
     for (int i = 0; i < NE; i++) {
         const float s = args.n_blk > 0 ? signs[i*NT + tid] : 1.0f;
-        reg[i] = float(src[i*NT + tid])*s*scale;
+        float x = float(src[i*NT + tid]);
+        if (SWIGLU) {
+            x = (x / (1.0f + exp(-x)))*float(up[i*NT + tid]);
+        }
+        reg[i] = x*s*scale;
     }
 
     for (int i = 1; i < NW; i *= 2) {
@@ -548,25 +564,31 @@ kernel void kernel_fwht_tg(
 typedef decltype(kernel_fwht<64, float>) kernel_fwht_f32_t;
 typedef decltype(kernel_fwht<64, half>)  kernel_fwht_f16_t;
 
-template [[host_name("kernel_fwht_f32_64")]]  kernel kernel_fwht_f32_t kernel_fwht<64,  float>;
-template [[host_name("kernel_fwht_f32_128")]] kernel kernel_fwht_f32_t kernel_fwht<128, float>;
-template [[host_name("kernel_fwht_f32_256")]] kernel kernel_fwht_f32_t kernel_fwht<256, float>;
-
-template [[host_name("kernel_fwht_f16_64")]]  kernel kernel_fwht_f16_t kernel_fwht<64,  half>;
-template [[host_name("kernel_fwht_f16_128")]] kernel kernel_fwht_f16_t kernel_fwht<128, half>;
-template [[host_name("kernel_fwht_f16_256")]] kernel kernel_fwht_f16_t kernel_fwht<256, half>;
-
-template [[host_name("kernel_fwht_f32_512")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_64")]]   kernel kernel_fwht_f32_t kernel_fwht<64, float>;
+template [[host_name("kernel_fwht_f32_128")]]  kernel kernel_fwht_f32_t kernel_fwht<128, float>;
+template [[host_name("kernel_fwht_f32_256")]]  kernel kernel_fwht_f32_t kernel_fwht<256, float>;
+template [[host_name("kernel_fwht_f32_512")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512, GGML_METAL_FWHT_TG_NT, float>;
 template [[host_name("kernel_fwht_f32_1024")]] kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, float>;
 template [[host_name("kernel_fwht_f32_2048")]] kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_4096")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
-template [[host_name("kernel_fwht_f32_8192")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
-
-template [[host_name("kernel_fwht_f16_512")]]  kernel kernel_fwht_f16_t kernel_fwht_tg<512,  GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f16_64")]]   kernel kernel_fwht_f16_t kernel_fwht<64, half>;
+template [[host_name("kernel_fwht_f16_128")]]  kernel kernel_fwht_f16_t kernel_fwht<128, half>;
+template [[host_name("kernel_fwht_f16_256")]]  kernel kernel_fwht_f16_t kernel_fwht<256, half>;
+template [[host_name("kernel_fwht_f16_512")]]  kernel kernel_fwht_f16_t kernel_fwht_tg<512, GGML_METAL_FWHT_TG_NT, half>;
 template [[host_name("kernel_fwht_f16_1024")]] kernel kernel_fwht_f16_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, half>;
 template [[host_name("kernel_fwht_f16_2048")]] kernel kernel_fwht_f16_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, half>;
+template [[host_name("kernel_fwht_f32_4096")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float>;
+template [[host_name("kernel_fwht_f32_8192")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float>;
 template [[host_name("kernel_fwht_f16_4096")]] kernel kernel_fwht_f16_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, half>;
 template [[host_name("kernel_fwht_f16_8192")]] kernel kernel_fwht_f16_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, half>;
+
+template [[host_name("kernel_fwht_swiglu_f32_64")]]   kernel kernel_fwht_f32_t kernel_fwht<64, float, true>;
+template [[host_name("kernel_fwht_swiglu_f32_128")]]  kernel kernel_fwht_f32_t kernel_fwht<128, float, true>;
+template [[host_name("kernel_fwht_swiglu_f32_256")]]  kernel kernel_fwht_f32_t kernel_fwht<256, float, true>;
+template [[host_name("kernel_fwht_swiglu_f32_512")]]  kernel kernel_fwht_f32_t kernel_fwht_tg<512, GGML_METAL_FWHT_TG_NT, float, true>;
+template [[host_name("kernel_fwht_swiglu_f32_1024")]] kernel kernel_fwht_f32_t kernel_fwht_tg<1024, GGML_METAL_FWHT_TG_NT, float, true>;
+template [[host_name("kernel_fwht_swiglu_f32_2048")]] kernel kernel_fwht_f32_t kernel_fwht_tg<2048, GGML_METAL_FWHT_TG_NT, float, true>;
+template [[host_name("kernel_fwht_swiglu_f32_4096")]] kernel kernel_fwht_f32_t kernel_fwht_tg<4096, GGML_METAL_FWHT_TG_NT, float, true>;
+template [[host_name("kernel_fwht_swiglu_f32_8192")]] kernel kernel_fwht_f32_t kernel_fwht_tg<8192, GGML_METAL_FWHT_TG_NT, float, true>;
 
 constant int FC_dsv4_hc_n_hc [[function_constant(FC_DSV4_HC + 0)]];
 
