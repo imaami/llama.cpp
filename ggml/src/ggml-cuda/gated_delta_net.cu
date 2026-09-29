@@ -75,9 +75,15 @@ gated_delta_net_cuda(const float * q,
 
     float *       attn_data        = dst;
 
+    // Wait before any s_ids / state load. inp_s_copy is a host upload today, so this is a no-op
+    // on that path; ggml_cuda_try_gdn_gather_skip accepts any I32 ids tensor.
+    ggml_cuda_pdl_sync();
+
     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
-    const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+    // fused gather: read this sequence's live state straight out of the cache row s_ids[sequence]
+    const int64_t state_in_offset      = (s_ids ? (int64_t) s_ids[sequence] * s_row_stride : sequence * H * S_v * S_v)
+                                         + h_idx * S_v * S_v;
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
     state += state_out_offset;
     curr_state += state_in_offset + col * S_v;
@@ -86,7 +92,6 @@ gated_delta_net_cuda(const float * q,
     float         s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
-    ggml_cuda_pdl_sync();
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * lanes_per_col + lane_in_col;
@@ -425,6 +430,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     const float * s_d   = (const float *) src_state->data;
     float *       dst_d = (float *) dst->data;
+
+    // fused state gather, registered for this node by this context's graph evaluator (ggml_cuda_try_gdn_gather_skip)
+    const int32_t * s_ids        = nullptr;
+    int64_t         s_row_stride = 0;
+    if (const ggml_cuda_gated_delta_net_gather * gather = ctx.gdn_gathers().find(dst)) {
+        s_d          = gather->base;
+        s_ids        = gather->ids;
+        s_row_stride = gather->row_stride;
+    }
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
