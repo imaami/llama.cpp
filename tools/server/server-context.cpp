@@ -257,6 +257,7 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+    int32_t spec_depth_max = 0; // no drafting once the sequence is longer than this (0 = always draft)
 
     llama_tokens spec_draft;
 
@@ -520,6 +521,12 @@ struct server_slot {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        // deep in the context the draft passes and the multi-column verify cost more than the
+        // accepted tokens save (see --spec-draft-depth-max); decode one token per step from here
+        if (spec_depth_max > 0 && prompt.n_tokens() > spec_depth_max) {
             return 0;
         }
 
@@ -1453,6 +1460,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
+            slot.spec_depth_max = params_base.speculative.draft.n_depth_max;
             slot.n_ctx   = n_ctx_slot();
 
             slot.stats.speculative = slot.can_speculate();
@@ -4256,7 +4264,19 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        // past --spec-draft-depth-max a slot does not draft, so its draft context has no use for
+        // these rows: skip the hook (and the draft-model decode it implies) when every token of this
+        // view sits beyond the cutoff. Positions, not the slot's token count, decide it, so the early
+        // ubatches of a long prompt still reach the draft context and stay reusable as a prefix.
+        bool spec_process = spec != nullptr;
+        if (spec_process && params_base.speculative.draft.n_depth_max > 0) {
+            spec_process = false;
+            for (int i = 0; i < batch.view.size() && !spec_process; ++i) {
+                spec_process = batch.view.tokens[i].pos[0] <= params_base.speculative.draft.n_depth_max;
+            }
+        }
+
+        if (spec_process) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);

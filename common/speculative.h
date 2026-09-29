@@ -48,6 +48,9 @@ common_speculative_output_limits common_speculative_get_output_limits(
 
 // return true if the target and draft models have compatible vocabs
 bool common_speculative_are_compatible(const llama_model * model_tgt, const llama_model * model_dft);
+// True if deferred catch-up rows plus one first-draft anchor per sequence fit in one llama_decode.
+// Used by draft-mtp so a full-prefill stash (n_tokens == n_batch) does not add a 33rd row.
+bool common_speculative_mtp_first_decode_fits(int32_t n_batch, int32_t catchup_rows, int32_t n_anchors);
 
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 

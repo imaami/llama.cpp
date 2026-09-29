@@ -832,6 +832,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (ampere_mma_available(cc)) {
+                    if (ggml_cuda_batch_invariant()) {
+                        return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
+                    }
                     return src0_small && ne11 == 1;
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -865,6 +868,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
                 }
                 if (ampere_mma_available(cc)) {
+                    // a few dozen rows (the qwen35 gated-delta-net gate projections) run faster as a
+                    // mat-vec than through the tensor-core path at 2 to 8 columns: 3.4 vs 10.5 us on an RTX 3060
+                    if (ggml_cuda_batch_invariant() || src0_ne[1] <= 64) {
+                        return src0_small && ne11 <= MMVF_MAX_BATCH_SIZE;
+                    }
                     return src0_small && ne11 == 1;
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {

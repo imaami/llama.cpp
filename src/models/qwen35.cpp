@@ -184,10 +184,8 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     // capture order, then concatenate them along dim0 after the layer loop.
     std::vector<ggml_tensor *> h_capture(cparams.n_capture_layers, nullptr);
 
-    // Only unmasked nextn extraction needs a hidden row for every token; otherwise the
-    // last layer runs on the output rows alone (capture taps and layer inputs are taken
-    // before it, or sliced to the same rows).
-    const bool narrow_last = inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    // capture taps of the last layer are already narrowed when it runs on the output rows only
+    const bool narrow_last = crop_before_nextn(inp_out_ids);
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
@@ -494,7 +492,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && n_seqs == 1;
 
     ggml_tensor * state;
     if (gdn_state_rows) {
@@ -774,9 +772,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
 
-    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    // llama_context copies the first n_outputs rows of t_h_nextn when embeddings_nextn_masked is set,
+    // so publish the output rows only (as the trunk graph does); unmasked readers index by token.
+    // Matters as soon as an MTP batch has more tokens than outputs, e.g. catch-up rows decoded
+    // together with the first draft row.
+    if (cparams.embeddings_nextn_masked) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        res->t_h_nextn = cur;
+    } else {
+        res->t_h_nextn = cur;
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
