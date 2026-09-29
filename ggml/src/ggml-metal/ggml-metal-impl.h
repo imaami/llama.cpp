@@ -532,6 +532,15 @@ typedef struct {
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
+    int32_t  ne11;
+    uint64_t nb01;
+    uint64_t nb11;
+    int32_t  ne0;
+} ggml_metal_kargs_mul_mm_fewrow;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
     int32_t  ne02;
     uint64_t nb00;
     uint64_t nb01;
@@ -1272,6 +1281,11 @@ typedef struct {
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
 
+// Block widths at or above this run the threadgroup-staged FWHT kernel: the
+// register-resident one keeps N/32 values per thread, which stops fitting here.
+#define GGML_METAL_FWHT_TG_MIN_N 512
+#define GGML_METAL_FWHT_TG_NT    256
+
 typedef struct {
     int32_t  ne00;   // number of columns (elements per row)
     int32_t  ne01;   // rows
@@ -1282,11 +1296,6 @@ typedef struct {
     uint64_t nb03;
     int32_t  top_k;  // k
 } ggml_metal_kargs_top_k;
-
-// widths at or above this use the threadgroup FWHT kernel, one row per threadgroup
-// with GGML_METAL_FWHT_TG_NT threads, instead of one row per simdgroup
-#define GGML_METAL_FWHT_TG_MIN_N 512
-#define GGML_METAL_FWHT_TG_NT    256
 
 typedef struct {
     int32_t  ne01;      // n_tokens
