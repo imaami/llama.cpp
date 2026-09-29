@@ -39,7 +39,10 @@ kernel void kernel_gated_delta_net_impl(
 
     const uint i23 = tgpig.z; // B (n_seqs)
     const uint i21 = tgpig.y; // H (head)
-    const uint i20 = tgpig.x*NSG + ty; // row within S_v
+    constexpr short LANES_PER_ROW = 8;
+    constexpr short SEG = NSG*(32/LANES_PER_ROW);
+    const uint lane = tx % LANES_PER_ROW;
+    const uint i20 = (tgpig.x*NSG + ty)*(32/LANES_PER_ROW) + tx/LANES_PER_ROW;
 
     const uint i01 = i21 % args.ne01;
     const uint i11 = i21 % args.ne11;
@@ -56,10 +59,10 @@ kernel void kernel_gated_delta_net_impl(
     const uint state_in_base = state_seq_base + i21*S_v*S_v + i20*S_v;
     device const float * s_ptr = (device const float *) (s) + state_in_base;
 
-    float ls[NSG];
+    float ls[SEG];
 
-    FOR_UNROLL (short j = 0; j < NSG; j++) {
-        const short is = tx*NSG + j;
+    FOR_UNROLL (short j = 0; j < SEG; j++) {
+        const short is = lane*SEG + j;
         ls[j] = s_ptr[is];
     }
 
@@ -104,23 +107,25 @@ kernel void kernel_gated_delta_net_impl(
             }
             const float g_exp = exp(g0);
 
-            FOR_UNROLL (short j = 0; j < NSG; j++) {
-                const short is = tx*NSG + j;
+            FOR_UNROLL (short j = 0; j < SEG; j++) {
+                const short is = lane*SEG + j;
                 ls[j] *= g_exp;
 
                 s_k += ls[j]*k_ptr[is];
             }
         } else {
             // KDA
-            FOR_UNROLL (short j = 0; j < NSG; j++) {
-                const short is = tx*NSG + j;
+            FOR_UNROLL (short j = 0; j < SEG; j++) {
+                const short is = lane*SEG + j;
                 ls[j] *= exp(g_ptr[is]);
 
                 s_k += ls[j]*k_ptr[is];
             }
         }
 
-        s_k = simd_sum(s_k);
+        for (short offset = 1; offset < LANES_PER_ROW; offset <<= 1) {
+            s_k += simd_shuffle_xor(s_k, offset);
+        }
 
         float bt = b_ptr[0];
         if (RAW_GATES) {
@@ -131,16 +136,18 @@ kernel void kernel_gated_delta_net_impl(
 
         float y = 0.0f;
 
-        FOR_UNROLL (short j = 0; j < NSG; j++) {
-            const short is = tx*NSG + j;
+        FOR_UNROLL (short j = 0; j < SEG; j++) {
+            const short is = lane*SEG + j;
             ls[j] += k_ptr[is]*d;
 
             y += ls[j]*q_ptr[is];
         }
 
-        y = simd_sum(y);
+        for (short offset = 1; offset < LANES_PER_ROW; offset <<= 1) {
+            y += simd_shuffle_xor(y, offset);
+        }
 
-        if (tx == 0) {
+        if (lane == 0) {
             dst_attn[t*args.ne21*S_v] = y*scale;
         }
 
@@ -155,8 +162,8 @@ kernel void kernel_gated_delta_net_impl(
             const int target_slot = (int)args.ne22 - 1 - (int)t;
             if (target_slot >= 0 && target_slot < (int)K) {
                 device float * dst_state = (device float *)state_out + (uint)target_slot * slot_stride + state_out_base;
-                FOR_UNROLL (short j = 0; j < NSG; j++) {
-                    const short is = tx*NSG + j;
+                FOR_UNROLL (short j = 0; j < SEG; j++) {
+                    const short is = lane*SEG + j;
                     dst_state[is] = ls[j];
                 }
 
@@ -168,8 +175,8 @@ kernel void kernel_gated_delta_net_impl(
                     const uint64_t row = ((device const int64_t *) write_rows)[(uint)target_slot * args.ne23 + i23];
                     device float * dst_rows = (device float *) state_dst + row * (uint64_t)(S_v * S_v * args.ne21)
                         + (uint) i21 * S_v * S_v + i20 * S_v;
-                    FOR_UNROLL (short j = 0; j < NSG; j++) {
-                        const short is = tx*NSG + j;
+                    FOR_UNROLL (short j = 0; j < SEG; j++) {
+                        const short is = lane*SEG + j;
                         dst_rows[is] = ls[j];
                     }
                 }
@@ -179,8 +186,8 @@ kernel void kernel_gated_delta_net_impl(
 
     if (K == 1) {
         device float * dst_state = (device float *)state_out + state_out_base;
-        FOR_UNROLL (short j = 0; j < NSG; j++) {
-            const short is = tx*NSG + j;
+        FOR_UNROLL (short j = 0; j < SEG; j++) {
+            const short is = lane*SEG + j;
             dst_state[is] = ls[j];
         }
 
@@ -190,8 +197,8 @@ kernel void kernel_gated_delta_net_impl(
             const uint64_t row = ((device const int64_t *) write_rows)[i23];
             device float * dst_rows = (device float *) state_dst + row * (uint64_t)(S_v * S_v * args.ne21)
                 + (uint) i21 * S_v * S_v + i20 * S_v;
-            FOR_UNROLL (short j = 0; j < NSG; j++) {
-                const short is = tx*NSG + j;
+            FOR_UNROLL (short j = 0; j < SEG; j++) {
+                const short is = lane*SEG + j;
                 dst_rows[is] = ls[j];
             }
         }
@@ -202,6 +209,7 @@ kernel void kernel_gated_delta_net_impl(
 #undef K
 #undef HAS_ROWS
 #undef WRITE_ROWS
+#undef RAW_GATES
 }
 
 typedef decltype(kernel_gated_delta_net_impl<4>) kernel_gated_delta_net_t;
