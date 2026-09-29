@@ -14879,6 +14879,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
 
+    // in-place quantized K/V for the tensor-core prompt kernels (CUDA reads q4_0 / q8_0 straight from the cache at
+    // hs 128 / 256 instead of converting the whole cache to F16): every GQA tiling, prompt-sized batches, a KV
+    // length that is not a multiple of the tile (out-of-bounds rows), and the permuted cache layout.
+    for (ggml_type type_KV : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        for (int64_t kv : { 1024, 4096, 16384 }) {
+            for (int64_t nb : { 3, 8, 35, 512 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+        for (int64_t nr : { 1, 2, 4, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {nr, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr, 1}, 4096,  35, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1025, 512, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1025,  64, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096,  35, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, false));
+        // Isolated ALiBi / Gemma softcap on the native q4_0/q8_0 MMA path. The loop above is
+        // max_bias=0, logit_softcap=0; the one older q8_0 case at D=256 sets both at once with sinks.
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 8, true, false, 8.0f, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 8, true, false, 0, 10.0f, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 8, true, false, 8.0f, 0, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 8, true, false, 8.0f, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 8, true, false, 0, 10.0f, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -14940,6 +14966,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PTQ1_0 dedicated mat-vec, shared-memory boundary on this branch. The launch asks for
+    // ncols * rows_per_cta * (K/128 + 1) * 4 bytes (the +1 is the odd epilogue stride), twice
+    // that with a gate, against the 48 KiB default. One column and 4 rows per CTA: last K that
+    // fits is 393088 without a gate and 196480 with one; the next block over each falls back.
+    for (int64_t k : {393088, 393216}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, 1, k, {1, 1}, {1, 1}));
+    }
+    for (int64_t k : {196480, 196608}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 1, 64, k,
+            false, 1, 1, false, false, true, false, {1, 1}));
+    }
     // gate fused PTQ1_0 mat-vec with 2 to 4 columns
     for (int64_t m : {2, 3, 4}) {
         for (int64_t k : {512, 5120}) {
