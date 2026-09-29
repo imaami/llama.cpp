@@ -1634,9 +1634,15 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                               run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                               fused_nodes_to_verify.size());
+        bool cmp_ok = true;
+        for (int i = 0; i < n_eval() && cmp_ok && ud.ok; i++) {
+            if (i > 0) {
+                initialize_tensors(ctx.get());
+            }
+            cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                        run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                        fused_nodes_to_verify.size());
+        }
 
         // compare backend1 with itself: a second copy of the graph must give the same bytes
         if (deterministic(backend1)) {
