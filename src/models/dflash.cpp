@@ -173,7 +173,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     }
 
     // DSpark = DFlash + a semi-autoregressive Markov head and Confidence head
-// Reject a declared confidence head when its required Markov head is missing.
+    // Reject a declared confidence head when its required Markov head is missing.
     bool kv_confidence_head = false;
     const bool has_kv_confidence_head = ml->get_key(LLM_KV_CONFIDENCE_HEAD, kv_confidence_head, false);
 
@@ -779,18 +779,26 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     // a position's score reads only the candidate sets at pos-1 and pos, so a run
     // of positions has no internal dependency and scores in one batched matmul
     auto score_run = [&](int64_t beg_pos, int64_t n_pos, ggml_tensor * pred_ids) {
-        ggml_tensor * cand_run = ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, n_pos, n_blocks,
-                    cand_blk->nb[1], cand_blk->nb[2], beg_pos * cand_blk->nb[1]));
-        ggml_tensor * unary_run = ggml_cont(ctx0, ggml_view_3d(ctx0, unary_blk, top_k, n_pos, n_blocks,
-                    unary_blk->nb[1], unary_blk->nb[2], beg_pos * unary_blk->nb[1]));
-        ggml_tensor * gate_run = ggml_cont(ctx0, ggml_view_3d(ctx0, gate_blk, rank, n_pos, n_blocks,
-                    gate_blk->nb[1], gate_blk->nb[2], beg_pos * gate_blk->nb[1]));
+        ggml_tensor * cand_run  = ggml_view_3d(ctx0, cand_blk, top_k, n_pos, n_blocks, cand_blk->nb[1], cand_blk->nb[2],
+                                               beg_pos * cand_blk->nb[1]);
+        ggml_tensor * unary_run = ggml_view_3d(ctx0, unary_blk, top_k, n_pos, n_blocks, unary_blk->nb[1],
+                                               unary_blk->nb[2], beg_pos * unary_blk->nb[1]);
+        ggml_tensor * gate_run  = ggml_view_3d(ctx0, gate_blk, rank, n_pos, n_blocks, gate_blk->nb[1], gate_blk->nb[2],
+                                               beg_pos * gate_blk->nb[1]);
+        // A single sequence's position slice is already contiguous. Avoid three
+        // copies per score run; retain packing for interleaved multi-sequence views.
+        if (n_blocks > 1) {
+            cand_run  = ggml_cont(ctx0, cand_run);
+            unary_run = ggml_cont(ctx0, unary_run);
+            gate_run  = ggml_cont(ctx0, gate_run);
+        }
 
         const int64_t n_pred = pred_ids->ne[0] / (n_pos * n_blocks);
 
-        ggml_tensor * successor = ggml_reshape_4d(ctx0,
-                ggml_get_rows(ctx0, model.dflash_selector_next, ggml_reshape_1d(ctx0, cand_run, top_k * n_pos * n_blocks)),
-                rank, top_k, n_pos, n_blocks);
+        ggml_tensor * successor = ggml_reshape_4d(
+            ctx0,
+            ggml_get_rows(ctx0, model.dflash_selector_next, ggml_reshape_1d(ctx0, cand_run, top_k * n_pos * n_blocks)),
+            rank, top_k, n_pos, n_blocks);
         ggml_tensor * predecessor = ggml_reshape_4d(ctx0,
                 ggml_get_rows(ctx0, model.dflash_selector_prev, pred_ids),
                 rank, n_pred, n_pos, n_blocks);
@@ -872,7 +880,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
     };
-
 
     // KV cache injection
     ASSERT_EMBD_OR_TOKEN(ubatch);
@@ -1128,6 +1135,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "attn_post_norm", il);
         }
+
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);
