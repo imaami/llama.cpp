@@ -59,6 +59,9 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 //            quantized values bit-cast into ds.y; the 1-column PTQ1_0 vec-dot folds the digit bias
 //            {0,1,2} -> {-1,0,+1} into one subtraction per 32-block instead of a SIMD byte
 //            subtract per 4 weights (bit-identical to the biased path)
+//   PQ2      PQ2_0, 3-8 columns: qs bytes of a column first (permuted inside each 16-element group so that
+//            (code_word >> 2k) & 0x03030303 lines up with the activation bytes), then one half2 (d, raw int sum
+//            of q) per 32-block (see mmvq-pq2_0.cuh)
 //   PT       planar-transposed layout consumed by the 2-8 column PTQ1_0 mat-vec path
 //            (see mmvq-ptq1_0.cuh); same quantization, same bytes per row as block_q8_1, and the
 //            same exact integer sum in ds.y as SOA_ISUM so that kernel can also use unbiased trits
