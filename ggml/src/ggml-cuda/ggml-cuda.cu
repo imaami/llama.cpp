@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+#include "ggml-cuda/l2-hint.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -3399,6 +3400,38 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     return true;
 }
 
+// L2 prefetch hint (see mmvq-ptq1_0.cuh): the weights of the next PTQ1_0 mat-vec after node i. Gate/up pairs feeding one GLU
+// count as one op, so the partner of a fused gate/up kernel is skipped.
+static ggml_cuda_l2_hint_t ggml_cuda_l2_hint_for_node(const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_L2_PREFETCH_PCT"); return !e || atoi(e) > 0; }();
+    ggml_cuda_l2_hint_t hint;
+    const ggml_tensor * cur = cgraph->nodes[i];
+    if (!enabled || cur->op != GGML_OP_MUL_MAT || cur->src[0]->type != GGML_TYPE_PTQ1_0) {
+        return hint;
+    }
+    const int last = std::min(i + 64, cgraph->n_nodes - 1);
+    for (int j = i + 1; j <= last; j++) {
+        const ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_MUL_MAT || nj->src[0]->type != GGML_TYPE_PTQ1_0 || nj->src[0]->data == cur->src[0]->data) {
+            continue;
+        }
+        bool partner = false;
+        if (nj->src[1] == cur->src[1]) {
+            for (int k = i + 1; k <= std::min(j + 8, cgraph->n_nodes - 1) && !partner; k++) {
+                const ggml_tensor * g = cgraph->nodes[k];
+                partner = g->op == GGML_OP_GLU && ((g->src[0] == cur && g->src[1] == nj) || (g->src[0] == nj && g->src[1] == cur));
+            }
+        }
+        if (partner) {
+            continue;
+        }
+        hint.ptr   = (const char *) nj->src[0]->data;
+        hint.bytes = ggml_nbytes(nj->src[0]);
+        break;
+    }
+    return hint;
+}
+
 // returns whether the write (out) nodes overwrite the read nodes in operation
 // the evaluating context's q8 rows registry, set while a graph is evaluated; lets the fusion memory check see that an input's
 // quantized rows live in a pool block and not in the tensor's own buffer
@@ -4987,6 +5020,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 prev_i = i;
+                g_ggml_cuda_l2_hint = ggml_cuda_l2_hint_for_node(cgraph, i);
 
                 if (ggml_cuda_is_view_or_noop(node)) {
                     continue;
