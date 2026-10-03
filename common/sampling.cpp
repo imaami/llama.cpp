@@ -13,7 +13,6 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
-#include <iterator>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -111,30 +110,74 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
-struct logits_iterator {
-    using iterator_category = std::input_iterator_tag;
-    using value_type = llama_token_data;
-    using difference_type = ptrdiff_t;
-    using pointer = void;
-    using reference = llama_token_data;
-
-    const float * logits;
-    int32_t id;
-
-    value_type operator*() const { return { id, logits[id], 0.0f }; }
-    logits_iterator & operator++() { ++id; return *this; }
-    logits_iterator operator++(int) { auto prev = *this; ++*this; return prev; }
-    bool operator==(const logits_iterator & other) const { return logits == other.logits && id == other.id; }
-    bool operator!=(const logits_iterator & other) const { return !(*this == other); }
-};
-
-// libstdc++ partial_sort_copy preserves the tie order of partial_sort without a full token array.
+// Top k of the logits without building the full token array. It repeats the steps of libstdc++ std::partial_sort
+// (make_heap on the first k, replace the heap top by every larger logit in index order, sort_heap) so that tokens with
+// equal logits end up in the same order as with llama_sampler_top_k.
 static void topk_from_logits(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
     static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
         return a.logit > b.logit;
     };
+
     out.resize(k);
-    std::partial_sort_copy(logits_iterator{ logits, 0 }, logits_iterator{ logits, n_vocab }, out.begin(), out.end(), comp);
+    for (int32_t i = 0; i < k; i++) {
+        out[i] = llama_token_data{ i, logits[i], 0.0f };
+    }
+    std::make_heap(out.begin(), out.end(), comp);
+
+    llama_token_data * heap = out.data();
+
+    // std::__pop_heap(first, middle, result) with value = the new token: sift down to a leaf, then sift up
+    const auto replace_top = [&](const llama_token_data & value) {
+        ptrdiff_t hole = 0;
+        ptrdiff_t child = 0;
+        const ptrdiff_t len = k;
+        while (child < (len - 1) / 2) {
+            child = 2 * (child + 1);
+            if (comp(heap[child], heap[child - 1])) {
+                child--;
+            }
+            heap[hole] = heap[child];
+            hole = child;
+        }
+        if ((len & 1) == 0 && child == (len - 2) / 2) {
+            child = 2 * (child + 1);
+            heap[hole] = heap[child - 1];
+            hole = child - 1;
+        }
+        ptrdiff_t parent = (hole - 1) / 2;
+        while (hole > 0 && comp(heap[parent], value)) {
+            heap[hole] = heap[parent];
+            hole = parent;
+            parent = (hole - 1) / 2;
+        }
+        heap[hole] = value;
+    };
+
+    constexpr int32_t BLOCK = 16;
+    float thr = heap[0].logit;
+    int32_t i = k;
+    for (; i + BLOCK <= n_vocab; i += BLOCK) {
+        bool any = false;
+        for (int32_t j = 0; j < BLOCK; j++) {
+            any |= logits[i + j] > thr;
+        }
+        if (!any) {
+            continue;
+        }
+        for (int32_t j = 0; j < BLOCK; j++) {
+            if (logits[i + j] > heap[0].logit) {
+                replace_top(llama_token_data{ i + j, logits[i + j], 0.0f });
+            }
+        }
+        thr = heap[0].logit;
+    }
+    for (; i < n_vocab; i++) {
+        if (logits[i] > heap[0].logit) {
+            replace_top(llama_token_data{ i, logits[i], 0.0f });
+        }
+    }
+
+    std::sort_heap(out.begin(), out.end(), comp);
 }
 
 struct common_sampler {
