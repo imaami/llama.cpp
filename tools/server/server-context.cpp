@@ -2696,6 +2696,14 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // the buffers of an evicted checkpoint go to the new one: a fresh vector is zero-filled by resize()
+        std::vector<uint8_t> spare_tgt;
+        std::vector<uint8_t> spare_dft;
+        const auto keep_spare = [&](common_prompt_checkpoint & ckpt) {
+            spare_tgt = std::move(ckpt.data_tgt);
+            spare_dft = std::move(ckpt.data_dft);
+        };
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2708,6 +2716,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+                keep_spare(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2723,6 +2732,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            keep_spare(cur);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2743,6 +2753,9 @@ private:
         auto & cur = *ckpt;
 
         cur.id_task = id_task;
+
+        cur.data_tgt = std::move(spare_tgt);
+        cur.data_dft = std::move(spare_dft);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
