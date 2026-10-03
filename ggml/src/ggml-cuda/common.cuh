@@ -1319,15 +1319,14 @@ int ggml_cuda_get_device();
 // Ada and newer keep SOA_ISUM at one column (4070 win).
 // Lives here, after ggml_cuda_info(), because the body reads the current device's cc.
 // PQ2_0 multi-column mat-vec (mmvq-pq2_0.cuh): Ada only, plain 2D (no ids, no batch dims), 3-8 columns.
-// GGML_CUDA_PQ2_MULTICOL=0 turns it off. Batch invariance keeps the generic kernel.
+// Batch invariance keeps the generic kernel.
 static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
 #if defined(GGML_USE_HIP)
     GGML_UNUSED(ncols_dst);
     return false;
 #else
-    static const bool enabled = getenv("GGML_CUDA_PQ2_MULTICOL") == nullptr || atoi(getenv("GGML_CUDA_PQ2_MULTICOL")) != 0;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    return enabled && !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE &&
+    return !ggml_cuda_batch_invariant() && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE &&
         ncols_dst >= 3 && ncols_dst <= 8;
 #endif
 }
