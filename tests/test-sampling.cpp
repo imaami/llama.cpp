@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama.h"
+#include "sampling.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -8,6 +9,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -335,7 +339,145 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
-int main(void) {
+static int test_common_top_k(const char * model_path) {
+    if (!std::ifstream(model_path).good()) {
+        fprintf(stderr, "Model fixture not found: %s\n", model_path);
+        return 77;
+    }
+
+    llama_backend_init();
+    auto mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;
+    llama_model * model = llama_model_load_from_file(model_path, mparams);
+    GGML_ASSERT(model);
+
+    auto cparams = llama_context_default_params();
+    cparams.n_ctx = 64;
+    cparams.n_batch = 1;
+    cparams.n_ubatch = 1;
+    cparams.n_threads = 1;
+    cparams.n_threads_batch = 1;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    GGML_ASSERT(ctx);
+
+    common_batch batch(ctx);
+    batch.add(0, 0, 0, true);
+    GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+    float * logits = llama_get_logits_ith(ctx, 0);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    GGML_ASSERT(n_vocab > 128);
+
+    std::mt19937 rng(1234);
+    for (const int k : { 1, 2, 3, 20, 64, 127, 128, 129, n_vocab, n_vocab + 1 }) {
+        for (int mode = 0; mode < 8; ++mode) {
+            common_params_sampling params;
+            params.seed = 4321;
+            params.top_k = k;
+            params.temp = 1.0f;
+            params.top_p = 1.0f;
+            params.min_p = 0.0f;
+            params.n_probs = 128;
+            if (mode == 4) { params.penalty_repeat = 1.2f; }
+            if (mode == 5) { params.dry_multiplier = 1.0f; }
+            if (mode == 6) { params.top_n_sigma = 1.0f; }
+            if (mode == 7) { params.logit_bias.push_back({ 7, 2.0f }); }
+
+            auto control_params = params;
+            // Disabled XTC consumes no RNG and prevents selection before the sampler chain.
+            control_params.samplers.insert(control_params.samplers.begin(), COMMON_SAMPLER_TYPE_XTC);
+            common_sampler * fast = common_sampler_init(model, params);
+            common_sampler * control = common_sampler_init(model, control_params);
+            GGML_ASSERT(fast && control);
+
+            for (int step = 0; step < 32; ++step) {
+                for (int i = 0; i < n_vocab; ++i) {
+                    logits[i] = mode == 0 ? 0.0f : float(int(rng() % 33) - 16);
+                    if (mode == 1 && i % 7 == 0) { logits[i] = -INFINITY; }
+                    if (mode == 2 && i % 7 == 0) { logits[i] = -0.0f; }
+                    if (mode == 3) { logits[i] = float(rng()) / float(rng.max()); }
+                }
+
+                const llama_token actual = common_sampler_sample(fast, ctx, 0);
+                const llama_token expected = common_sampler_sample(control, ctx, 0);
+                GGML_ASSERT(actual == expected);
+                const auto * a = common_sampler_get_candidates(fast, false);
+                const auto * b = common_sampler_get_candidates(control, false);
+                GGML_ASSERT(a->size == b->size && a->selected == b->selected && a->sorted == b->sorted);
+                for (size_t i = 0; i < a->size; ++i) {
+                    GGML_ASSERT(a->data[i].id == b->data[i].id);
+                    GGML_ASSERT(std::memcmp(&a->data[i].logit, &b->data[i].logit, sizeof(float)) == 0);
+                    GGML_ASSERT(std::memcmp(&a->data[i].p, &b->data[i].p, sizeof(float)) == 0);
+                }
+                common_sampler_accept(fast, actual, true);
+                common_sampler_accept(control, expected, true);
+                if (step == 8) {
+                    auto * cloned = common_sampler_clone(fast);
+                    common_sampler_free(fast);
+                    fast = cloned;
+                }
+                if (step == 16) {
+                    auto * copied = common_sampler_init(model, params);
+                    common_sampler_copy(fast, copied);
+                    common_sampler_free(fast);
+                    fast = copied;
+                }
+            }
+            common_sampler_free(fast);
+            common_sampler_free(control);
+        }
+    }
+
+    // The required token is outside the initial top-k shortlist.
+    for (int i = 0; i < n_vocab; ++i) {
+        logits[i] = float(i);
+    }
+    llama_token token_x = LLAMA_TOKEN_NULL;
+    for (llama_token i = 0; i < n_vocab; ++i) {
+        if (common_token_to_piece(llama_model_get_vocab(model), i) == "x") {
+            token_x = i;
+            break;
+        }
+    }
+    GGML_ASSERT(token_x >= 0 && token_x < n_vocab - 20);
+    for (bool grammar_first : { false, true }) {
+        common_params_sampling params;
+        params.top_k = 20;
+        params.seed = 1234;
+        params.grammar = { COMMON_GRAMMAR_TYPE_USER, "root ::= \"x\"+" };
+        auto * sampler = common_sampler_init(model, params);
+        for (int step = 0; step < 8; ++step) {
+            const auto token = common_sampler_sample(sampler, ctx, 0, grammar_first);
+            GGML_ASSERT(token == token_x);
+            common_sampler_accept(sampler, token, true);
+        }
+        common_sampler_free(sampler);
+    }
+    {
+        common_params_sampling params;
+        params.top_k = 20;
+        params.reasoning_budget_start = { 1 };
+        params.reasoning_budget_end = { { 2 } };
+        params.reasoning_budget_forced = { 7, 2 };
+        params.reasoning_budget_tokens = 16;
+        auto * sampler = common_sampler_init(model, params);
+        common_sampler_accept(sampler, 1, true);
+        GGML_ASSERT(common_sampler_reasoning_budget_force(sampler));
+        GGML_ASSERT(common_sampler_sample(sampler, ctx, 0) == 7);
+        common_sampler_free(sampler);
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_backend_free();
+    printf("Common top-k candidates, probabilities and tokens match\n");
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    if (argc == 2) {
+        return test_common_top_k(argv[1]);
+    }
+
     ggml_time_init();
 
     test_dist_singleton_rng();
