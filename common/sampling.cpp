@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -109,6 +110,32 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+struct logits_iterator {
+    using iterator_category = std::input_iterator_tag;
+    using value_type = llama_token_data;
+    using difference_type = ptrdiff_t;
+    using pointer = void;
+    using reference = llama_token_data;
+
+    const float * logits;
+    int32_t id;
+
+    value_type operator*() const { return { id, logits[id], 0.0f }; }
+    logits_iterator & operator++() { ++id; return *this; }
+    logits_iterator operator++(int) { auto prev = *this; ++*this; return prev; }
+    bool operator==(const logits_iterator & other) const { return logits == other.logits && id == other.id; }
+    bool operator!=(const logits_iterator & other) const { return !(*this == other); }
+};
+
+// libstdc++ partial_sort_copy preserves the tie order of partial_sort without a full token array.
+static void topk_from_logits(const float * logits, int32_t n_vocab, int32_t k, std::vector<llama_token_data> & out) {
+    static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    };
+    out.resize(k);
+    std::partial_sort_copy(logits_iterator{ logits, 0 }, logits_iterator{ logits, n_vocab }, out.begin(), out.end(), comp);
+}
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -124,6 +151,8 @@ struct common_sampler {
 
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
+    // > 0: the chain starts with top-k (all earlier samplers are no-ops), so cur_p can be built from the top k logits only
+    int32_t fast_topk = 0;
 
     void reset() {
         prev.clear();
@@ -165,6 +194,27 @@ struct common_sampler {
         cur_p = { cur.data(), cur.size(), -1, false };
     }
 
+    // cur_p = the k largest logits in descending order, same entries and order as top-k on the full array (set_logits + std::partial_sort)
+    // returns false if the logits are not plain CPU logits (backend sampling)
+    bool set_logits_topk(struct llama_context * ctx, int idx, int32_t k) {
+        if (llama_get_sampled_probs_ith(ctx, idx) || llama_get_sampled_logits_ith(ctx, idx)) {
+            return false;
+        }
+
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        if (n_vocab <= k) {
+            return false;
+        }
+
+        topk_from_logits(logits, n_vocab, k, cur);
+
+        cur_p = { cur.data(), cur.size(), -1, true };
+        return true;
+    }
+
     common_time_meas tm() {
         return common_time_meas(t_total_us, params.no_perf);
     }
@@ -186,6 +236,46 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// k > 0 if the sampler chain starts with top-k (every sampler before it does nothing with these settings)
+static int32_t common_sampler_fast_topk(const common_params_sampling & params, bool has_logit_bias) {
+#ifndef __GLIBCXX__
+    // Equal-logit ordering must match the standard library's partial_sort.
+    GGML_UNUSED(params);
+    GGML_UNUSED(has_logit_bias);
+    return 0;
+#else
+    if (has_logit_bias || params.mirostat != 0 || params.backend_sampling || params.top_k <= 0 || params.top_k > 128) {
+        return 0;
+    }
+
+    for (const auto cnstr : params.samplers) {
+        switch (cnstr) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                return params.top_k;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (params.penalty_last_n != 0 && (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && params.dry_penalty_last_n != 0) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (params.top_n_sigma > 0.0f) {
+                    return 0;
+                }
+                break;
+            default:
+                return 0;
+        }
+    }
+
+    return 0;
+#endif
 }
 
 struct common_sampler * common_sampler_init(
@@ -326,6 +416,8 @@ struct common_sampler * common_sampler_init(
         }
     }
 
+    bool has_logit_bias = false;
+
     // logit bias: user biases + model suppress tokens (-INFINITY)
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
@@ -337,6 +429,7 @@ struct common_sampler * common_sampler_init(
         }
 
         if (!merged.empty()) {
+            has_logit_bias = true;
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
         }
     }
@@ -443,6 +536,8 @@ struct common_sampler * common_sampler_init(
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
+    result->fast_topk = common_sampler_fast_topk(result->params, has_logit_bias);
+
     return result;
 }
 
@@ -525,6 +620,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
+        /* .fast_topk = */ gsmpl->fast_topk,
     };
 }
 
@@ -546,6 +642,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
+    dst->fast_topk  = src->fast_topk;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -616,7 +713,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // top-k directly from the logits when nothing before the top-k sampler reads the full array
+    const bool fast = gsmpl->fast_topk > 0 &&
+        !(grammar_first && grammar_should_apply(gsmpl)) &&
+        !(rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) &&
+        gsmpl->set_logits_topk(ctx, idx, gsmpl->fast_topk);
+
+    if (!fast) {
+        gsmpl->set_logits(ctx, idx);
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
