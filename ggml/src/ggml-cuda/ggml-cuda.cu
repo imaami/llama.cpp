@@ -3055,6 +3055,22 @@ static bool ggml_cuda_try_gdn_gather_skip(ggml_backend_cuda_context & ctx, const
             if (gr->ne[0] != D || v->ne[3] != 1 || ggml_nelements(cur) != D) {
                 return false;
             }
+            // ggml-alloc sees the GET_ROWS as the last reader of ids, so a later node can reuse ids memory before the GDN kernel reads it
+            const char * ids_beg = (const char *) ids->data;
+            const char * ids_end = ids_beg + ggml_nbytes(ids);
+            for (int k = node_idx + 1; k <= j; ++k) {
+                const ggml_tensor * t = cgraph->nodes[k];
+                const char *        b = (const char *) t->data;
+                if (b != nullptr && b < ids_end && ids_beg < b + ggml_nbytes(t)) {
+                    return false;
+                }
+            }
+            // on a concurrent stream, other nodes can run at the same time as the GDN op
+            for (const auto & [fork_node, event] : ctx.stream_context().concurrent_events) {
+                if (event.stream_mapping.find(n) != event.stream_mapping.end()) {
+                    return false;
+                }
+            }
             ggml_cuda_gated_delta_net_gather gather;
             gather.base       = (const float *) cache->data;
             gather.ids        = (const int32_t *) ids->data;
@@ -3905,6 +3921,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_get_op_params_i32(node, 1) == 0 && ggml_are_same_shape(node->src[0], node->src[1]) &&
                 ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) &&
                 mm->src[1]->ne[1] >= 32 &&
+                (mm->src[0]->type == GGML_TYPE_Q1_0 || mm->src[0]->type == GGML_TYPE_Q2_0 ||
+                 mm->src[0]->type == GGML_TYPE_PQ2_0) &&
                 ggml_cuda_should_use_mmq(mm->src[0]->type, cc, mm->src[1]->ne[1], 0) &&
                 ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
@@ -6349,9 +6367,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // rows-indexed state read (src[6]) not implemented on CUDA yet;
-            // reject so it falls back instead of silently reading src[5] as a scratch
-            if (op->src[6] != NULL) {
+            // Rows-indexed state reads are not implemented by this backend.
+            if (op->src[6] != nullptr) {
                 return false;
             }
             return true;
