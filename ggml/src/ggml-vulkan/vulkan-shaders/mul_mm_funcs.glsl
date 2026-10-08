@@ -455,11 +455,12 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
         const float d = float(a_ptq1_0.data[ib].d);
 
         const uint k_pair = row * mm_load_vec_a() / 2;
-        [[unroll]] for (uint l = 0; l < 4; ++l) {
-            store_a(col, k_pair + l, FLOAT_TYPEV2(
-                ptq1_0_trit(ib, 0u, e0 + 2u*l)      * d,
-                ptq1_0_trit(ib, 0u, e0 + 2u*l + 1u) * d));
-        }
+        const vec4 v0 = ptq1_0_trits4(ib, 0u, e0) * d;
+        const vec4 v1 = ptq1_0_trits4(ib, 0u, e0 + 4u) * d;
+        store_a(col, k_pair,     FLOAT_TYPEV2(v0.xy));
+        store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
+        store_a(col, k_pair + 2, FLOAT_TYPEV2(v1.xy));
+        store_a(col, k_pair + 3, FLOAT_TYPEV2(v1.zw));
     } else if (MmTypeA == GGML_TYPE_PQ2_0) {
         const uint idx = pos_a + col * p.stride_a / mm_load_vec_a() + row;
 
