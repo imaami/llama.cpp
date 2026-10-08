@@ -3016,7 +3016,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             batch.set_embd_state(idx, { next.h.data() + (size_t) end * n_embd, 1, (size_t) n_embd });
                             ++end;
                         }
-                        const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                        const int32_t rc = trim_window() ? llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) : -1;
                         if (rc != 0) {
                             SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                                     head, (int) rc, (int) batch_in.tokens[beg].pos[0]);
@@ -3206,7 +3206,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            int ret = trim_window() ? llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) : -1;
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 if (i == 0) {
@@ -4184,6 +4184,27 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+
+    if (params.speculative.draft.n_window > 0) {
+        char arch[64] = {};
+        llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch));
+        if (!spec_mtp || has_draft || (std::strcmp(arch, "qwen35") != 0 && std::strcmp(arch, "qwen35moe") != 0)) {
+            LOG_ERR("%s: --spec-draft-window requires Qwen3.5 MTP in the target GGUF\n", __func__);
+            return;
+        }
+        // Keep room for a catch-up batch and a draft batch. Do the arithmetic before narrowing;
+        // an INT_MAX CLI value must not wrap into a tiny allocation. A depth cutoff alone does
+        // not justify shrinking the cache: resumed prompts may still need catch-up beyond it.
+        const uint64_t span = (uint64_t) params.speculative.draft.n_window;
+        const uint64_t pad = 2ull * std::max(cparams.n_batch, cparams.n_ubatch) +
+                             (uint64_t) std::max(0, params.speculative.draft.n_max) + 256;
+        const uint64_t need = GGML_PAD(span + pad, 256) * std::max<uint32_t>(1, cparams.n_seq_max);
+        if (need < cparams.n_ctx) {
+            LOG_INF("%s: MTP draft cache sized to %u tokens (window %d, target %u)\n", __func__,
+                    (uint32_t) need, params.speculative.draft.n_window, cparams.n_ctx);
+            cparams.n_ctx = (uint32_t) need;
+        }
+    }
 
     // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
     cparams.ctx_other = ctx_tgt;
