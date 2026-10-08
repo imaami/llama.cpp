@@ -3564,6 +3564,18 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         // Qwen3-Coder (tool calling with XML-style format)
         auto tst = peg_tester("models/templates/Qwen3-Coder.jinja", detailed_debug);
 
+        const common_chat_tool two_strings {
+            "two_strings", "Two string arguments",
+            R"({"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b"]})"
+        };
+        for (const std::string close : {"\n</parameter>\n", "\n</parameter>", "</parameter>\n", "</parameter>"}) {
+            tst.test("<tool_call>\n<function=two_strings>\n<parameter=a>\nfirst" + close +
+                     "<parameter=b>\nsecond" + close + "</function>\n</tool_call>")
+                .tools({two_strings})
+                .expect_tool_calls({ { "two_strings", R"({"a":"first","b":"second"})", {} } })
+                .run();
+        }
+
         tst.test("Hello, world!\nWhat's up?").expect(message_assist).expect_reconstruction().run();
 
         tst.test(

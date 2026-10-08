@@ -88,9 +88,18 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
         // Tool call parser
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
-            auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
+            // Accept missing framing newlines, while still requiring the closing tag.
+            const std::vector<std::string> arg_close_delims = {
+                "\n</parameter>", "</parameter>",
+            };
+            auto arg_close = p.tool_arg_close(p.choice({
+                p.literal("\n</parameter>"), p.literal("</parameter>"),
+            }));
+            // AC stops at the first complete delimiter. Keep its optional suffix outside
+            // the automaton, or the shorter delimiter would reject the trailing newline.
+            auto arg_suffix = p.optional(p.literal("\n"));
             auto arg_string = p.rule("xml-arg-string",
-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
+                p.ac(p.tool_arg_string_value(p.until_one_of(arg_close_delims)) + arg_close, arg_close_delims) + arg_suffix);
 
             auto tool_choice = p.choice();
             foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
@@ -109,7 +118,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
                     auto arg_value = p.eps();
                     if (!types.has(common_chat_schema::TYPE_STRING)) {
-                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
+                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close + arg_suffix;
                     } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
                         arg_value = arg_string;
                     } else {
@@ -131,7 +140,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                         if (types.has(common_chat_schema::TYPE_NULL)) {
                             json_value |= p.json_null();
                         }
-                        arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
+                        arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close + arg_suffix) | arg_string, "xml-arg-string");
                     }
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
