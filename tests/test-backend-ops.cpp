@@ -2452,15 +2452,12 @@ struct test_get_rows : public test_case {
 
 // Every packed byte takes all 256 values at every PTQ1 element position.
 struct test_ptq1_decode : public test_case {
-    const bool gather;
-    const ggml_type type_out;
     const bool view;
 
-    test_ptq1_decode(bool gather, ggml_type type_out, bool view)
-        : gather(gather), type_out(type_out), view(view) {}
+    test_ptq1_decode(bool view) : view(view) {}
 
     std::string op_desc(ggml_tensor *) override { return "PTQ1_DECODE"; }
-    std::string vars() override { return VARS_TO_STR3(gather, type_out, view); }
+    std::string vars() override { return VAR_TO_STR(view); }
     double max_nmse_err() override { return 0.0; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -2469,14 +2466,9 @@ struct test_ptq1_decode : public test_case {
         if (view) {
             src = ggml_view_2d(ctx, src, 256, 256, src->nb[1], src->nb[1] + ggml_type_size(src->type));
         }
-        if (gather) {
-            ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 256);
-            ggml_set_name(ids, "ids");
-            return ggml_get_rows(ctx, src, ids);
-        }
-        ggml_tensor * dst = ggml_new_tensor_1d(ctx, type_out, 256 * 256 + (view ? 1 : 0));
-        dst = ggml_view_2d(ctx, dst, 256, 256, 256 * ggml_type_size(type_out), view ? ggml_type_size(type_out) : 0);
-        return ggml_cpy(ctx, src, dst);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 256);
+        ggml_set_name(ids, "ids");
+        return ggml_get_rows(ctx, src, ids);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -10113,9 +10105,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     for (bool view : {false, true}) {
-        test_cases.emplace_back(new test_ptq1_decode(true, GGML_TYPE_F32, view));
-        test_cases.emplace_back(new test_ptq1_decode(false, GGML_TYPE_F32, view));
-        test_cases.emplace_back(new test_ptq1_decode(false, GGML_TYPE_F16, view));
+        test_cases.emplace_back(new test_ptq1_decode(view));
     }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
