@@ -535,6 +535,8 @@ static constexpr std::initializer_list<ggml_op> snake_pattern              { GGM
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
 
+static constexpr std::initializer_list<ggml_op> fwht_signed_pattern { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+
 static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
@@ -970,6 +972,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
     vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_signed_f32[GGML_VK_FWHT_NUM_SIZES];
     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
@@ -1321,6 +1324,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_fwht_signed {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

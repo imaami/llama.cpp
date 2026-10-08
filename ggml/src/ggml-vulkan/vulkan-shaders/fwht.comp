@@ -21,6 +21,10 @@ layout(push_constant) uniform parameter
     uint src_offset;
     uint dst_offset;
     float scale;
+#ifdef FWHT_SIGNED
+    uint sign_width;
+    uint sign_offset;
+#endif
 };
 
 layout(binding = 0, std430) readonly buffer A {
@@ -31,6 +35,9 @@ layout(binding = 0, std430) readonly buffer A {
 #endif
 };
 layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+#ifdef FWHT_SIGNED
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+#endif
 
 const uint EL_W = N / BLOCK_SIZE;
 
@@ -53,6 +60,9 @@ void main() {
             base_row += gl_NumWorkGroups.x * gl_WorkGroupSize.y) {
         const uint row = base_row + row_id;
         const uint row_offset = row * N;
+#ifdef FWHT_SIGNED
+        const uint sign_row_offset = sign_offset + row_offset % sign_width;
+#endif
 
 #ifndef FWHT_SHMEM
         if (row >= n_rows) {
@@ -64,7 +74,15 @@ void main() {
 
         [[unroll]]
         for (uint i = 0; i < EL_W; ++i) {
+#ifdef FWHT_SIGNED
+            const uint col = row_offset + i * BLOCK_SIZE + tid;
+            // Match the rounding of MUL followed by the normalized FWHT.
+            precise float val = row < n_rows ? data_a[src_offset + col] * data_s[sign_row_offset + i * BLOCK_SIZE + tid] : 0.0;
+            precise float scaled = val * scale;
+            reg[i] = scaled;
+#else
             reg[i] = row < n_rows ? float(data_a[src_offset + row_offset + i * BLOCK_SIZE + tid]) * scale : 0.0;
+#endif
         }
 
 #ifdef FWHT_SHMEM
