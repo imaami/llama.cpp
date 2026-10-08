@@ -4029,6 +4029,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 3)) {
             const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
             if (weight && weight->type == GGML_TYPE_F32 && ggml_is_contiguous(weight) &&
+                    node->ne[2] <= UINT16_MAX && node->ne[3] <= UINT16_MAX &&
                     weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1) {
                 ggml_cuda_pool_alloc<float> row_scale(cuda_ctx->pool(), ggml_nrows(node));
                 ggml_cuda_op_add_rms_norm_scale_fused(*cuda_ctx, node, rms_norm, row_scale.get());
@@ -4067,6 +4068,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 2, false, true)) {
             const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
             if (weight && weight->type == GGML_TYPE_F32 && ggml_is_contiguous(weight) &&
+                    node->ne[2] <= UINT16_MAX && node->ne[3] <= UINT16_MAX &&
                     weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1 &&
                     weight->data != node->data && weight->data != rms_norm->data &&
                     weight->data != mul->data) {
@@ -5119,7 +5121,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_are_same_shape(node, rms) && ggml_is_contiguous(node->src[0]) &&
                             ggml_is_contiguous(node->src[1]) && ggml_is_contiguous(node) &&
                             ggml_is_contiguous(mul) && ggml_is_contiguous(weight) &&
-                            weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1 && node->ne[1] >= 32 &&
+                            node->ne[2] <= UINT16_MAX && node->ne[3] <= UINT16_MAX &&
+                    weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1 && node->ne[1] >= 32 &&
                             ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 2) &&
                             ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 2)) {
                         auto row_scale = std::make_unique<ggml_cuda_pool_alloc<char>>(
@@ -5225,9 +5228,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 CUDA_CHECK(cudaEventRecord(end, cuda_ctx->stream(cuda_ctx->device, 0)));
                 CUDA_CHECK(cudaEventSynchronize(end));
                 struct acc { double ms = 0; int64_t n = 0; };
-                static std::map<std::string, acc> totals;
-                static int64_t n_graphs = 0;
-                static double  ms_graphs = 0;
+                static thread_local std::map<std::string, acc> totals;
+                static thread_local int64_t n_graphs = 0;
+                static thread_local double  ms_graphs = 0;
                 for (size_t k = 0; k < op_events.size(); ++k) {
                     float ms = 0.0f;
                     CUDA_CHECK(cudaEventElapsedTime(&ms, op_events[k].second, k + 1 < op_events.size() ? op_events[k + 1].second : end));

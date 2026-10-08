@@ -383,12 +383,14 @@ static __global__ void mul_mat_vec_ptq1_0_pt(
 
     // the last CTAs have finished their loads and the DRAM is about to go idle: pull the head of the next
     // mat-vec's weights into L2 (prefetch.global.L2 keeps the loads off the critical path of this kernel)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (pf_ptr != nullptr && (int) blockIdx.x + pf_ctas >= (int) gridDim.x) {
         const char * pf = pf_ptr + (size_t) ((int) blockIdx.x - ((int) gridDim.x - pf_ctas)) * pf_lines_per_cta * 128;
         for (int i = tid; i < pf_lines_per_cta; i += PTQ1_0_PT_THREADS) {
             asm volatile("prefetch.global.L2 [%0];" :: "l"(pf + (size_t) i * 128));
         }
     }
+#endif
 
     __syncthreads();
 
