@@ -195,7 +195,15 @@ static bool stacks_point_into_rules(llama_grammar * grammar) {
         for (const llama_grammar_element * pe : stack) {
             bool found = false;
             for (const auto & rule : rules) {
-                found = found || (!rule.empty() && pe >= rule.data() && pe < rule.data() + rule.size());
+                for (const auto & element : rule) {
+                    if (pe == &element) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    break;
+                }
             }
             if (!found) {
                 return false;
