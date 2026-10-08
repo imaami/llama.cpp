@@ -227,7 +227,7 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
             FWHT_CASE(2048)
             FWHT_SMEM_CASE(4096)
 #if !defined(GGML_USE_MUSA)
-            // 32 KiB of shared memory exceeds the MUSA launch limit.
+            // 32 KiB of shared memory exceeds the MUSA limit; use the generic fallback.
             FWHT_SMEM_CASE(8192)
 #endif
             default:
@@ -240,7 +240,6 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
         FWHT_BLOCK_CASE(2048)
         FWHT_BLOCK_CASE(4096)
 #if !defined(GGML_USE_MUSA)
-        // 32 KiB of shared memory exceeds the MUSA launch limit.
         FWHT_BLOCK_CASE(8192)
 #endif
 #undef FWHT_CASE
