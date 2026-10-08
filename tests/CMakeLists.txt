@@ -367,6 +367,9 @@ llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-mtp-catchup-batch.cpp  LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-mtp-window.cpp LABEL "model behavior"
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/tiny-qwen35-mtp.gguf")
+    set_tests_properties(test-mtp-window PROPERTIES SKIP_RETURN_CODE 77)
     llama_build_and_test(test-mtp.cpp LABEL "model behavior"
         ARGS "${CMAKE_CURRENT_BINARY_DIR}/tiny-qwen35-mtp.gguf")
     set_tests_properties(test-mtp PROPERTIES SKIP_RETURN_CODE 77)
@@ -379,7 +382,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                 ARGS "${CMAKE_CURRENT_SOURCE_DIR}/gen_tiny_qwen35_mtp.py"
                     "${CMAKE_CURRENT_BINARY_DIR}/tiny-qwen35-mtp.gguf")
             set_tests_properties(test-generate-mtp-fixture PROPERTIES FIXTURES_SETUP mtp-fixture)
-            set_tests_properties(test-mtp PROPERTIES FIXTURES_REQUIRED mtp-fixture)
+            set_tests_properties(test-mtp test-mtp-window PROPERTIES FIXTURES_REQUIRED mtp-fixture)
         endif()
     endif()
 endif()
