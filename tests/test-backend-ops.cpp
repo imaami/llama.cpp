@@ -5614,18 +5614,31 @@ struct test_mul_mat_hadamard : public test_mul_mat {
 
 // sign flip + reshape + FWHT-hint matmul, the fusable Hadamard activation path
 struct test_fwht_signed : public test_case {
+    enum option : uint32_t {
+        VIEW_X       = 1u << 0,
+        VIEW_S       = 1u << 1,
+        SCALED_SIGNS = 1u << 2,
+        MARK_MUL     = 1u << 3,
+        MARK_RESHAPE = 1u << 4,
+        USE_MUL      = 1u << 5,
+        USE_RESHAPE  = 1u << 6,
+        INPLACE      = 1u << 7,
+    };
+
     const int64_t blk;
     const int64_t width;
     const int64_t n_tokens;
     const ggml_type type_x;
     const bool swiglu; // x is the SwiGLU of a gate and an up projection (the ffn_down input)
+    const uint32_t options;
+    std::vector<ggml_tensor *> checked_nodes;
 
     test_fwht_signed(int64_t blk = 1024, int64_t width = 5120, int64_t n_tokens = 7,
-                     ggml_type type_x = GGML_TYPE_F32, bool swiglu = false)
-        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), swiglu(swiglu) {}
+                     ggml_type type_x = GGML_TYPE_F32, bool swiglu = false, uint32_t options = 0)
+        : blk(blk), width(width), n_tokens(n_tokens), type_x(type_x), swiglu(swiglu), options(options) {}
 
     std::string vars() override {
-        return VARS_TO_STR5(blk, width, n_tokens, type_x, swiglu);
+        return VARS_TO_STR6(blk, width, n_tokens, type_x, swiglu, options);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5636,8 +5649,11 @@ struct test_fwht_signed : public test_case {
     // the point of this case is the fused sign/SwiGLU + transform path, which a
     // node-by-node comparison never reaches
     bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked_nodes; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked_nodes.clear();
+        GGML_ASSERT(!(options & VIEW_X) || (!swiglu && type_x == GGML_TYPE_F32));
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk);
         ggml_set_name(a, "a");
         ggml_tensor * x;
@@ -5647,23 +5663,55 @@ struct test_fwht_signed : public test_case {
             ggml_tensor * u = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
             ggml_set_name(u, "u");
             x = ggml_swiglu_split(ctx, g, u);
+        } else if (options & VIEW_X) {
+            ggml_tensor * storage = ggml_new_tensor_1d(ctx, type_x, width * n_tokens + 1);
+            ggml_set_name(storage, "x_storage");
+            x = ggml_view_2d(ctx, storage, width, n_tokens, width * sizeof(float), sizeof(float));
         } else {
             x = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
         }
         ggml_set_name(x, "x");
-        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        ggml_tensor * s;
+        if (options & VIEW_S) {
+            ggml_tensor * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width + 1);
+            ggml_set_name(storage, "s_storage");
+            s = ggml_view_1d(ctx, storage, width, sizeof(float));
+        } else {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        }
         ggml_set_name(s, "s");
 
-        ggml_tensor * cur = ggml_mul(ctx, x, s);
-        cur = ggml_reshape_2d(ctx, cur, blk, width / blk * n_tokens);
-        ggml_tensor * out = ggml_mul_mat(ctx, a, cur);
+        ggml_tensor * mul = (options & INPLACE) ? ggml_mul_inplace(ctx, x, s) : ggml_mul(ctx, x, s);
+        ggml_set_name(mul, "signed_input");
+        ggml_tensor * reshape = ggml_reshape_2d(ctx, mul, blk, width / blk * n_tokens);
+        ggml_set_name(reshape, "signed_blocks");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, reshape);
         ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+        if (options & MARK_MUL) {
+            ggml_set_output(mul);
+            checked_nodes.push_back(mul);
+        }
+        if (options & MARK_RESHAPE) {
+            ggml_set_output(reshape);
+            checked_nodes.push_back(reshape);
+        }
+        if (options & (USE_MUL | USE_RESHAPE)) {
+            ggml_set_name(out, "fwht_out");
+            checked_nodes.push_back(out);
+            ggml_tensor * extra = ggml_scale(ctx, (options & USE_MUL) ? mul : reshape, 0.25f);
+            extra = ggml_reshape_2d(ctx, extra, blk, width / blk * n_tokens);
+            out = ggml_add(ctx, out, extra);
+        }
         ggml_set_name(out, "out");
+        checked_nodes.push_back(out);
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE && strcmp(t->name, "s") != 0) {
+                continue;
+            }
             if (strcmp(t->name, "a") == 0) {
                 const int64_t n_cols = t->ne[0];
                 const int64_t n_rows = ggml_nrows(t);
@@ -5681,7 +5729,8 @@ struct test_fwht_signed : public test_case {
             } else if (strcmp(t->name, "s") == 0) {
                 std::vector<float> data(ggml_nelements(t));
                 for (size_t i = 0; i < data.size(); i++) {
-                    data[i] = (i % 3 == 0) ? -1.0f : 1.0f;
+                    data[i] = (options & SCALED_SIGNS) ? (int(i % 29) - 14) * 0.117f :
+                              (i % 3 == 0) ? -1.0f : 1.0f;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
             } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
@@ -10934,6 +10983,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(1024, 5120, 32));
     test_cases.emplace_back(new test_fwht_signed(1024, 6144, 7, GGML_TYPE_F16));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 3));
+    // Bonsai 2 block width, unaligned views, and intermediates that must prevent fusion.
+    for (int64_t n_tokens : {1, 7}) {
+        test_cases.emplace_back(new test_fwht_signed(128, 5120, n_tokens));
+    }
+    test_cases.emplace_back(new test_fwht_signed(128, 5120, 1, GGML_TYPE_F32, false, test_fwht_signed::VIEW_X));
+    test_cases.emplace_back(new test_fwht_signed(128, 5120, 7, GGML_TYPE_F32, false, test_fwht_signed::VIEW_S));
+    test_cases.emplace_back(new test_fwht_signed(128, 5120, 7, GGML_TYPE_F32, false,
+                test_fwht_signed::VIEW_X | test_fwht_signed::VIEW_S | test_fwht_signed::SCALED_SIGNS));
+    test_cases.emplace_back(new test_fwht_signed(128, 5120, 7, GGML_TYPE_F32, false, test_fwht_signed::MARK_MUL));
+    test_cases.emplace_back(new test_fwht_signed(128, 5120, 7, GGML_TYPE_F32, false, test_fwht_signed::MARK_RESHAPE));
+    test_cases.emplace_back(new test_fwht_signed(128, 5120, 7, GGML_TYPE_F32, false, test_fwht_signed::USE_MUL));
+    test_cases.emplace_back(new test_fwht_signed(128, 5120, 7, GGML_TYPE_F32, false, test_fwht_signed::USE_RESHAPE));
+    test_cases.emplace_back(new test_fwht_signed(128, 5120, 1, GGML_TYPE_F32, false, test_fwht_signed::INPLACE));
     // SwiGLU -> sign flip -> FWHT, the ffn_down input of a rotated model
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 1,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 17408, 8,   GGML_TYPE_F32, true));
