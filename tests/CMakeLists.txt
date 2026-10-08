@@ -297,6 +297,11 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-mtp-catchup-batch.cpp)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-mtp-window.cpp LABEL "model"
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/tiny-qwen35-mtp.gguf")
+    set_tests_properties(test-mtp-window PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)

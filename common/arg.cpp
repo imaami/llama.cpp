@@ -4251,6 +4251,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_depth_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_DEPTH_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-window"}, "N",
+        "retain N past positions in the Qwen3.5 MTP draft cache (plus the current batch); "
+        "0 = full history (default). The target retains its full context",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("spec-draft-window must be nonnegative");
+            }
+            params.speculative.draft.n_window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_CLI})
+        .set_env("LLAMA_ARG_SPEC_DRAFT_WINDOW"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

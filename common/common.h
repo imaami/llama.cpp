@@ -339,6 +339,10 @@ struct common_params_speculative_draft {
     // even near 24k tokens and costs 30% at 64k. Past the cutoff the slot decodes one token per step.
     int32_t n_depth_max = 0;
 
+    // Qwen3.5 MTP retains this many past positions per sequence, plus the current batch.
+    // Zero preserves full history. The target context is never trimmed by this option.
+    int32_t n_window = 0;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
