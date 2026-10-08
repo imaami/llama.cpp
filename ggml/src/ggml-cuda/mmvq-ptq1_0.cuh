@@ -275,13 +275,17 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
 #ifndef PTQ1_0_PT_MINB_34
 #define PTQ1_0_PT_MINB_34 3
 #endif
+#ifndef PTQ1_0_PT_ROWS_1
+#define PTQ1_0_PT_ROWS_1 1
+#endif
 #ifndef PTQ1_0_PT_ROWS_34
 #define PTQ1_0_PT_ROWS_34 4
 #endif
 
-// Same row-per-item rule the launcher instantiates. 4 up to 4 columns, 2 beyond (8 spills).
+// Same row-per-item rule the launcher instantiates. Batch 1 uses its tuned row tile;
+// multi-column paths retain their verified 4/2-row schedule.
 static constexpr __host__ __device__ int ptq1_0_pt_rows_per_item(const int ncols_dst) {
-    return ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : 2);
+    return ncols_dst == 1 ? PTQ1_0_PT_ROWS_1 : (ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : 2));
 }
 
 // Bytes the launch requests: one fp32 partial per (column, row, K block + 1 pad) for the CTA,
