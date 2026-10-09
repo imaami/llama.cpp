@@ -8,7 +8,7 @@
 // Weight = (trit - 1) * d, so with q8_1 activations: sum_e (q_e - 1) * y_e = sum_k (d_b[k] * sum_{e in k} q_e * q8_e - s_b[k]), s_b = d_b * sum(q8).
 //
 // Two lanes per 128-element block: sub=0 takes qs dwords 0..2, sub=1 takes qs dwords 3..5 and qh. Same instruction stream, no divergence.
-// One column (single sequence, bandwidth bound): load the activations of a block once, then decode and dot each row with the residue-tolerant trick (see TRIT_LEVEL).
+// One column: load the activations once per block, then dot each row with masked activations or packed trits.
 // Several columns (batched decode, ALU bound): passes of CG columns; per block decode all rows once per level, pack the trits and dot them with every column of the pass.
 
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
@@ -35,6 +35,7 @@ layout (binding = 1) readonly buffer B_U128 {uvec4    data_b_u128[];};
 
 // columns per pass of the multi-column path (see above); 3 measured best on RDNA2
 layout (constant_id = 3) const uint CG = 3;
+layout (constant_id = 4) const bool PACKED_DOT = false;
 
 uint a_offset, b_offset, d_offset;
 
@@ -48,22 +49,33 @@ uint a_offset, b_offset, d_offset;
 // one accumulator sums at most 32 trit (0..2) x int8 products (|sum| <= 8192), so saturation is not needed
 #define DOT4(a, b, acc) ((acc) + dotPacked4x8EXT((a), (b)))
 
-// One trit level from the 16-bit lanes vl (bytes 0,2) and vh (bytes 1,3): after w = v*3 the trit is in byte 1/3 and the residue in byte 0/2.
-// The activation words are pre-masked (bytes 0,2 zero; yh = y1,y3 in bytes 1,3; yl = y0,y2 moved to bytes 1,3), so the dot product ignores the residue.
-#define TRIT_LEVEL(vl, vh, yl, yh, acc)          \
-    {                                            \
-        const uint wl = MUL3(vl);                \
-        const uint wh = MUL3(vh);                \
-        vl = wl & 0x00FF00FFu;                   \
-        vh = wh & 0x00FF00FFu;                   \
-        acc = DOT4(int32_t(wl), yl, acc);        \
-        acc = DOT4(int32_t(wh), yh, acc);        \
+// With PACKED_DOT, yh holds the original activation word; otherwise yl/yh mask the residue bytes.
+#define TRIT_LEVEL(vl, vh, yl, yh, acc)                                                 \
+    {                                                                                   \
+        const uint wl = MUL3(vl);                                                       \
+        const uint wh = MUL3(vh);                                                       \
+        vl = wl & 0x00FF00FFu;                                                          \
+        vh = wh & 0x00FF00FFu;                                                          \
+        if (PACKED_DOT) {                                                               \
+            const int32_t q = int32_t(((wl >> 8u) & 0x00FF00FFu) | (wh & 0xFF00FF00u)); \
+            acc = DOT4(q, yh, acc);                                                     \
+        } else {                                                                        \
+            acc = DOT4(int32_t(wl), yl, acc);                                           \
+            acc = DOT4(int32_t(wh), yh, acc);                                           \
+        }                                                                               \
     }
 // last level: no residue needed afterwards
-#define TRIT_LEVEL_LAST(vl, vh, yl, yh, acc)     \
-    {                                            \
-        acc = DOT4(int32_t(MUL3(vl)), yl, acc);  \
-        acc = DOT4(int32_t(MUL3(vh)), yh, acc);  \
+#define TRIT_LEVEL_LAST(vl, vh, yl, yh, acc)                                            \
+    {                                                                                   \
+        const uint wl = MUL3(vl);                                                       \
+        const uint wh = MUL3(vh);                                                       \
+        if (PACKED_DOT) {                                                               \
+            const int32_t q = int32_t(((wl >> 8u) & 0x00FF00FFu) | (wh & 0xFF00FF00u)); \
+            acc = DOT4(q, yh, acc);                                                     \
+        } else {                                                                        \
+            acc = DOT4(int32_t(wl), yl, acc);                                           \
+            acc = DOT4(int32_t(wh), yh, acc);                                           \
+        }                                                                               \
     }
 
 // Per-invocation state shared by the column-group passes.
@@ -107,9 +119,9 @@ void process_group(const uint j0) {
                 const uint y0 = (sub != 0u) ? q4.w : q4.x;
                 const uint y1 = (sub != 0u) ? q2.x : q4.y;
                 const uint y2 = (sub != 0u) ? q2.y : q4.z;
-                yh0[t] = int32_t(y0 & 0xFF00FF00u);
-                yh1[t] = int32_t(y1 & 0xFF00FF00u);
-                yh2[t] = int32_t(y2 & 0xFF00FF00u);
+                yh0[t] = int32_t(PACKED_DOT ? y0 : (y0 & 0xFF00FF00u));
+                yh1[t] = int32_t(PACKED_DOT ? y1 : (y1 & 0xFF00FF00u));
+                yh2[t] = int32_t(PACKED_DOT ? y2 : (y2 & 0xFF00FF00u));
                 yl0[t] = int32_t((y0 << 8u) & 0xFF00FF00u);
                 yl1[t] = int32_t((y1 << 8u) & 0xFF00FF00u);
                 yl2[t] = int32_t((y2 << 8u) & 0xFF00FF00u);

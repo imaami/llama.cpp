@@ -463,6 +463,8 @@ by default and changes activation precision from F16 to Q8_1. Compare model
 outputs or perplexity and prompt-processing throughput before enabling it for
 your workload.
 
+`GGML_VK_PTQ1_PACKED_DOT=1` enables an experimental packed-trit variant of the PTQ1_0 integer-dot decoder. It affects one-token decoding and one-column remainders of larger decode batches; the two- and three-column paths are unchanged. Quantization and floating-point accumulation are preserved. Compare decoding throughput on your GPU and driver before enabling it; leave the variable unset or set it to `0` to use the default decoder.
+
 ### For Windows Users:
 **w64devkit**
 
