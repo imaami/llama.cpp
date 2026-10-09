@@ -72,11 +72,12 @@ void quantize_row(float values[EL_W], const uint row, const uint tid) {
         [[unroll]] for (uint h = 1; h < Q8_LANES; h <<= 1) {
             amax = max(amax, subgroupShuffleXor(amax, h));
         }
-        precise float d = amax / 127.0;
-        precise float inv_d = d != 0.0 ? 1.0 / d : 0.0;
+        // Match the standalone quantizer arithmetic, including its optimization permissions.
+        float d = amax / 127.0;
+        float inv_d = d != 0.0 ? 1.0 / d : 0.0;
         float sum = 0.0;
         [[unroll]] for (uint j = 0; j < Q8_REGS; ++j) {
-            precise float q = round(values[base + j] * inv_d);
+            float q = round(values[base + j] * inv_d);
             sum += q;
             const uint byte = uint(int(q)) & 255u;
             // All lanes execute the shuffles, including lanes which do not store.
