@@ -77,7 +77,7 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
     <h1>llama.cpp <span style="font-weight:400;color:#aeb9cd">/ crossthink</span></h1>
     <span id="connection" class="connection" role="status">Connecting...</span>
 </header>
-<p class="muted">Two reasoning streams, with each model receiving the other's newly generated tokens.</p>
+<p class="muted">Two live reasoning streams, exchanging their newly generated reasoning.</p>
 <div class="toolbar">
     <div id="mode" class="mode"><span class="status-dot"></span><span id="mode-text">Loading...</span></div>
     <div class="actions">
@@ -87,6 +87,7 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         <button type="button" id="reset" disabled title="Clear both models' shared session and displayed history">New session</button>
     </div>
 </div>
+<p id="splice-status" class="muted" role="status"></p>
 <div id="error" class="notice error" role="alert" hidden></div>
 <div id="warning" class="notice" role="status" hidden></div>
 <main class="peers">
@@ -122,7 +123,7 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
     <label for="message" class="muted">Message both models</label>
     <textarea id="message" name="message" placeholder="Ask a question, add a constraint, or redirect the discussion." required></textarea>
     <div class="send-row">
-        <span class="muted">Messages and pause requests take effect after the current token chunks finish. Ctrl+Enter or Cmd+Enter sends.</span>
+        <span class="muted">Messages and pause requests take effect after the current segments finish. Ctrl+Enter or Cmd+Enter sends.</span>
         <button id="send" class="primary" type="submit" disabled>Send to both</button>
     </div>
 </form>
@@ -215,18 +216,28 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         byId('mode').dataset.mode = state.mode;
         byId('mode-text').textContent = (state.mode || 'Unknown') + (state.busy ? ' / applying request' : '');
         const number = value => Number.isFinite(value) ? value.toLocaleString() : '?';
+        const paragraph = state.splice_mode === 'paragraph';
+        byId('splice-status').textContent = paragraph ?
+            'Paragraph rendezvous / ' + number(state.exchanges) + ' exchanges' : 'Fixed intervals';
         for (const peer of state.peers || []) {
             if (!peers.includes(peer.name)) {
                 continue;
             }
             const stats = byId('stats-' + peer.name);
             stats.replaceChildren();
-            for (const text of [
+            const details = [
                 'Context ' + number(peer.tokens) + ' / ' + number(peer.context_size),
                 'Queued ' + number(peer.queued),
                 'Generated ' + number(peer.generated),
                 'Imported ' + number(peer.imported),
-            ]) {
+            ];
+            if (paragraph) {
+                const boundary = { paragraph: 'paragraph', sentence: 'sentence', limit: 'token limit' }[peer.boundary];
+                if (peer.waiting) { details.push('Waiting for peer'); }
+                if (boundary) { details.push('Last boundary: ' + boundary); }
+                details.push('Forced cuts ' + number(peer.forced_splices));
+            }
+            for (const text of details) {
                 const item = document.createElement('span');
                 item.textContent = text;
                 stats.appendChild(item);

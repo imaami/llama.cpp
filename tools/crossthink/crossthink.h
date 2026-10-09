@@ -18,7 +18,9 @@
 using crossthink_json = nlohmann::ordered_json;
 
 struct crossthink_options {
-    int32_t chunk_tokens = 32;
+    int32_t chunk_tokens = 512;
+    int32_t sentence_after = 256;
+    bool paragraph_splice = true;
     int32_t answer_tokens = 1024;
     uint32_t seed = 42;
     double temperature = 1.0;
@@ -65,10 +67,13 @@ private:
         uint64_t generated = 0;
         uint64_t imported = 0;
         uint64_t sequence = 0;
+        uint64_t forced_splices = 0;
+        std::string boundary;
         llama_token close_token = -1;
         bool active = false;
         bool thinking_open = false;
         bool answer_done = false;
+        bool segment_done = false;
     };
 
     struct pending_command {
@@ -88,6 +93,7 @@ private:
     uint64_t next_event_id = 1;
     uint64_t epoch = 1;
     uint64_t round = 0;
+    uint64_t exchanges = 0;
     std::string mode = "idle";
     std::string error;
     bool stopping = false;
@@ -99,6 +105,7 @@ private:
     void emit_state();
     void fail(const std::string & message);
     void drain(peer_state & peer);
+    void rendezvous();
     void worker(size_t index);
     void control();
     void apply(const pending_command & command);

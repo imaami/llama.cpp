@@ -19,6 +19,7 @@ crossthink_session::crossthink_session(
         std::array<std::unique_ptr<crossthink_transport>, 2> transports,
         const crossthink_options & opts) : options(opts) {
     if (options.chunk_tokens < 1 || options.chunk_tokens > 4096 ||
+            options.sentence_after < 1 || options.sentence_after > 4096 ||
             options.answer_tokens < 1 || options.answer_tokens > 65536) {
         throw std::invalid_argument("chunk/answer token limits are outside supported bounds");
     }
@@ -29,6 +30,9 @@ crossthink_session::crossthink_session(
             throw std::invalid_argument("two transports are required");
         }
         peer.info = peer.transport->describe();
+        if (options.paragraph_splice && !peer.info.value("splice", false)) {
+            throw std::runtime_error("paragraph splicing requires updated model servers with splice support");
+        }
         const int64_t n_vocab = peer.info.at("n_vocab").get<int64_t>();
         const int64_t context = peer.info.at("context_size").get<int64_t>();
         if (peer.info.at("protocol") != server_token_wire::magic || n_vocab <= 0 ||
@@ -99,6 +103,7 @@ json crossthink_session::state_locked() const {
     json result = {
         {"mode", mode}, {"busy", busy}, {"epoch", epoch}, {"round", round},
         {"error", error}, {"last_event_id", next_event_id - 1}, {"peers", json::array()},
+        {"splice_mode", options.paragraph_splice ? "paragraph" : "fixed"}, {"exchanges", exchanges},
     };
     for (size_t index = 0; index < peers.size(); ++index) {
         const auto & peer = peers[index];
@@ -106,6 +111,7 @@ json crossthink_session::state_locked() const {
             {"name", peer_name(index)}, {"tokens", peer.tape.size()}, {"queued", peer.inbox.size()},
             {"generated", peer.generated}, {"imported", peer.imported},
             {"context_size", peer.context_size}, {"active", peer.active},
+            {"waiting", peer.segment_done}, {"boundary", peer.boundary}, {"forced_splices", peer.forced_splices},
         });
     }
     return result;
@@ -169,6 +175,9 @@ void crossthink_session::command(const std::string & action, const std::string &
             if (mode == "answering") {
                 throw std::logic_error("wait for the answers before sending the next message");
             }
+            if (options.paragraph_splice && mode == "error") {
+                throw std::logic_error("reset the failed session before starting another message");
+            }
         } else if (action == "pause") {
             if (mode != "thinking") {
                 throw std::logic_error("only an active thinking session can be paused");
@@ -214,6 +223,25 @@ void crossthink_session::drain(peer_state & peer) {
     peer.tape.insert(peer.tape.end(), peer.inbox.begin(), peer.inbox.end());
     peer.imported += peer.inbox.size();
     peer.inbox.clear();
+    changed.notify_all();
+}
+
+void crossthink_session::rendezvous() {
+    if (!options.paragraph_splice || !peers[0].segment_done || !peers[1].segment_done) {
+        return;
+    }
+    for (const auto & peer : peers) {
+        if (peer.tape.size() + peer.inbox.size() >= peer.context_size) {
+            throw std::runtime_error("context full at splice boundary; reset the conversation");
+        }
+    }
+    for (auto & peer : peers) {
+        drain(peer);
+        peer.segment_done = false;
+    }
+    ++exchanges;
+    emit({{"type", "splice"}, {"exchange", exchanges},
+        {"a_boundary", peers[0].boundary}, {"b_boundary", peers[1].boundary}});
     changed.notify_all();
 }
 
@@ -264,7 +292,8 @@ void crossthink_session::worker(size_t index) {
     std::unique_lock<std::mutex> lock(mutex);
     while (!stopping) {
         changed.wait(lock, [&] {
-            return stopping || (!busy && (mode == "thinking" || (mode == "answering" && !peer.answer_done)));
+            return stopping || (!busy && ((mode == "thinking" &&
+                (!options.paragraph_splice || !peer.segment_done)) || (mode == "answering" && !peer.answer_done)));
         });
         if (stopping) {
             break;
@@ -272,9 +301,12 @@ void crossthink_session::worker(size_t index) {
         const bool answer = mode == "answering";
         try {
             if (!answer) {
-                drain(peer);
                 const size_t queue_limit = static_cast<size_t>(options.chunk_tokens) * 4;
-                const uint64_t reserve = options.chunk_tokens + queue_limit + options.answer_tokens + 2;
+                if (!options.paragraph_splice) {
+                    drain(peer);
+                }
+                const uint64_t reserve = (options.paragraph_splice ? 2 * options.chunk_tokens
+                    : options.chunk_tokens + queue_limit) + options.answer_tokens + 2;
                 if (peer.tape.size() + reserve >= peer.context_size) {
                     error = std::string(peer_name(index)) + ": context full for further crossthink; request answers or reset";
                     mode = "paused";
@@ -283,16 +315,17 @@ void crossthink_session::worker(size_t index) {
                     changed.notify_all();
                     continue;
                 }
-                // Reserve a whole quantum so callbacks never block each other.
-                changed.wait(lock, [&] {
-                    return stopping || busy || mode != "thinking" ||
-                        other.inbox.size() + static_cast<size_t>(options.chunk_tokens) <= queue_limit;
-                });
-                if (stopping || busy || mode != "thinking") {
-                    continue;
+                if (!options.paragraph_splice) {
+                    // Reserve a whole quantum so callbacks never block each other.
+                    changed.wait(lock, [&] {
+                        return stopping || busy || mode != "thinking" ||
+                            other.inbox.size() + static_cast<size_t>(options.chunk_tokens) <= queue_limit;
+                    });
+                    if (stopping || busy || mode != "thinking") {
+                        continue;
+                    }
+                    drain(peer);
                 }
-                // New peer tokens may have arrived while waiting for outbound capacity.
-                drain(peer);
             }
             const auto prompt = peer.tape;
             const uint64_t generation_epoch = epoch;
@@ -303,12 +336,15 @@ void crossthink_session::worker(size_t index) {
                     bias.push_back(json::array({token, false}));
                 }
             }
-            const json parameters = {
+            json parameters = {
                 {"n_predict", answer ? options.answer_tokens : options.chunk_tokens},
                 {"seed", seed}, {"temperature", options.temperature}, {"cache_prompt", true},
                 {"stream", true}, {"return_content", true}, {"reasoning_budget_tokens", -1},
                 {"logit_bias", std::move(bias)}, {"stop", json::array()},
             };
+            if (!answer && options.paragraph_splice) {
+                parameters["splice"] = {{"sentence_after", options.sentence_after}};
+            }
             peer.active = true;
             if (answer) {
                 emit({{"type", "answer_start"}, {"peer", peer_name(index)}});
@@ -338,9 +374,25 @@ void crossthink_session::worker(size_t index) {
                 throw std::runtime_error("completion ended without a valid final record, or truncated its context");
             }
             if (!answer && (!received || result.value("stop_type", std::string()) != "limit")) {
-                throw std::runtime_error("reasoning ended before its quantum; control token suppression may be unsupported");
+                throw std::runtime_error("reasoning ended unexpectedly; control token suppression may be unsupported");
             }
-            if (answer) {
+            if (!answer && options.paragraph_splice) {
+                const auto boundary = result.value("splice_boundary", std::string());
+                if ((boundary != "paragraph" && boundary != "sentence" && boundary != "limit") ||
+                        (boundary == "limit" && received != static_cast<size_t>(options.chunk_tokens))) {
+                    throw std::runtime_error("completion did not report a valid splice boundary");
+                }
+                peer.boundary = boundary;
+                peer.segment_done = true;
+                if (boundary == "limit") {
+                    ++peer.forced_splices;
+                    emit({{"type", "notice"}, {"message", std::string(peer_name(index)) +
+                        ": forced splice at the token ceiling; no clean boundary was found"}});
+                }
+                if (!busy && mode == "thinking") {
+                    rendezvous();
+                }
+            } else if (answer) {
                 peer.answer_done = true;
                 if (other.answer_done && !busy) {
                     mode = "answered";
@@ -366,6 +418,12 @@ void crossthink_session::control() {
         changed.wait(lock, [&] { return stopping || (!peers[0].active && !peers[1].active); });
         if (stopping) {
             break;
+        }
+        if (options.paragraph_splice && mode == "error" && pending.action != "reset") {
+            busy = false;
+            pending = {};
+            emit_state();
+            continue;
         }
         const auto command = pending;
         lock.unlock();
@@ -394,7 +452,7 @@ void crossthink_session::apply(const pending_command & command) {
                 ? peer.transport->initial_prompt(command.text)
                 : peer.transport->next_user(command.text);
             const uint64_t retained = reset ? 0 : peer.tape.size() + peer.inbox.size() + (peer.thinking_open ? 1 : 0);
-            const uint64_t reserve = 5 * options.chunk_tokens + options.answer_tokens + 2;
+            const uint64_t reserve = (options.paragraph_splice ? 2 : 5) * options.chunk_tokens + options.answer_tokens + 2;
             if (prepared[index].empty() || retained + prepared[index].size() + reserve >= peer.context_size) {
                 throw std::runtime_error(std::string(peer_name(index)) + ": message does not fit with the reasoning/answer reserve; reset or use smaller budgets");
             }
@@ -414,8 +472,12 @@ void crossthink_session::apply(const pending_command & command) {
             peer.sequence = 0;
             peer.thinking_open = false;
             peer.answer_done = false;
+            peer.segment_done = false;
+            peer.boundary.clear();
+            peer.forced_splices = 0;
         }
         round = 0;
+        exchanges = 0;
         mode = "idle";
         emit({{"type", "reset"}});
     }
@@ -430,6 +492,7 @@ void crossthink_session::apply(const pending_command & command) {
             peer.tape.insert(peer.tape.end(), prepared[index].begin(), prepared[index].end());
             peer.thinking_open = true;
             peer.answer_done = false;
+            peer.segment_done = false;
         }
         emit({{"type", "user"}, {"text", command.text}});
         mode = "thinking";
@@ -446,9 +509,11 @@ void crossthink_session::apply(const pending_command & command) {
                 peer.thinking_open = false;
             }
             peer.answer_done = false;
+            peer.segment_done = false;
         }
         mode = "answering";
     } else if (command.action == "resume") {
+        rendezvous();
         mode = "thinking";
     }
 }

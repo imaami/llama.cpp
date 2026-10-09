@@ -38,7 +38,7 @@ static uint64_t number(const char * text, uint64_t maximum) {
 }
 
 static bool parse(int argc, char ** argv, options & opts) {
-    enum { OPT_HOST = 256, OPT_PORT, OPT_CHUNK, OPT_ANSWER, OPT_SEED, OPT_TEMPERATURE, OPT_KEY };
+    enum { OPT_HOST = 256, OPT_PORT, OPT_CHUNK, OPT_SPLICE_MODE, OPT_SENTENCE_AFTER, OPT_ANSWER, OPT_SEED, OPT_TEMPERATURE, OPT_KEY };
     const struct option names[] = {
         {"socket-a", required_argument, nullptr, 'a'},
         {"socket-b", required_argument, nullptr, 'b'},
@@ -46,7 +46,10 @@ static bool parse(int argc, char ** argv, options & opts) {
         {"file", required_argument, nullptr, 'f'},
         {"host", required_argument, nullptr, OPT_HOST},
         {"port", required_argument, nullptr, OPT_PORT},
+        {"splice-mode", required_argument, nullptr, OPT_SPLICE_MODE},
+        {"max-segment-tokens", required_argument, nullptr, OPT_CHUNK},
         {"chunk-tokens", required_argument, nullptr, OPT_CHUNK},
+        {"sentence-after", required_argument, nullptr, OPT_SENTENCE_AFTER},
         {"answer-tokens", required_argument, nullptr, OPT_ANSWER},
         {"seed", required_argument, nullptr, OPT_SEED},
         {"temperature", required_argument, nullptr, OPT_TEMPERATURE},
@@ -88,6 +91,15 @@ static bool parse(int argc, char ** argv, options & opts) {
             case OPT_HOST: opts.host = optarg; break;
             case OPT_PORT: opts.port = static_cast<int>(number(optarg, 65535)); break;
             case OPT_CHUNK: opts.session.chunk_tokens = static_cast<int32_t>(number(optarg, 4096)); break;
+            case OPT_SENTENCE_AFTER: opts.session.sentence_after = static_cast<int32_t>(number(optarg, 4096)); break;
+            case OPT_SPLICE_MODE: {
+                const std::string mode = optarg;
+                if (mode != "paragraph" && mode != "fixed") {
+                    throw std::invalid_argument("splice mode must be paragraph or fixed");
+                }
+                opts.session.paragraph_splice = mode == "paragraph";
+                break;
+            }
             case OPT_ANSWER: opts.session.answer_tokens = static_cast<int32_t>(number(optarg, 65536)); break;
             case OPT_SEED: opts.session.seed = static_cast<uint32_t>(number(optarg, UINT32_MAX - 1)); break;
             case OPT_KEY: opts.api_key = optarg; break;
@@ -109,7 +121,10 @@ static bool parse(int argc, char ** argv, options & opts) {
                     "  -f, --file PATH           Read initial prompt (- for stdin)\n"
                     "      --host HOST           Console address (default: 127.0.0.1)\n"
                     "      --port PORT           Console port (default: 8090)\n"
-                    "      --chunk-tokens N      Local generation quantum, 1..4096 (default: 32)\n"
+                    "      --splice-mode MODE    paragraph rendezvous or fixed intervals (default: paragraph)\n"
+                    "      --max-segment-tokens N Hard segment ceiling, 1..4096 (default: 512)\n"
+                    "      --chunk-tokens N      Alias for --max-segment-tokens\n"
+                    "      --sentence-after N    Allow sentence boundaries after N tokens, 1..4096 (default: 256)\n"
                     "      --answer-tokens N     Answer budget, 1..65536 (default: 1024)\n"
                     "      --seed N              Initial sampling seed (default: 42)\n"
                     "      --temperature N       Sampling temperature (default: 1.0)\n"
@@ -118,6 +133,9 @@ static bool parse(int argc, char ** argv, options & opts) {
                 return false;
             default: throw std::invalid_argument("unknown option; use --help");
         }
+    }
+    if (!opts.session.chunk_tokens || !opts.session.sentence_after) {
+        throw std::invalid_argument("segment ceiling and sentence threshold must be at least 1");
     }
     if (optind != argc || opts.socket_a.empty() || opts.socket_b.empty() || opts.socket_a == opts.socket_b ||
             opts.host.empty() || !opts.port || (has_prompt && opts.prompt.empty())) {

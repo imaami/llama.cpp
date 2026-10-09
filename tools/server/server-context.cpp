@@ -95,6 +95,7 @@ static json server_token_wire_info(const llama_vocab * vocab, int32_t n_ctx) {
     return {
         {"protocol", server_token_wire::magic},
         {"stream", true},
+        {"splice", true},
         {"fingerprint", string_format("%016" PRIx64, hash)},
         {"n_vocab", n_vocab},
         {"eog_ids", std::move(eog_ids)},
@@ -347,6 +348,8 @@ struct server_slot {
     bool truncated      = false;
 
     stop_type stop;
+    server_splice_scanner splice;
+    std::string splice_boundary;
 
     std::string stopping_word;
 
@@ -436,6 +439,8 @@ struct server_slot {
         truncated      = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
+        splice         = {};
+        splice_boundary.clear();
         n_sent_text    = 0;
 
         if (can_speculate()) {
@@ -2039,6 +2044,8 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        slot.splice = task.params.splice_prompt;
+
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -2182,6 +2189,18 @@ private:
             slot.has_next_token = false;
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");
+        }
+
+        if (slot.task->params.splice_sentence_after) {
+            slot.splice.feed(common_token_to_piece(vocab, result.tok, true));
+            if (!incomplete && (slot.has_next_token || (slot.stop == STOP_TYPE_LIMIT && !slot.truncated))) {
+                const char * boundary = slot.splice.boundary(slot.stats.n_gen >= slot.task->params.splice_sentence_after);
+                if (*boundary) {
+                    slot.splice_boundary = boundary;
+                    slot.stop = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+                }
+            }
         }
 
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
@@ -2347,6 +2366,10 @@ private:
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
+        if (slot.task->params.splice_sentence_after) {
+            res->splice_boundary = !slot.splice_boundary.empty() ? slot.splice_boundary :
+                slot.stop == STOP_TYPE_LIMIT ? "limit" : "none";
+        }
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -4915,6 +4938,9 @@ static std::string server_token_wire_result(server_task_result & result, bool st
             {"timings", final->stats.to_json()},
         };
         tokens = &final->tokens;
+        if (!final->splice_boundary.empty()) {
+            metadata["splice_boundary"] = final->splice_boundary;
+        }
         if (stream) {
             metadata["type"] = "done";
         } else if (return_content) {
@@ -5006,6 +5032,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 task.params.return_progress = false;
                 task.params.n_cmpl = 1;
                 task.params.sampling.n_probs = 0;
+                if (data.contains("splice")) {
+                    if (!task.params.antiprompt.empty() || task.params.n_indent > 0 || task.params.t_max_predict_ms > 0) {
+                        throw std::invalid_argument("splice does not support stop strings, indentation or time limits");
+                    }
+                    task.params.splice_sentence_after = data.at("splice").at("sentence_after").get<int32_t>();
+                    auto & scanner = task.params.splice_prompt;
+                    for (llama_token token : task.tokens.get_tokens()) {
+                        const std::string piece = common_token_to_piece(ctx_server.vocab, token, true);
+                        if (llama_vocab_is_control(ctx_server.vocab, token) || piece == "<think>" || piece == "</think>") {
+                            scanner = {};
+                        } else {
+                            scanner.feed(piece);
+                        }
+                    }
+                    scanner.begin_generation();
+                }
             }
 
             task.apply_chat_session(chat_session);
@@ -5691,6 +5733,15 @@ void server_routes::init_routes() {
                     body.at("n_predict").get<uint64_t>() == 0 ||
                     body.at("n_predict").get<uint64_t>() >= static_cast<uint64_t>(meta->slot_n_ctx)) {
                 throw std::invalid_argument("binary completion requires an explicit positive n_predict below context_size");
+            }
+            if (body.contains("splice")) {
+                const auto & splice = body.at("splice");
+                if (!splice.is_object() || splice.size() != 1 || !splice.contains("sentence_after") ||
+                        !splice.at("sentence_after").is_number_integer() ||
+                        splice.at("sentence_after").get<uint64_t>() == 0 ||
+                        splice.at("sentence_after").get<uint64_t>() > 4096) {
+                    throw std::invalid_argument("splice must contain only an integer sentence_after in [1, 4096]");
+                }
             }
             if (packet.tokens.size() >= static_cast<size_t>(meta->slot_n_ctx) ||
                     packet.tokens.size() + body.at("n_predict").get<uint64_t>() >= static_cast<uint64_t>(meta->slot_n_ctx)) {

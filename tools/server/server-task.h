@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-splice.h"
 
 
 enum server_task_type {
@@ -55,6 +56,9 @@ struct task_params {
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
+
+    int32_t splice_sentence_after = 0; // zero disables clean splice stopping
+    server_splice_scanner splice_prompt;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
@@ -373,6 +377,7 @@ struct server_task_result_cmpl_final : server_task_result {
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
+    std::string splice_boundary;
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;

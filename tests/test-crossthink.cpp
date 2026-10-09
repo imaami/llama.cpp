@@ -22,7 +22,7 @@ static void await(std::condition_variable & changed, std::unique_lock<std::mutex
 struct fake_step {
     std::vector<llama_token> tokens;
     bool done = false;
-    std::string stop_type = "limit";
+    crossthink_json result;
 };
 
 struct fake_request {
@@ -39,13 +39,21 @@ struct fake_request {
 
     void send(std::vector<llama_token> tokens) {
         std::lock_guard<std::mutex> lock(mutex);
-        steps.push_back({std::move(tokens), false, "limit"});
+        steps.push_back({std::move(tokens), false, {}});
         changed.notify_all();
     }
 
-    void finish(const std::string & stop_type = "limit") {
+    void finish(const std::string & stop_type = "limit", const std::string & boundary = "paragraph") {
+        crossthink_json result = {{"type", "done"}, {"stop_type", stop_type}, {"truncated", false}};
+        if (!boundary.empty()) {
+            result["splice_boundary"] = boundary;
+        }
+        finish_result(std::move(result));
+    }
+
+    void finish_result(crossthink_json result) {
         std::lock_guard<std::mutex> lock(mutex);
-        steps.push_back({{}, true, stop_type});
+        steps.push_back({{}, true, std::move(result)});
         changed.notify_all();
     }
 
@@ -75,7 +83,7 @@ public:
         return {
             {"protocol", "LLMTOK01"}, {"fingerprint", fingerprint},
             {"n_vocab", 4096}, {"eog_ids", {3}}, {"context_size", context_size},
-            {"close_token", 2}, {"control_ids", {1, 2, 3}},
+            {"close_token", 2}, {"control_ids", {1, 2, 3}}, {"splice", true},
         };
     }
 
@@ -120,7 +128,7 @@ public:
             if (step.done) {
                 request->returned = true;
                 request->changed.notify_all();
-                return {{"type", "done"}, {"stop_type", step.stop_type}, {"truncated", false}};
+                return step.result;
             }
             lock.unlock();
             const bool accepted = receive(packet(step.tokens));
@@ -152,6 +160,11 @@ public:
         return requests[index];
     }
 
+    size_t request_count() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return requests.size();
+    }
+
 private:
     static server_token_wire::packet packet(const std::vector<llama_token> & tokens) {
         return {crossthink_json{{"type", "tokens"}, {"content", "piece"}}.dump(), tokens};
@@ -163,7 +176,7 @@ struct fixture {
     std::unique_ptr<crossthink_session> session;
     uint64_t cursor = 0;
 
-    fixture(int32_t chunk = 2, uint64_t context = 256) {
+    fixture(int32_t chunk = 2, uint64_t context = 256, bool paragraph_splice = false) {
         std::array<std::unique_ptr<crossthink_transport>, 2> transports;
         for (size_t i = 0; i < peers.size(); ++i) {
             auto peer = std::make_unique<fake_transport>();
@@ -174,20 +187,38 @@ struct fixture {
         crossthink_options options;
         options.chunk_tokens = chunk;
         options.answer_tokens = 8;
+        options.paragraph_splice = paragraph_splice;
+        options.sentence_after = 2;
         session = std::make_unique<crossthink_session>(std::move(transports), options);
     }
 
-    crossthink_json wait_mode(const std::string & mode) {
+    template<typename Predicate>
+    crossthink_json wait_state(Predicate predicate, const char * operation, bool allow_error = false) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
         for (;;) {
             auto state = session->state();
-            if (state.at("mode") == mode && !state.at("busy").get<bool>()) {
+            if (predicate(state)) {
                 return state;
             }
-            check(state.at("mode") != "error" || mode == "error", "unexpected engine error: " + state.dump());
+            check(allow_error || state.at("mode") != "error", "unexpected engine error: " + state.dump());
+            check(std::chrono::steady_clock::now() < deadline, std::string("timeout: ") + operation);
             for (const auto & event : session->events_after(cursor, true)) {
                 cursor = event.at("id").get<uint64_t>();
             }
         }
+    }
+
+    crossthink_json wait_mode(const std::string & mode) {
+        return wait_state([&](const crossthink_json & state) {
+            return state.at("mode") == mode && !state.at("busy").get<bool>();
+        }, mode.c_str(), mode == "error");
+    }
+
+    crossthink_json wait_peer(size_t index) {
+        return wait_state([&](const crossthink_json & state) {
+            const auto & peer = state.at("peers").at(index);
+            return peer.at("waiting").get<bool>() && !peer.at("active").get<bool>();
+        }, "wait for peer boundary");
     }
 
     void start(const std::string & text = "first question") {
@@ -266,8 +297,8 @@ static void test_streaming_boundary_and_resume() {
     f.pause();
 }
 
-static void test_user_answer_and_reset() {
-    fixture f;
+static void test_user_answer_and_reset(bool paragraph_splice) {
+    fixture f(2, 256, paragraph_splice);
     f.start("question one");
     auto a1 = f.peers[0]->request(0);
     auto b1 = f.peers[1]->request(0);
@@ -305,6 +336,7 @@ static void test_user_answer_and_reset() {
         check(count(request->prompt, 102) == 1 && count(request->prompt, 202) == 1,
                 "answer omitted queued reasoning");
         check(request->parameters.at("n_predict") == 8, "answer used reasoning quantum as its token budget");
+        check(!request->parameters.contains("splice"), "answer inherited reasoning splice condition");
     }
     const auto before_answer = f.session->state();
     a3->send({301});
@@ -330,10 +362,12 @@ static void test_user_answer_and_reset() {
     b4->stale_on_cancel({902});
     f.session->command("reset");
     const auto reset = f.wait_mode("idle");
+    check(reset.at("exchanges") == 0, "reset retained the previous exchange count");
     for (size_t i = 0; i < f.peers.size(); ++i) {
-        for (const auto * field : {"tokens", "queued", "generated", "imported"}) {
+        for (const auto * field : {"tokens", "queued", "generated", "imported", "forced_splices"}) {
             check(reset.at("peers").at(i).at(field) == 0, std::string("reset retained ") + field);
         }
+        check(!reset.at("peers").at(i).at("waiting").get<bool>(), "reset retained a completed paragraph");
     }
     for (const auto & request : {a4, b4}) {
         std::lock_guard<std::mutex> lock(request->mutex);
@@ -345,10 +379,166 @@ static void test_user_answer_and_reset() {
     f.pause();
 }
 
+static void test_paragraph_rendezvous() {
+    fixture f(4, 256, true);
+    f.start();
+    auto a1 = f.peers[0]->request(0);
+    auto b1 = f.peers[1]->request(0);
+    for (const auto & request : {a1, b1}) {
+        check(request->parameters.at("splice").at("sentence_after") == 2, "sentence fallback was not passed to server");
+        check(request->parameters.at("n_predict") == 4, "paragraph hard ceiling was not passed to server");
+    }
+    a1->send({101, 102});
+    b1->send({201});
+    a1->wait_consumed(1);
+    b1->wait_consumed(1);
+    a1->finish();
+    const auto waiting = f.wait_peer(0);
+    check(waiting.at("exchanges") == 0, "incomplete pair counted as an exchange");
+    for (size_t i = 0; i < f.peers.size(); ++i) {
+        check(waiting.at("peers").at(i).at("imported") == 0, "unfinished peer paragraph was spliced");
+        check(f.peers[i]->request_count() == 1, "peer generated beyond its pending paragraph");
+    }
+    check(waiting.at("peers").at(0).at("queued") == 1, "incoming stream was not buffered while awaiting peer boundary");
+    b1->send({202});
+    b1->finish("limit", "sentence");
+    auto a2 = f.peers[0]->request(1);
+    auto b2 = f.peers[1]->request(1);
+    check(a2->prompt == std::vector<llama_token>({1, 10, 11, 101, 102, 201, 202}),
+            "A did not receive B's complete paragraph after its own boundary");
+    check(b2->prompt == std::vector<llama_token>({1, 10, 11, 201, 202, 101, 102}),
+            "B did not receive A's complete paragraph after its own boundary");
+    const auto exchanged = f.session->state();
+    check(exchanged.at("exchanges") == 1, "pair was not counted as exactly one exchange");
+    check(exchanged.at("peers").at(0).at("boundary") == "paragraph" &&
+            exchanged.at("peers").at(1).at("boundary") == "sentence", "splice reasons were not retained");
+    a2->send({103, 104, 105, 106});
+    a2->finish("limit", "limit");
+    f.wait_peer(0);
+    check(f.peers[0]->request_count() == 2, "forced boundary bypassed rendezvous");
+    b2->send({203});
+    b2->finish();
+    auto a3 = f.peers[0]->request(2);
+    auto b3 = f.peers[1]->request(2);
+    for (const auto & request : {a3, b3}) {
+        for (llama_token token : {101, 102, 103, 104, 105, 106, 201, 202, 203}) {
+            check(count(request->prompt, token) == 1, "rendezvous lost, echoed or replayed a reasoning token");
+        }
+    }
+    const auto forced = f.session->state();
+    check(forced.at("exchanges") == 2, "forced boundary did not complete the next exchange");
+    check(forced.at("peers").at(0).at("forced_splices") == 1 &&
+            forced.at("peers").at(1).at("forced_splices") == 0, "forced splice count is incorrect");
+    f.pause();
+}
+
+static void test_paragraph_pause_and_resume() {
+    fixture f(4, 256, true);
+    f.start();
+    auto a1 = f.peers[0]->request(0);
+    auto b1 = f.peers[1]->request(0);
+    a1->send({101});
+    a1->finish();
+    f.wait_peer(0);
+    b1->send({201});
+    b1->wait_consumed(1);
+    f.session->command("pause");
+    b1->send({202});
+    b1->finish();
+    const auto paused = f.wait_mode("paused");
+    check(paused.at("exchanges") == 0, "pause unexpectedly spliced a pending pair");
+    for (size_t i = 0; i < f.peers.size(); ++i) {
+        check(paused.at("peers").at(i).at("waiting").get<bool>(), "pause lost completed paragraph state");
+        check(paused.at("peers").at(i).at("imported") == 0, "pause consumed pending peer tokens");
+        check(f.peers[i]->request_count() == 1, "paused peer started a new paragraph");
+    }
+    f.session->command("resume");
+    f.wait_mode("thinking");
+    auto a2 = f.peers[0]->request(1);
+    auto b2 = f.peers[1]->request(1);
+    for (const auto & request : {a2, b2}) {
+        for (llama_token token : {101, 201, 202}) {
+            check(count(request->prompt, token) == 1, "resume did not splice the pending pair exactly once");
+        }
+    }
+    check(f.session->state().at("exchanges") == 1, "resume did not count the pending exchange");
+    f.pause();
+}
+
+static void test_invalid_paragraph_result() {
+    for (const std::string boundary : {"", "invalid", "limit", "error"}) {
+        fixture f(4, 256, true);
+        f.start();
+        auto a1 = f.peers[0]->request(0);
+        auto b1 = f.peers[1]->request(0);
+        a1->send({101});
+        a1->finish();
+        f.wait_peer(0);
+        b1->send({201});
+        if (boundary == "error") {
+            b1->finish_result({{"type", "error"}, {"message", "test transport failure"}});
+        } else {
+            b1->finish("limit", boundary);
+        }
+        const auto failed = f.wait_mode("error");
+        check(failed.at("exchanges") == 0, "invalid completion was counted as a complete exchange");
+        for (size_t i = 0; i < f.peers.size(); ++i) {
+            check(failed.at("peers").at(i).at("imported") == 0, "invalid completion spliced partial reasoning");
+            check(f.peers[i]->request_count() == 1, "generation continued after an invalid completion");
+        }
+        f.session->command("reset");
+        const auto reset = f.wait_mode("idle");
+        check(reset.at("exchanges") == 0, "reset retained exchange count after failure");
+        for (const auto & peer : reset.at("peers")) {
+            check(!peer.at("waiting").get<bool>() && peer.at("queued") == 0,
+                    "reset retained failed exchange state");
+        }
+    }
+}
+
+static void test_paragraph_failure_during_command() {
+    for (const std::string action : {"message", "answer"}) {
+        fixture f(4, 256, true);
+        f.start();
+        auto a1 = f.peers[0]->request(0);
+        auto b1 = f.peers[1]->request(0);
+        a1->send({101});
+        a1->finish();
+        f.wait_peer(0);
+        b1->send({201});
+        b1->wait_consumed(1);
+        f.session->command(action, action == "message" ? "intervention" : "");
+        b1->finish("limit", "");
+        const auto failed = f.wait_mode("error");
+        check(failed.at("round") == 1 && failed.at("exchanges") == 0,
+                "pending command committed a failed exchange");
+        for (size_t i = 0; i < f.peers.size(); ++i) {
+            check(failed.at("peers").at(i).at("imported") == 0, "pending command imported incomplete reasoning");
+            check(f.peers[i]->request_count() == 1, "pending command started generation after failure");
+            std::lock_guard<std::mutex> lock(f.peers[i]->mutex);
+            check(f.peers[i]->user_texts.empty(), "failed pending message reached template preparation");
+        }
+        bool rejected = false;
+        try {
+            f.session->command("message", "try to continue");
+        } catch (const std::logic_error &) {
+            rejected = true;
+        }
+        check(rejected, "failed exchange accepted a new message without reset");
+        f.session->command("reset");
+        f.wait_mode("idle");
+    }
+}
+
 int main() {
     try {
         test_streaming_boundary_and_resume();
-        test_user_answer_and_reset();
+        test_user_answer_and_reset(false);
+        test_user_answer_and_reset(true);
+        test_paragraph_rendezvous();
+        test_paragraph_pause_and_resume();
+        test_invalid_paragraph_result();
+        test_paragraph_failure_during_command();
         std::puts("crossthink tests: passed");
         return 0;
     } catch (const std::exception & error) {

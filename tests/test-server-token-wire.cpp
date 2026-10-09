@@ -1,6 +1,7 @@
 // Without arguments, test the codec. Pass gen-tiny-qwen35-mtp.py's GGUF to test routes without sockets.
 #include "../tools/server/server-context.h"
 #include "../tools/server/server-token-wire.h"
+#include "../tools/server/server-splice.h"
 
 #include <cstdio>
 #include <functional>
@@ -73,6 +74,44 @@ static void test_codec() {
         }
         check(rejected, "stream decoder accepted malformed packet");
     }
+}
+
+static void test_splice_scanner() {
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"First\n\n", "paragraph"}, {"First\r\n \t\r\n", "paragraph"},
+        {"First\n\nNext", ""}, {"First\n\n \t", "paragraph"}, {"\n\n", ""},
+        {"First. ", "sentence"}, {"First.)\" \t", "sentence"}, {"First. Next", ""},
+        {"First\r\n\r", ""}, {"First.\r\n", "sentence"},
+        {"```cpp\ncode\n\n", ""}, {"~~~cpp\ncode\n\n", ""},
+        {"```cpp\ncode\n```\n\n", "paragraph"}, {"~~~cpp\ncode\n~~~\n\n", "paragraph"},
+        {"````cpp\n```\n\n", ""}, {"```cpp\n```oops\n\n", ""},
+        {"  ```cpp\ncode. \n\n", ""}, {"  ```cpp\ncode\n  ``` \n\n", "paragraph"},
+        {"```info. ", ""}, {"``inline``\n\n", "paragraph"},
+    };
+    for (const auto & item : cases) {
+        for (size_t stride = 1; stride <= item.first.size(); ++stride) {
+            server_splice_scanner scanner;
+            for (size_t offset = 0; offset < item.first.size(); offset += stride) {
+                scanner.feed(item.first.substr(offset, stride));
+            }
+            check(scanner.boundary(true) == item.second, "splice scan mismatch: " + item.first);
+        }
+    }
+    server_splice_scanner scanner;
+    scanner.feed("Prompt.\n");
+    scanner.begin_generation();
+    scanner.feed("\n \t");
+    check(std::string(scanner.boundary(true)).empty(), "prompt text counted as generated paragraph");
+    scanner.feed("Next. ");
+    check(std::string(scanner.boundary(false)).empty(), "sentence fallback was enabled too early");
+    check(std::string(scanner.boundary(true)) == "sentence", "sentence fallback did not trigger");
+    scanner = {};
+    scanner.feed("```cpp\ncode");
+    scanner.begin_generation();
+    scanner.feed("\n\nmore. ");
+    check(std::string(scanner.boundary(true)).empty(), "prompt fence state was lost");
+    scanner.feed("\n```\n\n");
+    check(std::string(scanner.boundary(true)) == "paragraph", "continued fence did not close");
 }
 
 struct streamed_result {
@@ -185,6 +224,7 @@ static void test_routes(const char * model, bool mtp) {
     const json info = json::parse(info_response.second);
     check(info.at("protocol") == "LLMTOK01" && info.at("n_vocab") == 259, "wrong fixture vocabulary");
     check(info.at("stream") == true, "stream support not advertised");
+    check(info.at("splice") == true, "splice support not advertised");
     check(info.at("fingerprint") == json::parse(fixture.call(routes.get_tokens_info, "").second).at("fingerprint"), "unstable fingerprint");
 
     const llama_tokens prompt = {1, 100, 101, 102};
@@ -257,10 +297,62 @@ static void test_routes(const char * model, bool mtp) {
     utf8["n_predict"] = 1;
     check(fixture.binary_stream(utf8, prompt).tokens == llama_tokens{3 + 0xc3}, "stream lost incomplete UTF-8 at token limit");
 
+    json splice = options;
+    splice["n_predict"] = 96;
+    splice["ignore_eos"] = false;
+    splice["splice"] = {{"sentence_after", 4096}};
+    const llama_tokens splice_prompt = {1};
+    const std::vector<std::pair<std::string, std::string>> paragraphs = {
+        {"First.\n\nSecond.", "First.\n\n"},
+        {"First.\r\n \t\r\nSecond.", "First.\r\n \t\r\n"},
+        {"```cpp\ncode\n\nmore\n```\n\nSecond.", "```cpp\ncode\n\nmore\n```\n\n"},
+        {"\n\nFirst.\n\nSecond.", "\n\nFirst.\n\n"},
+    };
+    for (const auto & item : paragraphs) {
+        splice["grammar"] = "root ::= " + json(item.first).dump();
+        const auto plain = fixture.binary(splice, splice_prompt);
+        const auto stream = fixture.binary_stream(splice, splice_prompt);
+        check(plain.first.at("content") == item.second && stream.content == item.second, "splice did not preserve paragraph separator: " + json(item.first).dump());
+        check(plain.second == stream.tokens && stream.tokens.size() == item.second.size(), "splice raw IDs lost or duplicated");
+        check(stream.metadata.at("splice_boundary") == "paragraph" && stream.metadata.at("stop_type") == "limit", "wrong paragraph stop marker");
+    }
+    splice["splice"]["sentence_after"] = 1;
+    splice["grammar"] = "root ::= \"First.)\\\" Next.\"";
+    const auto sentence = fixture.binary_stream(splice, splice_prompt);
+    check(sentence.content == "First.)\" " && sentence.metadata.at("splice_boundary") == "sentence", "sentence fallback failed");
+
+    splice["splice"]["sentence_after"] = 4096;
+    splice["cache_prompt"] = true;
+    const std::string code_prefix = "```cpp\ncode\n\n";
+    splice["n_predict"] = code_prefix.size();
+    splice["grammar"] = "root ::= " + json(code_prefix + "rest").dump();
+    const auto cut = fixture.binary_stream(splice, splice_prompt);
+    check(cut.content == code_prefix && cut.metadata.at("splice_boundary") == "limit", "hard cut inside fence failed");
+    llama_tokens continued = splice_prompt;
+    continued.insert(continued.end(), cut.tokens.begin(), cut.tokens.end());
+    splice["n_predict"] = 64;
+    splice["grammar"] = "root ::= \"rest\\n\\ncode\\n```\\n\\nNext\"";
+    const auto continued_code = fixture.binary_stream(splice, continued);
+    check(continued_code.content == "rest\n\ncode\n```\n\n" && continued_code.metadata.at("splice_boundary") == "paragraph", "continued request lost fence state");
+
+    // A splice can stop inside an accepted MTP batch. Its cached continuation must match a fresh evaluation.
+    continued.insert(continued.end(), continued_code.tokens.begin(), continued_code.tokens.end());
+    json continuation = options;
+    continuation["cache_prompt"] = true;
+    const auto reused = fixture.binary(continuation, continued);
+    continuation["cache_prompt"] = false;
+    check(reused.second == fixture.binary(continuation, continued).second, "splice poisoned cached continuation");
+
     for (const auto & option : std::vector<json>{
             {{"stream", 1}}, {{"n", 2}}, {{"n_cmpl", 2}}, {{"return_tokens", false}},
             {{"n_probs", 1}}, {{"logprobs", 1}}, {{"response_fields", json::array({"content"})}},
-            {{"prompt", json::array({1})}}, {{"n_predict", -1}}, {{"n_predict", 0}}}) {
+            {{"prompt", json::array({1})}}, {{"n_predict", -1}}, {{"n_predict", 0}},
+            {{"splice", true}}, {{"splice", json::object()}}, {{"splice", {{"sentence_after", 0}}}},
+            {{"splice", {{"sentence_after", -1}}}}, {{"splice", {{"sentence_after", 4097}}}},
+            {{"splice", {{"sentence_after", 1.5}}}}, {{"splice", {{"sentence_after", 1}, {"unknown", true}}}},
+            {{"splice", {{"sentence_after", 1}}}, {"stop", json::array({"x"})}},
+            {{"splice", {{"sentence_after", 1}}}, {"n_indent", 1}},
+            {{"splice", {{"sentence_after", 1}}}, {"t_max_predict_ms", 1}}}) {
         json invalid = options;
         for (const auto & field : option.items()) {
             invalid[field.key()] = field.value();
@@ -283,6 +375,7 @@ int main(int argc, char ** argv) {
     try {
         check(argc <= 2, "usage: test-server-token-wire [tiny-qwen35-mtp.gguf]");
         test_codec();
+        test_splice_scanner();
         if (argc == 2) {
             llama_backend_init();
             test_routes(argv[1], false);
