@@ -100,13 +100,15 @@ void rms_norm(uint num_iters) {
             }
             barrier();
             sum = FLOAT_TYPE(0.0f);
-            if (gl_NumSubgroups <= 4) {
-                [[unroll]] for (uint i = 0; i < gl_NumSubgroups; ++i) {
+            // Full subgroups with a fixed size let the compiler fold the second reduction.
+            const uint num_subgroups = uint(BLOCK_SIZE) / gl_SubgroupSize;
+            if (num_subgroups <= 4) {
+                [[unroll]] for (uint i = 0; i < num_subgroups; ++i) {
                     sum += sumsh[i];
                 }
             } else {
                 // Every subgroup reads the partials, so no second workgroup barrier is needed.
-                for (uint i = gl_SubgroupInvocationID; i < gl_NumSubgroups; i += gl_SubgroupSize) {
+                for (uint i = gl_SubgroupInvocationID; i < num_subgroups; i += gl_SubgroupSize) {
                     sum += sumsh[i];
                 }
                 sum = subgroupAdd(sum);
