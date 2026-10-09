@@ -12,14 +12,29 @@
 #include <string>
 #include <thread>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 //
 // HTTP implementation using cpp-httplib
 //
 
 class server_http_context::Impl {
 public:
+    struct address {
+        std::string host;
+        bool is_unix;
+#ifndef _WIN32
+        bool owns_path = false;
+        dev_t device = 0;
+        ino_t inode = 0;
+#endif
+    };
+
     std::vector<std::unique_ptr<httplib::Server>> servers;
-    std::vector<std::string> hosts;
+    std::vector<address> addresses;
     std::vector<std::thread> threads; // one thread per listener
     std::unique_ptr<httplib::ThreadPool> pool; // single pool shared among all listeners
     int n_threads_http = 0;
@@ -124,24 +139,28 @@ bool server_http_context::init(const common_params & params) {
         port = gcp.port;
     }
 
-    pimpl->hosts = params.hostnames;
     size_t n_tcp_hosts = 0;
-    for (const auto & host : pimpl->hosts) {
-        if (!string_ends_with(host, ".sock")) {
+    for (const auto & host : params.hostnames) {
+        const bool is_unix = string_ends_with(host, ".sock");
+        pimpl->addresses.push_back({ host, is_unix });
+        if (!is_unix) {
             n_tcp_hosts++;
         }
+    }
+    if (!params.socket_path.empty()) {
+        pimpl->addresses.push_back({ params.socket_path, true });
     }
     if (port == 0 && n_tcp_hosts > 1) {
         SRV_ERR("%s", "--port 0 is not supported with multiple TCP addresses\n");
         return false;
     }
-    for (size_t i = 0; i < pimpl->hosts.size(); ++i) {
+    for (const auto & address : pimpl->addresses) {
         pimpl->servers.emplace_back();
-        if (!init_listener(params)) {
+        if (!init_listener(params, address.is_unix)) {
             return false;
         }
         // with multiple TCP addresses, [::] must not also claim 0.0.0.0
-        if (n_tcp_hosts > 1) {
+        if (!address.is_unix && n_tcp_hosts > 1) {
             pimpl->servers.back()->set_ipv6_v6only(true);
         }
     }
@@ -155,11 +174,11 @@ bool server_http_context::init(const common_params & params) {
     return true;
 }
 
-bool server_http_context::init_listener(const common_params & params) {
+bool server_http_context::init_listener(const common_params & params, bool is_unix) {
     auto & srv = pimpl->servers.back();
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    if (!params.ssl_file_key.empty() && !params.ssl_file_cert.empty()) {
+    if (!is_unix && !params.ssl_file_key.empty() && !params.ssl_file_cert.empty()) {
         SRV_TRC("running with SSL: key = %s, cert = %s\n", params.ssl_file_key.c_str(), params.ssl_file_cert.c_str());
         srv = std::make_unique<httplib::SSLServer>(
             params.ssl_file_cert.c_str(), params.ssl_file_key.c_str()
@@ -170,7 +189,7 @@ bool server_http_context::init_listener(const common_params & params) {
         srv = std::make_unique<httplib::Server>();
     }
 #else
-    if (params.ssl_file_key != "" && params.ssl_file_cert != "") {
+    if (!is_unix && params.ssl_file_key != "" && params.ssl_file_cert != "") {
         SRV_ERR("%s", "the server is built without SSL support\n");
         return false;
     }
@@ -496,8 +515,9 @@ bool server_http_context::start() {
     listening_addresses.clear();
     for (size_t i = 0; i < pimpl->servers.size(); ++i) {
         const auto & srv = pimpl->servers[i];
-        const auto & host = pimpl->hosts[i];
-        const bool is_sock = string_ends_with(host, ".sock");
+        auto & address = pimpl->addresses[i];
+        const auto & host = address.host;
+        const bool is_sock = address.is_unix;
         bool was_bound;
         if (is_sock) {
             SRV_TRC("%s", "setting address family to AF_UNIX\n");
@@ -519,6 +539,16 @@ bool server_http_context::start() {
             listening_addresses.clear();
             return false;
         }
+#ifndef _WIN32
+        if (is_sock && !(host.size() > 1 && host[0] == '@')) {
+            struct stat st;
+            if (!lstat(host.c_str(), &st) && S_ISSOCK(st.st_mode)) {
+                address.owns_path = true;
+                address.device = st.st_dev;
+                address.inode = st.st_ino;
+            }
+        }
+#endif
         listening_addresses.push_back(is_sock ? string_format("unix://%s", host.c_str())
                                               : string_format("%s://%s:%d", is_ssl ? "https" : "http", common_http_format_host(host).c_str(), port));
     }
@@ -564,6 +594,21 @@ void server_http_context::join() {
         pimpl->pool->shutdown();
         pimpl->pool.reset();
     }
+#ifndef _WIN32
+    for (auto & address : pimpl->addresses) {
+        if (!address.owns_path) {
+            continue;
+        }
+        struct stat st;
+        if (!lstat(address.host.c_str(), &st) && S_ISSOCK(st.st_mode) &&
+                st.st_dev == address.device && st.st_ino == address.inode) {
+            if (unlink(address.host.c_str())) {
+                SRV_WRN("couldn't remove UNIX socket: %s\n", address.host.c_str());
+            }
+        }
+        address.owns_path = false;
+    }
+#endif
 }
 
 static void set_headers(httplib::Response & res, const std::map<std::string, std::string> & headers) {

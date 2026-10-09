@@ -66,7 +66,7 @@ def actual_server(mtp):
     with tempfile.TemporaryDirectory(prefix="llama-swap-") as directory:
         path = pathlib.Path(directory) / "test.sock"
         with tempfile.TemporaryFile() as log:
-            command = [ARGS.server, "-m", ARGS.model, "--host", str(path), "-ngl", "0",
+            command = [ARGS.server, "-m", ARGS.model, "--socket", str(path), "--port", "0", "-ngl", "0",
                        "-c", "512", "-b", "64", "-ub", "64", "-t", "2", "-np", "1",
                        "--flash-attn", "off", "--no-webui", "--no-warmup", "--no-context-shift"]
             if mtp:
@@ -171,7 +171,7 @@ class ProtocolTests(unittest.TestCase):
                     "context overflow": packet(options, [1] * info["context_size"]),
                 }
                 for name, fields in {
-                    "stream": {"stream": True}, "n": {"n": 2}, "n_cmpl": {"n_cmpl": 2},
+                    "stream type": {"stream": "yes"}, "n": {"n": 2}, "n_cmpl": {"n_cmpl": 2},
                     "token return": {"return_tokens": False}, "probabilities": {"n_probs": 1},
                     "probabilities alias": {"logprobs": 1},
                     "response filtering": {"response_fields": ["content"]},

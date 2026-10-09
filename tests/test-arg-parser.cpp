@@ -231,6 +231,23 @@ static void test(void) {
 
     printf("test-arg-parser: test valid usage\n\n");
 
+    {
+        common_params server_params;
+        argv = {"binary_name", "--socket", "/tmp/llama-peer"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), server_params, LLAMA_EXAMPLE_SERVER));
+        assert(server_params.socket_path == "/tmp/llama-peer");
+        assert(server_params.hostnames == std::vector<std::string>({"127.0.0.1"}));
+
+        argv = {"binary_name", "--socket", "/tmp/llama-peer", "--host", "127.0.0.1,::1", "--port", "8080"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), server_params, LLAMA_EXAMPLE_SERVER));
+        assert(server_params.socket_path == "/tmp/llama-peer");
+        assert(server_params.hostnames == std::vector<std::string>({"127.0.0.1", "::1"}));
+        assert(server_params.port == 8080);
+
+        argv = {"binary_name", "--socket", ""};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), server_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");

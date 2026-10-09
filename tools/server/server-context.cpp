@@ -94,6 +94,7 @@ static json server_token_wire_info(const llama_vocab * vocab, int32_t n_ctx) {
     hash_byte(llama_vocab_get_add_sep(vocab));
     return {
         {"protocol", server_token_wire::magic},
+        {"stream", true},
         {"fingerprint", string_format("%016" PRIx64, hash)},
         {"n_vocab", n_vocab},
         {"eog_ids", std::move(eog_ids)},
@@ -2092,9 +2093,17 @@ private:
             }
 
             slot.add_token(result);
-            if (slot.task->params.stream) {
+            if (slot.task->params.stream && !slot.task->params.binary_stream) {
                 send_partial_response(slot, result, false);
             }
+        }
+
+        if (slot.task->params.binary_stream) {
+            completion_token_output raw = result;
+            if (incomplete) {
+                raw.text_to_send.clear();
+            }
+            send_partial_response(slot, raw, false);
         }
 
         if (incomplete) {
@@ -4876,6 +4885,53 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+static std::string server_token_wire_result(server_task_result & result, bool stream, bool return_content) {
+    json metadata;
+    const llama_tokens * tokens = nullptr;
+    if (result.is_error()) {
+        return server_token_wire::encode(safe_json_to_str({{"type", "error"}, {"error", result.to_json()}}), {});
+    }
+    if (const auto * partial = dynamic_cast<const server_task_result_cmpl_partial *>(&result)) {
+        if (partial->is_begin || partial->is_progress) {
+            return "";
+        }
+        metadata = {{"type", "tokens"}};
+        tokens = &partial->tokens;
+        if (return_content) {
+            metadata["content"] = partial->content.text;
+        }
+    } else if (const auto * final = dynamic_cast<const server_task_result_cmpl_final *>(&result)) {
+        const char * stop = final->stop == STOP_TYPE_EOS ? "eos" :
+                            final->stop == STOP_TYPE_WORD ? "word" :
+                            final->stop == STOP_TYPE_LIMIT ? "limit" : "none";
+        metadata = {
+            {"stop_type", stop},
+            {"stopping_word", final->stopping_word},
+            {"tokens_evaluated", final->n_prompt_tokens},
+            {"tokens_predicted", final->n_decoded},
+            {"tokens_cached", final->n_tokens_cached},
+            {"truncated", final->truncated},
+            {"id_slot", final->id_slot},
+            {"timings", final->stats.to_json()},
+        };
+        tokens = &final->tokens;
+        if (stream) {
+            metadata["type"] = "done";
+        } else if (return_content) {
+            metadata["content"] = final->content.text;
+        }
+    } else {
+        throw std::runtime_error("unexpected binary completion result");
+    }
+    std::string encoded = safe_json_to_str(metadata);
+    if (encoded.size() > server_token_wire::metadata_max && metadata.contains("content")) {
+        metadata.erase("content");
+        metadata["content_omitted"] = true;
+        encoded = safe_json_to_str(metadata);
+    }
+    return server_token_wire::encode(encoded, *tokens);
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -4946,7 +5002,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     throw std::invalid_argument("binary completion requires a positive n_predict and prompt + n_predict < context_size");
                 }
                 task.params.return_tokens = true;
-                task.params.stream = false;
+                task.params.binary_stream = task.params.stream;
+                task.params.return_progress = false;
                 task.params.n_cmpl = 1;
                 task.params.sampling.n_probs = 0;
             }
@@ -4990,31 +5047,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             return res;
         } else if (input_tokens) {
             GGML_ASSERT(all_results.results.size() == 1);
-            const auto * result = dynamic_cast<const server_task_result_cmpl_final *>(all_results.results[0].get());
-            GGML_ASSERT(result);
-            const char * stop = result->stop == STOP_TYPE_EOS ? "eos" :
-                                result->stop == STOP_TYPE_WORD ? "word" :
-                                result->stop == STOP_TYPE_LIMIT ? "limit" : "none";
-            json metadata = {
-                {"stop_type", stop},
-                {"stopping_word", result->stopping_word},
-                {"tokens_evaluated", result->n_prompt_tokens},
-                {"tokens_predicted", result->n_decoded},
-                {"tokens_cached", result->n_tokens_cached},
-                {"truncated", result->truncated},
-                {"id_slot", result->id_slot},
-                {"timings", result->stats.to_json()},
-            };
-            if (json_value(data, "return_content", true)) {
-                metadata["content"] = result->content.text;
-            }
-            std::string encoded_metadata = safe_json_to_str(metadata);
-            if (encoded_metadata.size() > server_token_wire::metadata_max && metadata.contains("content")) {
-                metadata.erase("content");
-                metadata["content_omitted"] = true;
-                encoded_metadata = safe_json_to_str(metadata);
-            }
-            res->data = server_token_wire::encode(encoded_metadata, result->tokens);
+            res->data = server_token_wire_result(*all_results.results[0], false, json_value(data, "return_content", true));
             res->content_type = "application/octet-stream";
             res->status = 200;
         } else {
@@ -5058,6 +5091,41 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
         );
+
+        if (input_tokens) {
+            const bool return_content = json_value(data, "return_content", true);
+            res->data = server_token_wire_result(*first_result, true, return_content);
+            res->status = 200;
+            res->content_type = "application/octet-stream";
+            res->set_next([res_this = res.get(), return_content, first_stop = first_result->is_stop()](std::string & output) {
+                output.clear();
+                if (res_this->should_stop()) {
+                    return false;
+                }
+                if (!res_this->data.empty()) {
+                    output.swap(res_this->data);
+                    return !first_stop;
+                }
+                try {
+                    auto & rd = res_this->rd;
+                    if (!rd.has_next()) {
+                        return false;
+                    }
+                    auto result = rd.next([res_this] { return res_this->should_stop(); });
+                    if (!result) {
+                        return false;
+                    }
+                    output = server_token_wire_result(*result, true, return_content);
+                    return !result->is_stop() && !result->is_error();
+                } catch (const std::exception & e) {
+                    output = server_token_wire::encode(safe_json_to_str({
+                        {"type", "error"}, {"error", format_error_response(e.what(), ERROR_TYPE_SERVER)},
+                    }), {});
+                    return false;
+                }
+            });
+            return res;
+        }
 
         // next responses are streamed
         // to be sent immediately
@@ -5607,7 +5675,7 @@ void server_routes::init_routes() {
                     throw std::invalid_argument(std::string("binary completion does not accept ") + field);
                 }
             }
-            const json fixed_options = {{"stream", false}, {"return_tokens", true}, {"n_cmpl", 1}, {"n", 1}, {"n_probs", 0}, {"logprobs", 0}};
+            const json fixed_options = {{"return_tokens", true}, {"n_cmpl", 1}, {"n", 1}, {"n_probs", 0}, {"logprobs", 0}};
             for (const auto & field : fixed_options.items()) {
                 if (body.contains(field.key()) && body.at(field.key()) != field.value()) {
                     throw std::invalid_argument(std::string("unsupported binary completion option: ") + field.key());
@@ -5615,6 +5683,9 @@ void server_routes::init_routes() {
             }
             if (body.contains("return_content") && !body.at("return_content").is_boolean()) {
                 throw std::invalid_argument("return_content must be a boolean");
+            }
+            if (body.contains("stream") && !body.at("stream").is_boolean()) {
+                throw std::invalid_argument("stream must be a boolean");
             }
             if (!body.contains("n_predict") || !body.at("n_predict").is_number_integer() ||
                     body.at("n_predict").get<uint64_t>() == 0 ||
@@ -5625,7 +5696,6 @@ void server_routes::init_routes() {
                     packet.tokens.size() + body.at("n_predict").get<uint64_t>() >= static_cast<uint64_t>(meta->slot_n_ctx)) {
                 throw std::invalid_argument("binary completion requires prompt + n_predict < context_size");
             }
-            body["stream"] = false;
             body["return_tokens"] = true;
             body["n_cmpl"] = 1;
             server_tokens tokens(packet.tokens, false);

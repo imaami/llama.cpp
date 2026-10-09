@@ -98,5 +98,5 @@ struct server_http_context {
     std::vector<std::string> listening_addresses;
 
 private:
-    bool init_listener(const common_params & params);
+    bool init_listener(const common_params & params, bool is_unix);
 };

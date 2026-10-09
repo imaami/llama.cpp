@@ -2,11 +2,14 @@
 
 #include "llama.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace server_token_wire {
@@ -80,5 +83,56 @@ inline std::string encode(const std::string & metadata, const std::vector<llama_
     }
     return result;
 }
+
+class stream_decoder {
+    int32_t n_vocab;
+    size_t tokens_max;
+    size_t packet_size = header_size;
+    std::string buffer;
+
+public:
+    stream_decoder(int32_t n_vocab, size_t tokens_max) : n_vocab(n_vocab), tokens_max(tokens_max) {
+        if (n_vocab <= 0) {
+            throw std::invalid_argument("invalid vocabulary size");
+        }
+    }
+
+    void feed(const char * data, size_t size, const std::function<void(packet)> & emit) {
+        while (size) {
+            const size_t n = std::min(size, packet_size - buffer.size());
+            buffer.append(data, n);
+            data += n;
+            size -= n;
+            if (buffer.size() != packet_size) {
+                continue;
+            }
+            if (packet_size == header_size) {
+                if (buffer.compare(0, 8, magic, 8)) {
+                    throw std::invalid_argument("invalid LLMTOK01 header");
+                }
+                const uint32_t n_metadata = read_u32(buffer.data() + 8);
+                const uint32_t n_tokens = read_u32(buffer.data() + 12);
+                if (n_metadata > metadata_max || n_tokens > tokens_max ||
+                        n_tokens > (buffer.max_size() - header_size - n_metadata) / 4) {
+                    throw std::invalid_argument("LLMTOK01 stream packet too large");
+                }
+                packet_size += n_metadata + size_t(n_tokens) * 4;
+                if (buffer.size() != packet_size) {
+                    continue;
+                }
+            }
+            packet result = decode(buffer, n_vocab);
+            buffer.clear();
+            packet_size = header_size;
+            emit(std::move(result));
+        }
+    }
+
+    void finish() const {
+        if (!buffer.empty()) {
+            throw std::invalid_argument("truncated LLMTOK01 stream packet");
+        }
+    }
+};
 
 } // namespace server_token_wire

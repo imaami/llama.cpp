@@ -1,5 +1,7 @@
 # Whole-reasoning token swap experiment
 
+For continuous exchange and a browser console, see [Crossthink](crossthink.md). The one-shot driver below remains available.
+
 This prototype runs two independent model instances, collects a complete reasoning block from each, and exchanges those blocks before generating their answers. The imported block occupies the recipient's own assistant reasoning prefix; no peer attribution or extra user message is inserted. It is an experiment in conditioning, with no claim that it improves reasoning quality.
 
 The branch starts at `imaami/llama.cpp` `bonsai`, commit `82a0e12a0`. The existing Vulkan and MTP changes are retained. The prototype changes server transport and adds a small native driver; it does not change inference kernels or the speculative decoder.
@@ -43,7 +45,7 @@ build/bin/llama-server -m /path/to/Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf \
     --device Vulkan0 --split-mode none --gpu-layers all \
     --ctx-size 262144 --parallel 1 --flash-attn on --jinja \
     --spec-type draft-mtp --spec-draft-n-max 1 \
-    --host /tmp/llama-reasoning-swap.XXXXXXXX/a.sock
+    --host 127.0.0.1 --port 8080 --socket /tmp/llama-reasoning-swap.XXXXXXXX/a.sock
 ```
 
 ```bash
@@ -51,7 +53,7 @@ build/bin/llama-server -m /path/to/Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf \
     --device Vulkan1 --split-mode none --gpu-layers all \
     --ctx-size 262144 --parallel 1 --flash-attn on --jinja \
     --spec-type draft-mtp --spec-draft-n-max 1 \
-    --host /tmp/llama-reasoning-swap.XXXXXXXX/b.sock
+    --host 127.0.0.1 --port 8081 --socket /tmp/llama-reasoning-swap.XXXXXXXX/b.sock
 ```
 
 Then run:
@@ -83,17 +85,17 @@ Unix-domain HTTP transport already exists in this branch. Both endpoints also fo
 | 16 | UTF-8 bytes | JSON metadata object, at most 65536 bytes |
 | following metadata | little-endian uint32 array | Exact token IDs |
 
-Request metadata holds completion controls such as `n_predict`, `seed`, `temperature`, `stop`, and `preserved_tokens`. The prompt is exclusively the packed token payload. Requests must use a positive finite generation budget, one completion, and nonstreaming output. Invalid framing, token IDs, unsupported modes, and requests that cannot fit in context are rejected.
+Request metadata holds completion controls such as `n_predict`, `seed`, `temperature`, `stop`, and `preserved_tokens`. The prompt is exclusively the packed token payload. Requests must use a positive finite generation budget and one completion. This driver uses nonstreaming output; the endpoint also supports the binary streaming mode described in [Crossthink](crossthink.md#binary-stream). Invalid framing, token IDs, unsupported modes, and requests that cannot fit in context are rejected.
 
 For reasoning, the driver supplies `stop: ["</think>"]`, `preserved_tokens: ["</think>"]`, and `return_content: false`. Preserving the special token makes it visible to the existing stop-string check. The returned token payload includes the closing delimiter, although displayed completion text conventionally excludes the stop string.
 
-Response metadata includes stop type, stopping word, counts, cache use, truncation state, timings, and optionally display text. If display text would exceed the metadata limit, the server omits it and sets `content_omitted: true`; the packed token output remains intact. The driver reports this as an error and recommends a smaller answer budget. Reasoning is exchanged exclusively as packed IDs. Ordinary JSON endpoints are used for the initial template/tokenizer setup. HTTP errors retain the normal JSON error format. This is whole-response transport, not a streaming protocol.
+Response metadata includes stop type, stopping word, counts, cache use, truncation state, timings, and optionally display text. If display text would exceed the metadata limit, the server omits it and sets `content_omitted: true`; the packed token output remains intact. The driver reports this as an error and recommends a smaller answer budget. Reasoning is exchanged exclusively as packed IDs. Ordinary JSON endpoints are used for the initial template/tokenizer setup. HTTP errors retain the normal JSON error format. The one-shot driver uses whole-response transport.
 
 ## Evaluation
 
 Compare the same questions with ordinary independent runs and with swapped reasoning. Keep seeds, sampling settings, model files, and budgets recorded. Different seeds encourage divergent traces but do not guarantee independent ideas, and identical models may reinforce the same mistake. Judge correctness and useful diversity as well as latency.
 
-The relevant performance measurements are reasoning time on each GPU, imported-prompt evaluation time, and answer time. The slower reasoner's completion is a barrier in this version. Overlapped ingestion is a separate follow-up requiring an open-input scheduler; it is not provided by these endpoints.
+The relevant performance measurements are reasoning time on each GPU, imported-prompt evaluation time, and answer time. The slower reasoner's completion is a barrier in this version. The continuous driver instead streams committed tokens and imports them at generation quantum boundaries; see [Crossthink](crossthink.md).
 
 ## Validation of this draft
 

@@ -50,6 +50,7 @@ enum stop_type {
 
 struct task_params {
     bool stream          = false;
+    bool binary_stream   = false; // emit every committed token, including incomplete UTF-8
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;

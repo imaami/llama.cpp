@@ -477,6 +477,7 @@ static std::filesystem::path get_server_exec_path() {
 }
 
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
+    preset.unset_option("LLAMA_ARG_SOCKET");
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
     preset.unset_option("LLAMA_API_KEY");
@@ -606,6 +607,9 @@ server_models::server_models(
               monitor(std::make_unique<server_monitor>(*this)) {
     // propagate base params to child
     unset_reserved_args(base_preset, true);
+    base_env.erase(std::remove_if(base_env.begin(), base_env.end(), [](const std::string & entry) {
+        return string_starts_with(entry, "LLAMA_ARG_SOCKET=");
+    }), base_env.end());
 
     // do not propagate these options, but allow preset to explicitly set them
     base_preset.unset_option("LLAMA_ARG_LOG_FILE");

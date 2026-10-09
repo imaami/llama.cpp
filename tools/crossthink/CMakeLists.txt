@@ -1,0 +1,10 @@
+add_library(crossthink-engine STATIC crossthink-engine.cpp crossthink.h)
+target_include_directories(crossthink-engine PUBLIC . ../server)
+target_link_libraries(crossthink-engine PUBLIC llama vendor::nlohmann Threads::Threads)
+target_compile_features(crossthink-engine PUBLIC cxx_std_17)
+
+add_executable(llama-crossthink crossthink-main.cpp crossthink-transport.cpp crossthink-ui.h)
+target_link_libraries(llama-crossthink PRIVATE crossthink-engine cpp-httplib)
+if (LLAMA_TOOLS_INSTALL)
+    install(TARGETS llama-crossthink RUNTIME)
+endif()
