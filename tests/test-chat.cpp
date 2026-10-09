@@ -7953,7 +7953,7 @@ static void test_reasoning_policy_session() {
     assert_equals(false, session.thinking_end_tags().empty());
     assert_equals(false, session.grammar().empty());
     assert_equals(0, params.at("reasoning_budget_tokens").get<int>());
-    assert_equals(json(session.thinking_end_tags()), params.at("reasoning_budget_end_tags"));
+    assert_equals(json(session.thinking_end_tags()).dump(), params.at("reasoning_budget_end_tags").dump());
     for (const char * key : {"n_predict", "max_tokens", "max_completion_tokens"}) {
         assert_equals(4096, params.at(key).get<int>());
     }
