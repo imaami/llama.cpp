@@ -183,16 +183,18 @@ void main() {
                         if (kv_active) {
                             f16vec4 m;
                             if (PACK_GQA_TOKENS) {
-                                // A vec4 may cross the boundary between tokens (GQA6).
-                                // Resolve every row separately rather than broadcasting a mask.
+                                // A vec4 may contain heads from both packed tokens.
+                                const uint32_t row0 = r * 4;
+                                const float16_t m0 = row0 < p.gqa_ratio
+                                    ? data_m[m_offset + kcol] : float16_t(NEG_FLT_MAX_OVER_2);
+                                const float16_t m1 = row0 + 3 >= p.gqa_ratio && row0 < N && N > p.gqa_ratio
+                                    ? data_m[m_offset + KV + kcol] : float16_t(NEG_FLT_MAX_OVER_2);
                                 [[unroll]] for (uint32_t lane = 0; lane < 4; ++lane) {
-                                    uint32_t row = r * 4 + lane;
-                                    m[lane] = row < N ? data_m[m_offset + fa_mask_row_offset(row) + kcol]
+                                    uint32_t row = row0 + lane;
+                                    m[lane] = row < N ? (row < p.gqa_ratio ? m0 : m1)
                                                       : float16_t(NEG_FLT_MAX_OVER_2);
-                                    if (row < N) {
-                                        max_mask = max(max_mask, float(m[lane]));
-                                    }
                                 }
+                                max_mask = max(max_mask, max(float(m0), float(m1)));
                             } else if (USE_SPARSE) {
                                 // sparse is gqa-gated (m_stride == 0): all four rows share the value
                                 FLOAT_TYPE mv = FLOAT_TYPE(data_m[m_offset + kcol]);

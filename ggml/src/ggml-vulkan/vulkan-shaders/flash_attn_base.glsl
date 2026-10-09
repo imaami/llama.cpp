@@ -121,8 +121,9 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     if (r < N && c == 0) {
+        const uint32_t token = uint32_t(r >= p.gqa_ratio);
         uint32_t offset = PACK_GQA_TOKENS
-            ? iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * 2 * p.k_num
+            ? iq2 + r - token * p.gqa_ratio + token * p.ne1 * 2 * p.k_num
             : iq2 + r;
         data_o[o_offset + offset] = D_TYPE(elem);
     }
@@ -181,7 +182,8 @@ void init_indices()
     }
 
     if (PACK_GQA_TOKENS) {
-        gqa_iq1 *= p.N / p.gqa_ratio;
+        // Packed tiles contain two query tokens.
+        gqa_iq1 *= 2;
         // The last tile of an odd verification batch contains only one token.
         N = min(N, (p.ne2 - gqa_iq1) * p.gqa_ratio);
     }
@@ -238,12 +240,13 @@ void init_indices()
 
 // Offsets relative to the first query token/head in this tile, in F32 elements.
 uint32_t fa_q_row_offset(uint32_t r) {
-    return PACK_GQA_TOKENS ? (r / p.gqa_ratio) * p.nb01 + (r % p.gqa_ratio) * q_stride
+    const uint32_t token = uint32_t(r >= p.gqa_ratio);
+    return PACK_GQA_TOKENS ? token * p.nb01 + (r - token * p.gqa_ratio) * q_stride
                            : r * q_stride;
 }
 
 uint32_t fa_mask_row_offset(uint32_t r) {
-    return PACK_GQA_TOKENS ? (r / p.gqa_ratio) * KV : r * m_stride;
+    return PACK_GQA_TOKENS ? uint32_t(r >= p.gqa_ratio) * KV : r * m_stride;
 }
 
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
@@ -270,8 +273,9 @@ const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 // original [head, split, token, batch] layout consumed by the split-K resolve.
 void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
+    const uint32_t token = uint32_t(r >= p.gqa_ratio);
     uint32_t offset = PACK_GQA_TOKENS
-        ? ((iq2 + r % p.gqa_ratio) + (r / p.gqa_ratio) * p.ne1 * p.k_num) * HSV / 4 + c
+        ? (iq2 + r - token * p.gqa_ratio + token * p.ne1 * p.k_num) * HSV / 4 + c
         : (iq2 + r) * HSV / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
 }
