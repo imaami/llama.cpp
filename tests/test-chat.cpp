@@ -7930,6 +7930,69 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+static void test_reasoning_policy_session() {
+    LOG_DBG("%s\n", __func__);
+    server_chat_params opt;
+    opt.tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+    opt.use_jinja = true;
+    opt.enable_thinking = true;
+    opt.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    opt.reasoning_budget = 512;
+    opt.reasoning_max_tokens_floor = 4096;
+
+    json body = {
+        {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+        {"tools", common_chat_tools_to_json_oaicompat({special_function_tool})},
+        {"reasoning_budget_tokens", 0},
+        {"n_predict", 128}, {"max_tokens", 256}, {"max_completion_tokens", 512},
+    };
+    std::vector<raw_buffer> files;
+    common_chat_session session;
+    auto params = oaicompat_chat_params_parse(nullptr, body, opt, files, session);
+
+    assert_equals(false, session.thinking_end_tags().empty());
+    assert_equals(false, session.grammar().empty());
+    assert_equals(0, params.at("reasoning_budget_tokens").get<int>());
+    assert_equals(json(session.thinking_end_tags()), params.at("reasoning_budget_end_tags"));
+    for (const char * key : {"n_predict", "max_tokens", "max_completion_tokens"}) {
+        assert_equals(4096, params.at(key).get<int>());
+    }
+    common_params_sampling sampling;
+    session.apply_sampling(sampling);
+    assert_equals(session.grammar(), common_grammar_value(sampling.grammar));
+    assert_equals(session.generation_prompt(), sampling.generation_prompt);
+
+    body["reasoning_effort"] = "none";
+    params = oaicompat_chat_params_parse(nullptr, body, opt, files, session);
+    for (const char * key : {"n_predict", "max_tokens", "max_completion_tokens"}) {
+        assert_equals(body.at(key).get<int>(), params.at(key).get<int>());
+    }
+
+    body.erase("reasoning_effort");
+    body.erase("tools");
+    opt.tmpls = read_templates("models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja");
+    params = oaicompat_chat_params_parse(nullptr, body, opt, files, session);
+    assert_equals(true, session.thinking_end_tags().empty());
+    assert_equals(128, params.at("n_predict").get<int>());
+
+    opt.tmpls = read_templates("models/templates/openai-gpt-oss-120b.jinja");
+    opt.reasoning_effort_allow = {"medium"};
+    opt.reasoning_effort_fallback = "medium";
+    opt.reasoning_max_tokens_floor = 0;
+    for (bool via_kwargs : {false, true}) {
+        body.erase("reasoning_effort");
+        body.erase("chat_template_kwargs");
+        if (via_kwargs) {
+            body["chat_template_kwargs"] = {{"reasoning_effort", "high"}};
+        } else {
+            body["reasoning_effort"] = "high";
+        }
+        params = oaicompat_chat_params_parse(nullptr, body, opt, files, session);
+        assert_contains(session.prompt(), "Reasoning: medium\n");
+        assert_equals(128, params.at("n_predict").get<int>());
+    }
+}
+
 static void test_reasoning_effort_caps() {
     LOG_DBG("%s\n", __func__);
 
@@ -8112,6 +8175,7 @@ int main(int argc, char ** argv) {
         test_chat_session();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_reasoning_policy_session();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
