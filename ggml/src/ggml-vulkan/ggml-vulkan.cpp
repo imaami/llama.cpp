@@ -3280,6 +3280,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // mul mat vec
 
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    const char * ptq1_packed_dot_env = getenv("GGML_VK_PTQ1_PACKED_DOT");
+    const uint32_t ptq1_packed_dot = ptq1_packed_dot_env != nullptr && strcmp(ptq1_packed_dot_env, "1") == 0;
+#endif
+
     // the number of rows computed per shader depends on GPU model and quant
     uint32_t rm_stdq = 1;
     uint32_t rm_kq = 2;
