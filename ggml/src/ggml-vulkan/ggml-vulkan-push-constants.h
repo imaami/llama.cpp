@@ -165,6 +165,7 @@ struct vk_op_fwht_signed_push_constants {
     float scale;
     uint32_t sign_width;
     uint32_t sign_offset;
+    uint32_t up_offset;
 };
 
 struct vk_op_dsv4_hc_comb_push_constants {
@@ -952,8 +953,8 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     p.src_offset  = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
     p.dst_offset  = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
     p.sign_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.up_offset   = src2 ? get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type) : 0;
 
-    GGML_UNUSED(src2);
     GGML_UNUSED(src3);
 }
 

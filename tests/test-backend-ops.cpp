@@ -5615,6 +5615,11 @@ struct test_fwht_signed : public test_case {
         USE_MUL      = 1u << 5,
         USE_RESHAPE  = 1u << 6,
         INPLACE      = 1u << 7,
+        VIEW_UP      = 1u << 8,
+        MARK_GLU     = 1u << 9,
+        USE_GLU      = 1u << 10,
+        STRIDED_GLU  = 1u << 11,
+        ALT_GLU      = 1u << 12,
     };
 
     const int64_t blk;
@@ -5645,16 +5650,31 @@ struct test_fwht_signed : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         checked_nodes.clear();
-        GGML_ASSERT(!(options & VIEW_X) || (!swiglu && type_x == GGML_TYPE_F32));
+        GGML_ASSERT(!(options & (VIEW_X | VIEW_UP | STRIDED_GLU)) || type_x == GGML_TYPE_F32);
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blk, blk);
         ggml_set_name(a, "a");
         ggml_tensor * x;
         if (swiglu) {
-            ggml_tensor * g = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+            ggml_tensor * g;
+            if (options & (VIEW_X | STRIDED_GLU)) {
+                const int64_t stride = width + ((options & STRIDED_GLU) ? 1 : 0);
+                ggml_tensor * storage = ggml_new_tensor_1d(ctx, type_x, stride * n_tokens + 1);
+                ggml_set_name(storage, "gate_storage");
+                g = ggml_view_2d(ctx, storage, width, n_tokens, stride * sizeof(float), sizeof(float));
+            } else {
+                g = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+            }
             ggml_set_name(g, "g");
-            ggml_tensor * u = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+            ggml_tensor * u;
+            if (options & VIEW_UP) {
+                ggml_tensor * storage = ggml_new_tensor_1d(ctx, type_x, width * n_tokens + 1);
+                ggml_set_name(storage, "up_storage");
+                u = ggml_view_2d(ctx, storage, width, n_tokens, width * sizeof(float), sizeof(float));
+            } else {
+                u = ggml_new_tensor_2d(ctx, type_x, width, n_tokens);
+            }
             ggml_set_name(u, "u");
-            x = ggml_swiglu_split(ctx, g, u);
+            x = (options & ALT_GLU) ? ggml_geglu_split(ctx, g, u) : ggml_swiglu_split(ctx, g, u);
         } else if (options & VIEW_X) {
             ggml_tensor * storage = ggml_new_tensor_1d(ctx, type_x, width * n_tokens + 1);
             ggml_set_name(storage, "x_storage");
@@ -5679,6 +5699,10 @@ struct test_fwht_signed : public test_case {
         ggml_set_name(reshape, "signed_blocks");
         ggml_tensor * out = ggml_mul_mat(ctx, a, reshape);
         ggml_mul_mat_set_hint(out, GGML_HINT_SRC0_IS_HADAMARD);
+        if (options & MARK_GLU) {
+            ggml_set_output(x);
+            checked_nodes.push_back(x);
+        }
         if (options & MARK_MUL) {
             ggml_set_output(mul);
             checked_nodes.push_back(mul);
@@ -5687,10 +5711,11 @@ struct test_fwht_signed : public test_case {
             ggml_set_output(reshape);
             checked_nodes.push_back(reshape);
         }
-        if (options & (USE_MUL | USE_RESHAPE)) {
+        if (options & (USE_MUL | USE_RESHAPE | USE_GLU)) {
             ggml_set_name(out, "fwht_out");
             checked_nodes.push_back(out);
-            ggml_tensor * extra = ggml_scale(ctx, (options & USE_MUL) ? mul : reshape, 0.25f);
+            ggml_tensor * extra_src = (options & USE_GLU) ? x : (options & USE_MUL) ? mul : reshape;
+            ggml_tensor * extra = ggml_scale(ctx, extra_src, 0.25f);
             extra = ggml_reshape_2d(ctx, extra, blk, width / blk * n_tokens);
             out = ggml_add(ctx, out, extra);
         }
@@ -11015,6 +11040,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(128,  1024,  5,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(2048, 8192,  3,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120,  4,   GGML_TYPE_F16, true));
+    for (uint32_t options : { uint32_t(0), uint32_t(test_fwht_signed::VIEW_X),
+            uint32_t(test_fwht_signed::VIEW_UP),
+            uint32_t(test_fwht_signed::VIEW_X | test_fwht_signed::VIEW_UP | test_fwht_signed::VIEW_S | test_fwht_signed::SCALED_SIGNS),
+            uint32_t(test_fwht_signed::MARK_GLU), uint32_t(test_fwht_signed::USE_GLU),
+            uint32_t(test_fwht_signed::STRIDED_GLU), uint32_t(test_fwht_signed::ALT_GLU) }) {
+        test_cases.emplace_back(new test_fwht_signed(1024, 5120, 3, GGML_TYPE_F32, true, options));
+    }
     // Block widths above the register path's reach, plus a couple below it as controls. 4096 and
     // 8192 exercise the shared-memory kernel; before it existed the CUDA backend declined them and
     // the op fell back, which cost both speed and (measurably) a little accuracy.

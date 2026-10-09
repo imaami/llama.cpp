@@ -24,6 +24,7 @@ layout(push_constant) uniform parameter
 #ifdef FWHT_SIGNED
     uint sign_width;
     uint sign_offset;
+    uint up_offset;
 #endif
 };
 
@@ -37,6 +38,9 @@ layout(binding = 0, std430) readonly buffer A {
 layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
 #ifdef FWHT_SIGNED
 layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+#endif
+#ifdef FWHT_SWIGLU
+layout(binding = 3, std430) readonly buffer U { float data_u[]; };
 #endif
 
 const uint EL_W = N / BLOCK_SIZE;
@@ -76,8 +80,13 @@ void main() {
         for (uint i = 0; i < EL_W; ++i) {
 #ifdef FWHT_SIGNED
             const uint col = row_offset + i * BLOCK_SIZE + tid;
-            // Match the rounding of MUL followed by the normalized FWHT.
-            precise float val = row < n_rows ? data_a[src_offset + col] * data_s[sign_row_offset + i * BLOCK_SIZE + tid] : 0.0;
+            precise float input_val = row < n_rows ? data_a[src_offset + col] : 0.0;
+#ifdef FWHT_SWIGLU
+            // Preserve the F32 SwiGLU result before sign multiplication and normalization.
+            precise float glu = row < n_rows ? input_val / (1.0 + exp(-input_val)) * data_u[up_offset + col] : 0.0;
+            input_val = glu;
+#endif
+            precise float val = row < n_rows ? input_val * data_s[sign_row_offset + i * BLOCK_SIZE + tid] : 0.0;
             precise float scaled = val * scale;
             reg[i] = scaled;
 #else
