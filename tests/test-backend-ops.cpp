@@ -12414,6 +12414,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 256, 2, {6, 1}, 4097, 2, false, false, 0, 0,
         GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
 
+    // Packed mask vectors with aligned and unaligned token boundaries, plus odd-token tails.
+    for (int64_t gqa : {4, 7}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {gqa, 1}, 1025, 3, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
+    }
+
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
