@@ -4,7 +4,47 @@
 //   block_a_load()           — load from global memory into a block_a_prefetch
 //   block_a_to_shmem()       — unpack and write to shared memory
 
-#if defined(DATA_A_Q4_0)
+#if defined(DATA_A_PTQ1_0)
+
+#include "ptq1_0.glsl"
+
+struct block_a_prefetch {
+    uint32_t qs;
+    float16_t d;
+};
+
+block_a_prefetch block_a_load(uint ib, uint loadr) {
+    // The framework indexes 32-element chunks; PTQ1 stores 128 weights and
+    // one scale. Repeat that scale for each of the four Q8 activation blocks.
+    const uint ib128 = ib / 4u;
+    const uint e = (ib % 4u) * 32u + 4u * loadr;
+    uint n;
+    const uint w = ptq1_0_word(ib128, 0u, e, n);
+    block_a_prefetch blk;
+    if (e < 120u) {
+        const uint qe = ptq1_0_lane_trits(w & 0x00FF00FFu, n);
+        const uint qo = ptq1_0_lane_trits((w >> 8u) & 0x00FF00FFu, n);
+        blk.qs = qe | (qo << 8u);
+    } else {
+        const uint bytes = (w & 0xFFu) | ((w & 0xFF00u) << 8u);
+        const uint q0 = ptq1_0_lane_trits(bytes, n);
+        const uint q1 = ptq1_0_lane_trits(bytes, n + 1u);
+        blk.qs = (q0 & 3u) | ((q0 >> 16u) << 8u) | ((q1 & 3u) << 16u) | ((q1 >> 16u) << 24u);
+    }
+    blk.d = data_a[ib128].d;
+    return blk;
+}
+
+void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
+    // Keep unsigned trits in int8 lanes. Subtract the separately rounded Q8
+    // stored sum rather than centering the trits and reconstructing that sum.
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr] = blk.qs;
+    if (loadr == 0) {
+        buf_a_dm[ks * BM + buf_ib] = vec2(float(blk.d), -float(blk.d));
+    }
+}
+
+#elif defined(DATA_A_Q4_0)
 
 struct block_a_prefetch {
     uint32_t qs;
@@ -511,7 +551,7 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
 struct block_b_prefetch {
     ivec4 qs;
     float16_t d;
-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K) || defined(DATA_A_PTQ1_0)
     float16_t s;
 #endif
 };
@@ -520,7 +560,7 @@ block_b_prefetch block_b_load(uint ib_outer, uint ib_inner, uint loadr) {
     block_b_prefetch blk;
     blk.qs = data_b[ib_outer].qs[ib_inner * 2 + loadr];
     blk.d = data_b[ib_outer].ds[ib_inner].x;
-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K) || defined(DATA_A_PTQ1_0)
     blk.s = data_b[ib_outer].ds[ib_inner].y;
 #endif
     return blk;
@@ -535,7 +575,7 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     buf_b_qs[base + 3] = v.w;
     if (loadr == 0) {
         buf_b_d[ks * BN + buf_ib] = in_bounds ? float(blk.d) : 0.0f;
-#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K) || defined(DATA_A_PTQ1_0)
         buf_b_s[ks * BN + buf_ib] = in_bounds ? float(blk.s) : 0.0f;
 #endif
     }

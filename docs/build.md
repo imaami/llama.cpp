@@ -456,6 +456,13 @@ On Linux it is possible to use unified memory architecture (UMA) to share main m
 
 ## Vulkan
 
+On AMD RDNA4 GPUs with integer cooperative matrix support,
+`GGML_VK_PTQ1_MMQ=1` enables experimental PTQ1_0 integer prefill for dense
+matrix multiplications with at least 16 activation columns. This is disabled
+by default and changes activation precision from F16 to Q8_1. Compare model
+outputs or perplexity and prompt-processing throughput before enabling it for
+your workload.
+
 ### For Windows Users:
 **w64devkit**
 

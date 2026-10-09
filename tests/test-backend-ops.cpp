@@ -11455,6 +11455,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 7, n, 384, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     }
 
+    // PTQ1_0 opt-in integer prefill threshold, 128/384-wide scales and tile tails.
+    for (int n : {15, 16, 17, 31, 32, 33}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 33, n, 128, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 65, n, 384, {2, 2}, {2, 1}));
+    }
+
     // PTQ1_0 medium/large prefill tiles, including a partial output row tile.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,  64,  64, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,  96,  64, 384, {1, 1}, {1, 1}));
