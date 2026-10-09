@@ -8849,9 +8849,13 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const bool causal;
+    const bool offset_views;
+    const int64_t mask_pad;
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
+               "," + VARS_TO_STR3(causal, offset_views, mask_pad);
     }
 
     double max_nmse_err() override {
@@ -8868,9 +8872,11 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool causal = false, bool offset_views = false,
+                        int64_t mask_pad = 1)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
+          causal(causal), offset_views(offset_views), mask_pad(mask_pad) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8883,9 +8889,12 @@ struct test_flash_attn_ext : public test_case {
                 ne_perm[permute[i]] = ne[i];
             }
             ggml_tensor * t;
-            if (is_view) {
-                ggml_tensor * t0 = ggml_new_tensor_4d(ctx, type, ne_perm[0], 2*ne_perm[1], ne_perm[2], ne_perm[3]);
-                t = ggml_view_4d(ctx, t0, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3], t0->nb[1], t0->nb[2], t0->nb[3], 0);
+            if (is_view || offset_views) {
+                // 32 rows retain 256-byte descriptor alignment for the tested
+                // Q8_0/Q4_0 head sizes while exercising nonzero Q/K/V offsets.
+                const int64_t offset_rows = offset_views ? 32 : 0;
+                ggml_tensor * t0 = ggml_new_tensor_4d(ctx, type, ne_perm[0], 2*ne_perm[1] + offset_rows, ne_perm[2], ne_perm[3]);
+                t = ggml_view_4d(ctx, t0, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3], t0->nb[1], t0->nb[2], t0->nb[3], offset_rows*t0->nb[1]);
             } else {
                 t = ggml_new_tensor_4d(ctx, type, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3]);
             }
@@ -8918,7 +8927,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, GGML_PAD(nb, mask_pad), 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -8943,7 +8952,21 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                if (n_kv_max > 0) {
+                if (causal) {
+                    std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                    for (int64_t batch = 0; batch < t->ne[3]; ++batch) {
+                        for (int64_t row = 0; row < nb; ++row) {
+                            for (int64_t col = 0; col < kv; ++col) {
+                                // Distinct finite biases also catch sharing token 0's
+                                // mask when the causal boundary is deep in the KV cache.
+                                const float bias = float((col/8 + 3*row + batch) % 7 - 3) / 4.0f;
+                                const float value = col <= kv - nb + row ? bias : -INFINITY;
+                                data[(batch*t->ne[1] + row)*kv + col] = ggml_fp32_to_fp16(value);
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+                } else if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
                 } else {
                     init_tensor_kq_mask(t);
@@ -12300,6 +12323,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
+
+    // Bonsai MTP: two-token GQA6 packing, odd-token tails, and a second packed
+    // tile. Small/large KV exercise unsplit and split-K output addressing;
+    // permuted, offset Q/K/V views exercise independent head/token strides.
+    for (int64_t nb : {2, 3, 4}) {
+        for (int64_t kv : {32, 1025}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 1025, nb, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, true, true));
+    }
+    // N=1 remains on the existing decode path; feature flags force fallback.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1025, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1025, 2, true, true, 8, 30,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
+    // Server masks pad query rows; packed tokens must not reuse mask-opt tile flags.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1025, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true, false, 32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 256, 2, {6, 1}, 4097, 2, false, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));

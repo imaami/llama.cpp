@@ -26,6 +26,8 @@ const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
 const bool USE_SPARSE      = (Flags & 16) != 0;
+// Each tile contains two query tokens, with GQA heads contiguous within a token.
+const bool PACK_GQA_TOKENS = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -119,7 +121,9 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
     if (r < N && c == 0) {
-        uint32_t offset = iq2 + r;
+        uint32_t offset = PACK_GQA_TOKENS
+            ? iq2 + r % p.gqa_ratio + (r / p.gqa_ratio) * p.ne1 * 2 * p.k_num
+            : iq2 + r;
         data_o[o_offset + offset] = D_TYPE(elem);
     }
     return elem;
@@ -176,6 +180,12 @@ void init_indices()
         split_k_index = 0;
     }
 
+    if (PACK_GQA_TOKENS) {
+        gqa_iq1 *= p.N / p.gqa_ratio;
+        // The last tile of an odd verification batch contains only one token.
+        N = min(N, (p.ne2 - gqa_iq1) * p.gqa_ratio);
+    }
+
     Tr = CEIL_DIV(N, Br);
 
     start_j = split_k_index * p.split_kv / Bc;
@@ -226,6 +236,16 @@ void init_indices()
     }
 }
 
+// Offsets relative to the first query token/head in this tile, in F32 elements.
+uint32_t fa_q_row_offset(uint32_t r) {
+    return PACK_GQA_TOKENS ? (r / p.gqa_ratio) * p.nb01 + (r % p.gqa_ratio) * q_stride
+                           : r * q_stride;
+}
+
+uint32_t fa_mask_row_offset(uint32_t r) {
+    return PACK_GQA_TOKENS ? (r / p.gqa_ratio) * KV : r * m_stride;
+}
+
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
 bool fa_kv_index(uint lin, out uint kv_col) {
     if (USE_SPARSE) {
@@ -246,9 +266,12 @@ bool fa_kv_index(uint lin, out uint kv_col) {
 const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 
 // Store the output when doing grouped query attention.
-// Rows index by Q's dimension 2, and the first N rows are valid.
+// Packed rows first index the GQA head, then the query token. Output keeps the
+// original [head, split, token, batch] layout consumed by the split-K resolve.
 void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
 {
-    uint32_t offset = (iq2 + r) * HSV / 4 + c;
+    uint32_t offset = PACK_GQA_TOKENS
+        ? ((iq2 + r % p.gqa_ratio) + (r / p.gqa_ratio) * p.ne1 * p.k_num) * HSV / 4 + c
+        : (iq2 + r) * HSV / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
 }

@@ -115,13 +115,15 @@ void main() {
         const bool is_in_bounds = r < Br && d < HSK / 4 && i * Br + r < N;
 #ifndef MMQ
         if (is_in_bounds) {
-            Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+            Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + fa_q_row_offset(i * Br + r) / 4 + d] * p.scale);
+        } else if (PACK_GQA_TOKENS && r < Br) {
+            Qf[r * qf_stride + d] = FLOAT_TYPEV4(0);
         }
 #else
         const uint buf_ib = r * qf_stride + d / 8;
         const uint buf_iqs = d % 8;
 
-        vec4 vals = is_in_bounds ? data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale : vec4(0.0f);
+        vec4 vals = is_in_bounds ? data_qv4[q_offset / 4 + fa_q_row_offset(i * Br + r) / 4 + d] * p.scale : vec4(0.0f);
         const vec4 abs_vals = abs(vals);
 
         const float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
@@ -215,12 +217,12 @@ void main() {
                     if (idx + tid < Bc * Br) {
                         uint32_t kcol;
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
-                        if (kv_active && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + kcol]);
+                        if (kv_active && (PACK_GQA_TOKENS ? r < N : (!nem1_bounds_check || i * Br + r < p.nem1))) {
+                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + fa_mask_row_offset(i * Br + r) + kcol]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {
-                            masksh[c * masksh_stride + r] = USE_SPARSE ? FLOAT_TYPE(NEG_FLT_MAX_OVER_2) : FLOAT_TYPE(0);
+                            masksh[c * masksh_stride + r] = (USE_SPARSE || PACK_GQA_TOKENS) ? FLOAT_TYPE(NEG_FLT_MAX_OVER_2) : FLOAT_TYPE(0);
                         }
                     }
                 }

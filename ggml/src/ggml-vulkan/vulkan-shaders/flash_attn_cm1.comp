@@ -97,7 +97,9 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
-            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + fa_q_row_offset(i * Br + r) / 4 + d] * p.scale);
+        } else if (PACK_GQA_TOKENS && r < Br) {
+            Qf[r * qstride + d] = FLOAT_TYPEV4(0);
         }
     }
     barrier();
@@ -180,7 +182,18 @@ void main() {
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
                         if (kv_active) {
                             f16vec4 m;
-                            if (USE_SPARSE) {
+                            if (PACK_GQA_TOKENS) {
+                                // A vec4 may cross the boundary between tokens (GQA6).
+                                // Resolve every row separately rather than broadcasting a mask.
+                                [[unroll]] for (uint32_t lane = 0; lane < 4; ++lane) {
+                                    uint32_t row = r * 4 + lane;
+                                    m[lane] = row < N ? data_m[m_offset + fa_mask_row_offset(row) + kcol]
+                                                      : float16_t(NEG_FLT_MAX_OVER_2);
+                                    if (row < N) {
+                                        max_mask = max(max_mask, float(m[lane]));
+                                    }
+                                }
+                            } else if (USE_SPARSE) {
                                 // sparse is gqa-gated (m_stride == 0): all four rows share the value
                                 FLOAT_TYPE mv = FLOAT_TYPE(data_m[m_offset + kcol]);
                                 m = f16vec4(mv);

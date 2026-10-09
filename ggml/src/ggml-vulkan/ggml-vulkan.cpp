@@ -1392,7 +1392,8 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, bool pack_gqa_tokens,
+                                                  ggml_type k_type, ggml_type v_type) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1400,7 +1401,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (use_sparse        ? 16 : 0);
+                     (use_sparse        ? 16 : 0) |
+                     (pack_gqa_tokens   ? 32 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -8325,6 +8327,38 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                             (int64_t)KV >= std::max<int64_t>(4096, min_ratio * (int64_t)n_kv_max) &&
                             (gqa_ratio > 1 || (tuning_params.path == FA_SCALAR && N == 1));
 
+    // Short MTP verification shares K/V between adjacent tokens as well as GQA heads.
+    // Two GQA6 queries fit the same 16-row coopmat tile as a single query, so this
+    // reuses the K/V loads and dequantization without increasing the tile size.
+    // The override also enables the common row mapping on scalar for validation;
+    // wider batches/other devices remain experimental until measured on hardware.
+    static const char * pack_gqa_env = getenv("GGML_VK_FA_GQA_PACK");
+    const bool force_pack_gqa = pack_gqa_env && strcmp(pack_gqa_env, "1") == 0;
+    const bool disable_pack_gqa = pack_gqa_env && strcmp(pack_gqa_env, "0") == 0;
+    const bool default_pack_gqa = ctx->device->architecture == AMD_RDNA4 &&
+                                  tuning_params.path == FA_COOPMAT1 && gqa_ratio == 6 && neq1 == 2;
+    bool pack_gqa_tokens = false;
+    if (!disable_pack_gqa && (force_pack_gqa || default_pack_gqa) &&
+        neq1 >= 2 && neq1 <= 4 && gqa_ratio > 1 &&
+        k_type_eff == GGML_TYPE_Q8_0 && v_type_eff == GGML_TYPE_Q4_0 &&
+        !sinks && max_bias == 0.0f && logit_softcap == 0.0f && n_kv_max == 0 &&
+        (!mask || (nem0 == KV && nem1 >= neq1)) &&
+        (tuning_params.path == FA_SCALAR || tuning_params.path == FA_COOPMAT1)) {
+        const uint32_t packed_rows = 2 * gqa_ratio;
+        // The scalar override may use a larger tile even for short KV, so both
+        // split and unsplit indexing can be exercised on software Vulkan devices.
+        const uint32_t tuning_kv = force_pack_gqa ? std::max(KV, 1024u) : KV;
+        const vk_fa_tuning_params packed_params = get_fa_tuning_params(ctx->device, HSK, HSV, packed_rows, tuning_kv,
+                                                                      k_type_eff, v_type_eff, f32acc);
+        if (packed_params.path == tuning_params.path && packed_rows <= packed_params.block_rows &&
+            (force_pack_gqa || packed_params.block_rows == tuning_params.block_rows)) {
+            pack_gqa_tokens = true;
+            tuning_params = packed_params;
+            N = packed_rows;
+            workgroups_x = CEIL_DIV((uint32_t)neq1, 2u);
+        }
+    }
+
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
     uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
@@ -8358,10 +8392,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = mask && !use_sparse && !pack_gqa_tokens && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, pack_gqa_tokens,
+                                                                   k_type_eff, v_type_eff);
 
     vk_pipeline pipeline = nullptr;
 
