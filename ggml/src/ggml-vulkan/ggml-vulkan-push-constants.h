@@ -713,7 +713,13 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
     uint32_t raw_dt_bias_offset;
     uint32_t raw_a_offset;
+    uint32_t state_offset;
+    uint32_t state_row_stride;
+    uint32_t n_state_rows;
+    uint32_t rows_offset;
 };
+
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;

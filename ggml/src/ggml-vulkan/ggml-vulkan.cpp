@@ -3815,7 +3815,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t gate = 0; gate < 3; gate++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][gate],
-                    gdn_names[si][gate], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][gate], gdn_len, gdn_data, "main", 10, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, gate == 1 ? 1u : 0u, gdn_subgroup_size, lanes_per_column, gate == 2 ? 1u : 0u},
                     1, true, use_subgroup_ops, gdn_subgroup_size);
             }
@@ -10380,6 +10380,8 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_rows  = dst->src[6] ? dst->src[6] : src_beta;
 
     GGML_ASSERT(dst->buffer != nullptr);
 
@@ -10405,7 +10407,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer src_buf[6] = {};
     for (int i = 0; i < 6; i++) {
-        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i], i == 5);
     }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
@@ -10430,13 +10432,18 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         neq1, rq3,
         scale,
         K,
-        get_misalign_bytes(ctx, raw_dt_bias) / sizeof(float),
-        get_misalign_bytes(ctx, raw_a) / sizeof(float)
+        (uint32_t)(get_misalign_bytes(ctx, raw_dt_bias) / sizeof(float)),
+        (uint32_t)(get_misalign_bytes(ctx, raw_a) / sizeof(float)),
+        (uint32_t)(get_misalign_bytes(ctx, src_state) / sizeof(float)),
+        dst->src[6] ? (uint32_t)(src_state->nb[1] / sizeof(float)) : 0,
+        dst->src[6] ? (uint32_t)src_state->ne[1] : 0,
+        (uint32_t)(get_misalign_bytes(ctx, src_rows) / sizeof(int32_t))
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf,
-         ggml_vk_tensor_subbuffer(ctx, raw_dt_bias, true), ggml_vk_tensor_subbuffer(ctx, raw_a, true)},
+         ggml_vk_tensor_subbuffer(ctx, raw_dt_bias, true), ggml_vk_tensor_subbuffer(ctx, raw_a, true),
+         ggml_vk_tensor_subbuffer(ctx, src_rows, true)},
         pc, { H, n_seqs, S_v });
 }
 
@@ -16184,16 +16191,23 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GATED_DELTA_NET:
             {
-                // rows-indexed state read (src[6]) not implemented on Vulkan yet
-                if (op->src[6] != nullptr) {
-                    return false;
-                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
                 }
                 for (int i = 0; i < 6; i++) {
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                if (op->src[6] != nullptr) {
+                    const ggml_tensor * state = op->src[5];
+                    const ggml_tensor * rows = op->src[6];
+                    if (rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows) ||
+                        ggml_nelements(rows) != op->src[2]->ne[3] || rows->view_offs % sizeof(int32_t) != 0 ||
+                        !ggml_is_contiguous(state) || state->ne[0] != S_v * S_v * op->src[2]->ne[1] ||
+                        state->ne[2] != 1 || state->ne[3] != 1 || state->view_offs % sizeof(float) != 0 ||
+                        ggml_nbytes(state) > UINT32_MAX || ggml_nbytes(rows) > UINT32_MAX) {
                         return false;
                     }
                 }
