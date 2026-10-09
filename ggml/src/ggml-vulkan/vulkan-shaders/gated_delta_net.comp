@@ -15,6 +15,7 @@ layout(constant_id = 0) const uint S_V = 128;
 layout(constant_id = 1) const uint KDA = 0;
 layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
 layout(constant_id = 3) const uint LANES_PER_COLUMN = 32;
+layout(constant_id = 4) const uint RAW_GATES = 0;
 
 const uint COLS_PER_WG = SUBGROUP_SIZE / LANES_PER_COLUMN;
 const uint ROWS_PER_LANE = S_V / LANES_PER_COLUMN;
@@ -32,6 +33,8 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    uint raw_dt_bias_offset;
+    uint raw_a_offset;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -41,6 +44,8 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 7) readonly  buffer BiasBuf  { FLOAT_TYPE data_dt_bias[]; };
+layout(binding = 8) readonly  buffer ABuf     { FLOAT_TYPE data_a[];       };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -117,13 +122,18 @@ void main() {
     // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
     uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
+    const FLOAT_TYPE raw_dt_bias = RAW_GATES != 0 ? data_dt_bias[raw_dt_bias_offset + head_id] : 0.0;
+    const FLOAT_TYPE raw_a = RAW_GATES != 0 ? data_a[raw_a_offset + head_id] : 0.0;
 
     for (uint t = 0; t < n_tokens; t++) {
         const uint q_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        if (RAW_GATES != 0) {
+            beta_val = 1.0 / (1.0 + exp(-beta_val));
+        }
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];
@@ -135,7 +145,12 @@ void main() {
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {
-            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+            FLOAT_TYPE g = FLOAT_TYPE(data_g[gb_off]);
+            if (RAW_GATES != 0) {
+                const FLOAT_TYPE x = g + raw_dt_bias;
+                g = raw_a * (x > 20.0 ? x : log(1.0 + exp(x)));
+            }
+            const FLOAT_TYPE g_val = exp(g);
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 g_exp[r] = g_val;
             }

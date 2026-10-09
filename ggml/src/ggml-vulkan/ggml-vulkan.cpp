@@ -3747,11 +3747,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
-        const char * gdn_names[][2] = {
-            {"gated_delta_net_f32_d16",     "gated_delta_net_f32_d16_kda"},
-            {"gated_delta_net_f32_d32",     "gated_delta_net_f32_d32_kda"},
-            {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
-            {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
+        const char * gdn_names[][3] = {
+            {"gated_delta_net_f32_d16",     "gated_delta_net_f32_d16_kda", "gated_delta_net_f32_d16_raw"},
+            {"gated_delta_net_f32_d32",     "gated_delta_net_f32_d32_kda", "gated_delta_net_f32_d32_raw"},
+            {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda", "gated_delta_net_f32_d64_raw"},
+            {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda", "gated_delta_net_f32_d128_raw"},
         };
         for (uint32_t si = 0; si < 4; si++) {
             const uint32_t S_V = gdn_sizes[si];
@@ -3813,10 +3813,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
             const std::array<uint32_t, 3> wg_denoms = {1u, 1u, cols_per_wg};
 
-            for (uint32_t kda = 0; kda < 2; kda++) {
-                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+            for (uint32_t gate = 0; gate < 3; gate++) {
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][gate],
+                    gdn_names[si][gate], gdn_len, gdn_data, "main", 9, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, gate == 1 ? 1u : 0u, gdn_subgroup_size, lanes_per_column, gate == 2 ? 1u : 0u},
+                    1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
     }
@@ -9315,7 +9316,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 3; break;
                 default: return nullptr;
             }
-            return ctx->device->pipeline_gated_delta_net[si][kda];
+            const uint32_t gate = ggml_get_op_params_i32(dst, 1) != 0 ? 2 : kda;
+            return ctx->device->pipeline_gated_delta_net[si][gate];
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -10389,6 +10391,10 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const uint32_t K = (uint32_t)ggml_get_op_params_i32(dst, 0);
 
+    const bool raw_gates = ggml_get_op_params_i32(dst, 1) != 0;
+    const ggml_tensor * raw_dt_bias = raw_gates ? dst->src[7] : src_beta;
+    const ggml_tensor * raw_a = raw_gates ? dst->src[8] : src_beta;
+
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
@@ -10423,11 +10429,14 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        get_misalign_bytes(ctx, raw_dt_bias) / sizeof(float),
+        get_misalign_bytes(ctx, raw_a) / sizeof(float)
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf,
+         ggml_vk_tensor_subbuffer(ctx, raw_dt_bias, true), ggml_vk_tensor_subbuffer(ctx, raw_a, true)},
         pc, { H, n_seqs, S_v });
 }
 
@@ -16179,15 +16188,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[6] != nullptr) {
                     return false;
                 }
-                // raw gates (ggml_gated_delta_net_set_raw_gates): beta and g arrive
-                // pre-activation and need beta = sigmoid(beta) and
-                // g = a * softplus(g + dt_bias), with dt_bias in src[7] and a in src[8].
-                // gated_delta_net.comp has neither those bindings nor that math - it
-                // applies exp(g) unconditionally - so the shader silently returns wrong
-                // results for this case. Decline it and let it fall back to the CPU.
-                if (ggml_get_op_params_i32(op, 1) != 0) {
-                    return false;
-                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
@@ -16195,6 +16195,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 for (int i = 0; i < 6; i++) {
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
                         return false;
+                    }
+                }
+                if (ggml_get_op_params_i32(op, 1) != 0) {
+                    if (op->src[3]->ne[0] != 1) {
+                        return false;
+                    }
+                    for (int i = 7; i < 9; ++i) {
+                        const ggml_tensor * t = op->src[i];
+                        if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
+                            ggml_nelements(t) != op->src[2]->ne[1] || t->view_offs % sizeof(float) != 0) {
+                            return false;
+                        }
                     }
                 }
                 return op->type == GGML_TYPE_F32;

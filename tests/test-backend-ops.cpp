@@ -4975,8 +4975,11 @@ struct test_gated_delta_net : public test_case {
     const int64_t cache_rows; // rows-mode cache row count (-1 => n_seqs + 3)
     const bool    raw_gates; // beta / g pre-activation, folded in by ggml_gated_delta_net_set_raw_gates
 
+    const bool    raw_edges;
+    int           n_init = 0;
+
     std::string vars() override {
-        return VARS_TO_STR12(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, rows_mode, cache_rows, raw_gates);
+        return VARS_TO_STR13(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, rows_mode, cache_rows, raw_gates, raw_edges);
     }
 
     int64_t n_cache_rows() const { return cache_rows > 0 ? cache_rows : n_seqs + 3; }
@@ -4984,9 +4987,11 @@ struct test_gated_delta_net : public test_case {
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool rows_mode = false,
-            int64_t cache_rows = -1, bool raw_gates = false)
+            int64_t cache_rows = -1, bool raw_gates = false, bool raw_edges = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), rows_mode(rows_mode), cache_rows(cache_rows), raw_gates(raw_gates) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), rows_mode(rows_mode), cache_rows(cache_rows), raw_gates(raw_gates), raw_edges(raw_edges) {}
+
+    int n_eval() override { return raw_edges ? 3 : 1; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -5029,10 +5034,14 @@ struct test_gated_delta_net : public test_case {
             out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         }
         if (raw_gates) {
-            ggml_tensor * dt_bias = ggml_new_tensor_1d(ctx, type, head_count * v_repeat);
-            ggml_tensor * a       = ggml_new_tensor_1d(ctx, type, head_count * v_repeat);
+            ggml_tensor * dt_bias = ggml_new_tensor_1d(ctx, type, head_count * v_repeat + (raw_edges ? 1 : 0));
+            ggml_tensor * a       = ggml_new_tensor_1d(ctx, type, head_count * v_repeat + (raw_edges ? 3 : 0));
             ggml_set_name(dt_bias, "dt_bias");
             ggml_set_name(a,       "a");
+            if (raw_edges) {
+                dt_bias = ggml_view_1d(ctx, dt_bias, head_count * v_repeat, sizeof(float));
+                a = ggml_view_1d(ctx, a, head_count * v_repeat, 3 * sizeof(float));
+            }
             ggml_gated_delta_net_set_raw_gates(out, dt_bias, a);
         }
         return out;
@@ -5041,15 +5050,23 @@ struct test_gated_delta_net : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0) {
+            if (raw_edges && (strcmp(t->name, "g") == 0 || strcmp(t->name, "beta") == 0)) {
+                // Cover saturated sigmoid and both sides of the softplus cutoff.
+                const float edges[] = {-100.0f, -21.0f, -1.0f, 0.0f, 19.999f, 20.0f, 20.001f, 100.0f};
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = edges[(i + n_init) % 8];
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "g") == 0) {
                 // raw: pre-softplus alpha; a[h] * softplus(g + dt_bias) lands in the usual decay range
                 init_tensor_uniform(t, raw_gates ? -3.0f : -20.0f, raw_gates ? 3.0f : -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, raw_gates ? -4.0f : 0.0f, raw_gates ? 4.0f : 1.0f);
             } else if (strcmp(t->name, "dt_bias") == 0) {
-                init_tensor_uniform(t, -1.0f, 1.0f);
+                init_tensor_uniform(t, raw_edges ? 0.0f : -1.0f, raw_edges ? 0.0f : 1.0f);
             } else if (strcmp(t->name, "a") == 0) {
-                init_tensor_uniform(t, -8.0f, -0.05f);
+                init_tensor_uniform(t, raw_edges ? -0.05f : -8.0f, -0.05f);
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else if (strcmp(t->name, "rows") == 0) {
@@ -5063,6 +5080,7 @@ struct test_gated_delta_net : public test_case {
                 init_tensor_uniform(t);
             }
         }
+        ++n_init;
     }
 };
 
@@ -12486,6 +12504,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  1, 1, false, false, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  2, 2, false, false, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1, 1, false, false, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 16,  2, 1, 1, false, false, 4, false, -1, true, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 4, 2, 1, false, false, 2, false, -1, true, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  4, 2, 2, true, false, 4, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  2, 1, false, false, 2, true,  -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));

@@ -160,7 +160,8 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             gdn_state_rows_dev_ok = false;
         }
         if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
-            strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
+            strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 &&
+            strcmp(reg_name, "Vulkan") != 0 && strcmp(reg_name, "CPU") != 0) {
             gdn_raw_gates_dev_ok = false;
         }
     }
@@ -451,7 +452,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     // the fused GDN op can apply sigmoid / softplus itself; hand it the raw projections and
     // the activated nodes below only stay in the graph on paths that still need them
-    // only where the fused op implements raw gates natively (CPU, Metal, CUDA/ROCm); other
+    // only where the fused op implements raw gates natively (CPU, Metal, CUDA/ROCm, MUSA, Vulkan); other
     // backends would fall back to the CPU for the whole op, which costs more than the four launches
     static const bool raw_gates_disable = getenv("GGML_GDN_RAW_GATES_DISABLE") != nullptr;
     if (!raw_gates_disable && gdn_raw_gates_dev_ok &&
