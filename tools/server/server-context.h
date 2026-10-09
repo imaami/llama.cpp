@@ -53,6 +53,7 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+    json token_wire_info;
 };
 
 enum server_state {
@@ -137,6 +138,8 @@ struct server_routes {
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;
     server_http_context::handler_t post_completions;
+    server_http_context::handler_t post_completions_tokens;
+    server_http_context::handler_t get_tokens_info;
     server_http_context::handler_t post_completions_oai;
     server_http_context::handler_t post_chat_completions;
     server_http_context::handler_t post_chat_completions_tok;
@@ -167,7 +170,8 @@ private:
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type,
-            const common_chat_session & chat_session = {});
+            const common_chat_session & chat_session = {},
+            server_tokens * input_tokens = nullptr);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);

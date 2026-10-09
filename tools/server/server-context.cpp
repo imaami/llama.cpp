@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-token-wire.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -52,6 +53,52 @@ static common_speculative_output_limits server_output_limits(const common_params
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
+}
+
+static json server_token_wire_info(const llama_vocab * vocab, int32_t n_ctx) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    auto hash_byte = [&](unsigned char byte) {
+        hash = (hash ^ byte) * UINT64_C(1099511628211);
+    };
+    auto hash_u32 = [&](uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            hash_byte((value >> shift) & 0xff);
+        }
+    };
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    hash_u32(llama_vocab_type(vocab));
+    hash_u32(n_vocab);
+    json eog_ids = json::array();
+    for (llama_token token = 0; token < n_vocab; ++token) {
+        const std::string piece = common_token_to_piece(vocab, token, true);
+        hash_u32(static_cast<uint32_t>(piece.size()));
+        for (unsigned char byte : piece) {
+            hash_byte(byte);
+        }
+        hash_u32(llama_vocab_get_attr(vocab, token));
+        const bool is_eog = llama_vocab_is_eog(vocab, token);
+        hash_byte(is_eog);
+        if (is_eog) {
+            eog_ids.push_back(token);
+        }
+    }
+    for (llama_token token : {
+            llama_vocab_bos(vocab), llama_vocab_eos(vocab), llama_vocab_eot(vocab),
+            llama_vocab_sep(vocab), llama_vocab_nl(vocab), llama_vocab_pad(vocab), llama_vocab_mask(vocab),
+            llama_vocab_fim_pre(vocab), llama_vocab_fim_suf(vocab), llama_vocab_fim_mid(vocab),
+            llama_vocab_fim_pad(vocab), llama_vocab_fim_rep(vocab), llama_vocab_fim_sep(vocab)}) {
+        hash_u32(static_cast<uint32_t>(token));
+    }
+    hash_byte(llama_vocab_get_add_bos(vocab));
+    hash_byte(llama_vocab_get_add_eos(vocab));
+    hash_byte(llama_vocab_get_add_sep(vocab));
+    return {
+        {"protocol", server_token_wire::magic},
+        {"fingerprint", string_format("%016" PRIx64, hash)},
+        {"n_vocab", n_vocab},
+        {"eog_ids", std::move(eog_ids)},
+        {"context_size", n_ctx},
+    };
 }
 
 // a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
@@ -4795,6 +4842,7 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params          */ llama_model_n_params(impl->model_tgt),
         /* model_size              */ llama_model_size(impl->model_tgt),
         /* model_ftype             */ ftype_name,
+        /* token_wire_info         */ server_token_wire_info(impl->vocab, impl->n_ctx_slot()),
     };
 }
 
@@ -4834,7 +4882,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type,
-            const common_chat_session & chat_session) {
+            const common_chat_session & chat_session,
+            server_tokens * input_tokens) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
@@ -4849,11 +4898,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     try {
         std::vector<server_task> tasks;
 
-        const auto & prompt = data.at("prompt");
+        const json empty_prompt;
+        const json & prompt = input_tokens ? empty_prompt : data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
 
-        if (!params.path_prompts_log_dir.empty()) {
+        if (!input_tokens && !params.path_prompts_log_dir.empty()) {
             const auto file_path = std::filesystem::path(params.path_prompts_log_dir) / string_format("%012" PRId64 ".txt", ggml_time_ms());
             std::ofstream f(file_path);
             if (f) {
@@ -4866,7 +4916,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        if (input_tokens) {
+            inputs.push_back(std::move(*input_tokens));
+        } else if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
@@ -4887,6 +4939,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+
+            if (input_tokens) {
+                if (task.params.n_predict <= 0 ||
+                        int64_t(task.n_tokens()) + task.params.n_predict >= meta->slot_n_ctx) {
+                    throw std::invalid_argument("binary completion requires a positive n_predict and prompt + n_predict < context_size");
+                }
+                task.params.return_tokens = true;
+                task.params.stream = false;
+                task.params.n_cmpl = 1;
+                task.params.sampling.n_probs = 0;
+            }
 
             task.apply_chat_session(chat_session);
 
@@ -4925,6 +4988,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         } else if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
+        } else if (input_tokens) {
+            GGML_ASSERT(all_results.results.size() == 1);
+            const auto * result = dynamic_cast<const server_task_result_cmpl_final *>(all_results.results[0].get());
+            GGML_ASSERT(result);
+            const char * stop = result->stop == STOP_TYPE_EOS ? "eos" :
+                                result->stop == STOP_TYPE_WORD ? "word" :
+                                result->stop == STOP_TYPE_LIMIT ? "limit" : "none";
+            json metadata = {
+                {"stop_type", stop},
+                {"stopping_word", result->stopping_word},
+                {"tokens_evaluated", result->n_prompt_tokens},
+                {"tokens_predicted", result->n_decoded},
+                {"tokens_cached", result->n_tokens_cached},
+                {"truncated", result->truncated},
+                {"id_slot", result->id_slot},
+                {"timings", result->stats.to_json()},
+            };
+            if (json_value(data, "return_content", true)) {
+                metadata["content"] = result->content.text;
+            }
+            std::string encoded_metadata = safe_json_to_str(metadata);
+            if (encoded_metadata.size() > server_token_wire::metadata_max && metadata.contains("content")) {
+                metadata.erase("content");
+                metadata["content_omitted"] = true;
+                encoded_metadata = safe_json_to_str(metadata);
+            }
+            res->data = server_token_wire::encode(encoded_metadata, result->tokens);
+            res->content_type = "application/octet-stream";
+            res->status = 200;
         } else {
             json arr = json::array();
             for (auto & res : all_results.results) {
@@ -5488,6 +5580,60 @@ void server_routes::init_routes() {
             body,
             files,
             TASK_RESPONSE_TYPE_NONE);
+    };
+
+    this->get_tokens_info = [this](const server_http_req &) {
+        auto res = create_response();
+        res->ok(meta->token_wire_info);
+        return res;
+    };
+
+    this->post_completions_tokens = [this](const server_http_req & req) {
+        auto res = create_response();
+        try {
+            if (ctx_server.mctx || params.embedding) {
+                throw std::invalid_argument("binary completion requires a text generation context without mmproj");
+            }
+            auto packet = server_token_wire::decode(req.body, meta->model_vocab_n_tokens);
+            if (packet.tokens.empty()) {
+                throw std::invalid_argument("binary completion requires a nonempty token prompt");
+            }
+            json body = json::parse(packet.metadata);
+            if (!body.is_object()) {
+                throw std::invalid_argument("LLMTOK01 metadata must be a JSON object");
+            }
+            for (const char * field : {"prompt", "messages", "image_data", "response_fields", "stream_options"}) {
+                if (body.contains(field)) {
+                    throw std::invalid_argument(std::string("binary completion does not accept ") + field);
+                }
+            }
+            const json fixed_options = {{"stream", false}, {"return_tokens", true}, {"n_cmpl", 1}, {"n", 1}, {"n_probs", 0}, {"logprobs", 0}};
+            for (const auto & field : fixed_options.items()) {
+                if (body.contains(field.key()) && body.at(field.key()) != field.value()) {
+                    throw std::invalid_argument(std::string("unsupported binary completion option: ") + field.key());
+                }
+            }
+            if (body.contains("return_content") && !body.at("return_content").is_boolean()) {
+                throw std::invalid_argument("return_content must be a boolean");
+            }
+            if (!body.contains("n_predict") || !body.at("n_predict").is_number_integer() ||
+                    body.at("n_predict").get<uint64_t>() == 0 ||
+                    body.at("n_predict").get<uint64_t>() >= static_cast<uint64_t>(meta->slot_n_ctx)) {
+                throw std::invalid_argument("binary completion requires an explicit positive n_predict below context_size");
+            }
+            if (packet.tokens.size() >= static_cast<size_t>(meta->slot_n_ctx) ||
+                    packet.tokens.size() + body.at("n_predict").get<uint64_t>() >= static_cast<uint64_t>(meta->slot_n_ctx)) {
+                throw std::invalid_argument("binary completion requires prompt + n_predict < context_size");
+            }
+            body["stream"] = false;
+            body["return_tokens"] = true;
+            body["n_cmpl"] = 1;
+            server_tokens tokens(packet.tokens, false);
+            return handle_completions_impl(req, SERVER_TASK_TYPE_COMPLETION, body, {}, TASK_RESPONSE_TYPE_NONE, {}, &tokens);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {

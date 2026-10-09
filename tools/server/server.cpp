@@ -269,6 +269,10 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
+    if (!is_router_server) {
+        ctx_http.post("/completion/tokens",    ex_wrapper(routes.post_completions_tokens));
+        ctx_http.get ("/tokens/info",          ex_wrapper(routes.get_tokens_info));
+    }
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
