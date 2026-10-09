@@ -7838,6 +7838,10 @@ enum mul_mat_add_mode {
     MUL_MAT_ADD_RES_INPLACE, // res += mm
     MUL_MAT_ADD_B_INPLACE,   // b += mm: the sum overwrites the mat-mul input (m == k)
     MUL_MAT_ADD_MM_MM,       // mm2 + mm: the residual is itself a mat-mul output, so both operands are MUL_MAT
+    MUL_MAT_ADD_TWO_RES,     // mm + res + res2
+    MUL_MAT_ADD_KEEP_MM,     // retain the intermediate mat-mul output
+    MUL_MAT_ADD_VIEW,        // residual at an unaligned buffer offset
+    MUL_MAT_ADD_STRIDED,     // residual with padding between columns
 };
 
 static std::string var_to_str(mul_mat_add_mode mode) {
@@ -7848,6 +7852,10 @@ static std::string var_to_str(mul_mat_add_mode mode) {
         case MUL_MAT_ADD_RES_INPLACE: return "res+=mm";
         case MUL_MAT_ADD_B_INPLACE:   return "b+=mm";
         case MUL_MAT_ADD_MM_MM:       return "mm2+mm";
+        case MUL_MAT_ADD_TWO_RES:     return "mm+res+res2";
+        case MUL_MAT_ADD_KEEP_MM:     return "keep-mm";
+        case MUL_MAT_ADD_VIEW:        return "res-view";
+        case MUL_MAT_ADD_STRIDED:     return "res-strided";
     }
     return "unknown";
 }
@@ -7885,14 +7893,28 @@ struct test_mul_mat_add : public test_case {
         ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, mode == MUL_MAT_ADD_ROW ? 1 : n);
 
+        if (mode == MUL_MAT_ADD_VIEW || mode == MUL_MAT_ADD_STRIDED) {
+            ggml_tensor * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m + 8, n);
+            res = ggml_view_2d(ctx, storage, m, n,
+                              (mode == MUL_MAT_ADD_STRIDED ? m + 8 : m) * sizeof(float),
+                              mode == MUL_MAT_ADD_VIEW ? sizeof(float) : 0);
+        }
+
         ggml_tensor * mm  = ggml_mul_mat(ctx, a, b);
         ggml_tensor * out = nullptr;
         switch (mode) {
             case MUL_MAT_ADD_MM_RES:
+            case MUL_MAT_ADD_VIEW:
+            case MUL_MAT_ADD_STRIDED:
             case MUL_MAT_ADD_ROW:         out = ggml_add(ctx, mm, res);         break;
             case MUL_MAT_ADD_RES_MM:      out = ggml_add(ctx, res, mm);         break;
             case MUL_MAT_ADD_RES_INPLACE: out = ggml_add_inplace(ctx, res, mm); break;
             case MUL_MAT_ADD_B_INPLACE:   out = ggml_add_inplace(ctx, b, mm);   break;
+            case MUL_MAT_ADD_TWO_RES: {
+                ggml_tensor * res2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+                out = ggml_add(ctx, ggml_add(ctx, mm, res), res2);
+            } break;
+            case MUL_MAT_ADD_KEEP_MM: out = ggml_concat(ctx, ggml_add(ctx, mm, res), mm, 1); break;
             case MUL_MAT_ADD_MM_MM:
                 {
                     ggml_tensor * a2  = ggml_new_tensor_2d(ctx, type_a, k, m);
@@ -11107,6 +11129,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, n, 2048, {1, 2}, {2, 1}));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
+    }
+
+    // Dense PTQ residual fusion, including column tails and the mat-vec/mat-mat boundary.
+    for (int64_t n : {1, 2, 3, 4, 8, 9}) {
+        for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_ROW,
+                                     MUL_MAT_ADD_RES_INPLACE, MUL_MAT_ADD_MM_MM, MUL_MAT_ADD_TWO_RES,
+                                     MUL_MAT_ADD_KEEP_MM, MUL_MAT_ADD_VIEW, MUL_MAT_ADD_STRIDED}) {
+            test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_PTQ1_0, 67, n, 2048, mode));
+        }
+        test_cases.emplace_back(new test_mul_mat_add(GGML_TYPE_PTQ1_0, 2048, n, 2048, MUL_MAT_ADD_B_INPLACE));
     }
 
     // PQ2_0 at speculative verify widths (Metal few-row tensor tile): every n up to 32 plus

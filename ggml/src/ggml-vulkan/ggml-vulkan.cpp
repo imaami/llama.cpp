@@ -13772,10 +13772,6 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     auto const &mm_add_ok = [&](const ggml_tensor *mul, const ggml_tensor *add) {
         const ggml_tensor *bias = add->src[0] == mul ? add->src[1] : add->src[0];
 
-        // mat-vec only
-        if (ggml_nrows(mul) != 1) {
-            return false;
-        }
         // shaders assume the types match
         if (mul->type != bias->type) {
             return false;
@@ -13796,6 +13792,22 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         // additional constraints specific to this fusion
         const ggml_tensor *mul = cgraph->nodes[node_idx];
         const ggml_tensor *add = cgraph->nodes[node_idx + 1];
+
+        if (ggml_nrows(mul) != 1) {
+            const ggml_tensor *a = mul->src[0];
+            const ggml_tensor *b = mul->src[1];
+            const ggml_tensor *dst = cgraph->nodes[node_idx + ops.size() - 1];
+
+            // Only the dense PTQ mat-vec route handles several columns of fused residuals.
+            if (a->type != GGML_TYPE_PTQ1_0 || b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+                mul->ne[1] > mul_mat_vec_max_cols || mul->ne[2] != 1 || mul->ne[3] != 1 ||
+                a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1 ||
+                !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(mul) ||
+                !ggml_is_contiguous(add) || !ggml_is_contiguous(dst) || get_misalign_bytes(ctx, dst) != 0 ||
+                ggml_nbytes(a) > ctx->device->properties.limits.maxStorageBufferRange) {
+                return false;
+            }
+        }
 
         if (!mm_add_ok(mul, add)) {
             return false;
@@ -14562,13 +14574,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_fwht_signed = true;
                 fusion_string = "FWHT_SIGNED";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD }) &&
+                       !ggml_vk_tensors_overlap(cgraph->nodes[i]->src[0], cgraph->nodes[i + 2], false) &&
+                       !ggml_vk_tensors_overlap(cgraph->nodes[i]->src[1], cgraph->nodes[i + 2], false)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
                 op_srcs_fused_elementwise[2] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD }) &&
+                       !ggml_vk_tensors_overlap(cgraph->nodes[i]->src[0], cgraph->nodes[i + 1], false) &&
+                       !ggml_vk_tensors_overlap(cgraph->nodes[i]->src[1], cgraph->nodes[i + 1], false)) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
