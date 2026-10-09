@@ -5700,6 +5700,7 @@ struct test_fwht_signed : public test_case {
         USE_GLU      = 1u << 10,
         STRIDED_GLU  = 1u << 11,
         ALT_GLU      = 1u << 12,
+        NO_SIGNS     = 1u << 13,
     };
 
     const int64_t blk;
@@ -5773,7 +5774,7 @@ struct test_fwht_signed : public test_case {
         }
         ggml_set_name(s, "s");
 
-        ggml_tensor * mul = (options & INPLACE) ? ggml_mul_inplace(ctx, x, s) : ggml_mul(ctx, x, s);
+        ggml_tensor * mul = (options & NO_SIGNS) ? x : (options & INPLACE) ? ggml_mul_inplace(ctx, x, s) : ggml_mul(ctx, x, s);
         ggml_set_name(mul, "signed_input");
         ggml_tensor * reshape = ggml_reshape_2d(ctx, mul, blk, width / blk * n_tokens);
         ggml_set_name(reshape, "signed_blocks");
@@ -5831,6 +5832,55 @@ struct test_fwht_signed : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
             } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// Retained F32 transform output plus PTQ1_0 consumers of a producer-quantized activation.
+struct test_fwht_ptq1 : public test_fwht_signed {
+    const int reuse;
+
+    test_fwht_ptq1(int64_t blk, int64_t n_tokens, bool swiglu = false, uint32_t options = 0, int reuse = 0)
+        : test_fwht_signed(blk, 5120, n_tokens, GGML_TYPE_F32, swiglu, options), reuse(reuse) {}
+
+    std::string vars() override { return test_fwht_signed::vars() + "," + VAR_TO_STR(reuse); }
+    std::string op_desc(ggml_tensor *) override { return "FWHT_PTQ1"; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * rotated = test_fwht_signed::build_graph(ctx);
+        ggml_set_name(rotated, "rotated_f32");
+        ggml_tensor * input = ggml_reshape_2d(ctx, rotated, width, n_tokens);
+        // The transform must stay readable even when quantized scratch is reused.
+        ggml_set_output(rotated);
+        auto project = [&](ggml_tensor * x) {
+            ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, x->ne[0], 33);
+            return ggml_mul_mat(ctx, weights, x);
+        };
+        if (reuse == 3) {
+            input = ggml_scale(ctx, input, 0.5f); // first dispatch is not a matvec
+        } else if (reuse == 4) {
+            input = ggml_view_2d(ctx, rotated, width - 128, n_tokens, width * sizeof(float), 128 * sizeof(float));
+        }
+        ggml_tensor * out = project(input);
+        if (reuse == 1) {
+            out = ggml_add(ctx, out, project(input));
+        } else if (reuse == 2) {
+            ggml_tensor * other = project(ggml_scale(ctx, input, 0.5f));
+            // Execution order: first projection, scratch overwrite, original input again.
+            out = ggml_add(ctx, out, ggml_add(ctx, other, project(input)));
+        }
+        ggml_set_name(out, "ptq1_out");
+        checked_nodes.push_back(out);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_fwht_signed::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_PTQ1_0 && t->op == GGML_OP_NONE) {
                 init_tensor_uniform(t);
             }
         }
@@ -11143,6 +11193,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(128,  1024,  5,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(2048, 8192,  3,   GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_fwht_signed(1024, 5120,  4,   GGML_TYPE_F16, true));
+    for (int64_t blk : { 128, 1024 }) {
+        for (bool swiglu : { false, true }) {
+            test_cases.emplace_back(new test_fwht_ptq1(blk, 2, swiglu));
+        }
+    }
+    test_cases.emplace_back(new test_fwht_ptq1(128, 1));
+    test_cases.emplace_back(new test_fwht_ptq1(128, 8));
+    test_cases.emplace_back(new test_fwht_ptq1(128, 9)); // matrix path must not use the sidecar
+    test_cases.emplace_back(new test_fwht_ptq1(128, 2, false, test_fwht_signed::NO_SIGNS));
+    for (int reuse : { 1, 2, 3, 4 }) {
+        test_cases.emplace_back(new test_fwht_ptq1(128, 2, false, 0, reuse));
+    }
     for (uint32_t options : { uint32_t(0), uint32_t(test_fwht_signed::VIEW_X),
             uint32_t(test_fwht_signed::VIEW_UP),
             uint32_t(test_fwht_signed::VIEW_X | test_fwht_signed::VIEW_UP | test_fwht_signed::VIEW_S | test_fwht_signed::SCALED_SIGNS),

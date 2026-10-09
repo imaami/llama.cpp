@@ -1120,6 +1120,9 @@ void process_shaders() {
     string_to_spv("fwht_signed_shmem_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_SHMEM", "1"}});
     string_to_spv("fwht_swiglu_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_SWIGLU", "1"}});
     string_to_spv("fwht_swiglu_shmem_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_SWIGLU", "1"}, {"FWHT_SHMEM", "1"}});
+    string_to_spv("fwht_q8_f32", "fwht.comp", {{"FWHT_Q8", "1"}});
+    string_to_spv("fwht_signed_q8_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_Q8", "1"}});
+    string_to_spv("fwht_swiglu_q8_f32", "fwht.comp", {{"FWHT_SIGNED", "1"}, {"FWHT_SWIGLU", "1"}, {"FWHT_Q8", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});

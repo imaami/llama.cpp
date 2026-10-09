@@ -975,6 +975,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_signed_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_swiglu_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_q8_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_signed_q8_f32[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_swiglu_q8_f32[GGML_VK_FWHT_NUM_SIZES];
     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
@@ -1327,6 +1330,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_fwht_signed {};
+    const ggml_tensor * fwht_q8_consumer {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

@@ -3656,6 +3656,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_f32", fwht_signed_f32_len, fwht_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_swiglu_f32[idx], "fwht_swiglu_f32", fwht_swiglu_f32_len, fwht_swiglu_f32_data, "main", 4, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
+                    if (n >= 128 && sg >= 4 && sg <= 64 && device->integer_dot_product) {
+                        ggml_vk_create_pipeline(device, device->pipeline_fwht_q8_f32[idx], "fwht_q8_f32", fwht_q8_f32_len, fwht_q8_f32_data, "main", 3, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
+                        ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_q8_f32[idx], "fwht_signed_q8_f32", fwht_signed_q8_f32_len, fwht_signed_q8_f32_data, "main", 4, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
+                        ggml_vk_create_pipeline(device, device->pipeline_fwht_swiglu_q8_f32[idx], "fwht_swiglu_q8_f32", fwht_swiglu_q8_f32_len, fwht_swiglu_q8_f32_data, "main", 5, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
+                    }
                     // the f16 shader needs shader-float16; a null pipeline makes ggml_vk_can_use_fwht fall back
                     if (device->fp16) {
                         ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_f16", fwht_f16_len, fwht_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
@@ -7247,9 +7252,33 @@ bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml_tensor
     return true;
 }
 
+static vk_subbuffer ggml_vk_fwht_q8_buffer(ggml_backend_vk_context * ctx, vk_context& subctx) {
+    const uint64_t ne = ggml_nelements(ctx->fwht_q8_consumer);
+    const uint64_t size = ne / 128 * 144;
+    if (ctx->prealloc_size_y < size) {
+        ctx->prealloc_size_y = size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    return { ctx->prealloc_y, 0, size };
+}
+
+static void ggml_vk_fwht_q8_ready(ggml_backend_vk_context * ctx, vk_context& subctx) {
+    ctx->prealloc_y_last_pipeline_used = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1).get();
+    ctx->prealloc_y_last_tensor_used = ctx->fwht_q8_consumer;
+    ctx->prealloc_y_last_k_padded = false;
+    ctx->prealloc_y_need_sync = true;
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
 void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, ggml_tensor * dst) {
     const int idx = ggml_vk_fwht_pipeline_idx(src->ne[0]);
     vk_pipeline pipeline = src->type == GGML_TYPE_F16 ? ctx->device->pipeline_fwht_f16[idx] : ctx->device->pipeline_fwht_f32[idx];
+    if (ctx->fwht_q8_consumer) {
+        pipeline = ctx->device->pipeline_fwht_q8_f32[idx];
+    }
 
     const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
     GGML_ASSERT(rows_per_workgroup > 0);
@@ -7271,13 +7300,22 @@ void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
     };
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+    if (ctx->fwht_q8_consumer) {
+        const vk_subbuffer q8_buf = ggml_vk_fwht_q8_buffer(ctx, subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, q8_buf }, pc, { workgroups_x, 1, 1 });
+        ggml_vk_fwht_q8_ready(ctx, subctx);
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+    }
 }
 
 static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src,
                                 const ggml_tensor * signs, ggml_tensor * dst, const ggml_tensor * up = nullptr) {
     const int idx = ggml_vk_fwht_pipeline_idx(dst->ne[0]);
     vk_pipeline pipeline = up ? ctx->device->pipeline_fwht_swiglu_f32[idx] : ctx->device->pipeline_fwht_signed_f32[idx];
+    if (ctx->fwht_q8_consumer) {
+        pipeline = up ? ctx->device->pipeline_fwht_swiglu_q8_f32[idx] : ctx->device->pipeline_fwht_signed_q8_f32[idx];
+    }
     const uint32_t n_rows = (uint32_t) ggml_nrows(dst);
     const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
     const uint32_t workgroups_x = std::min(CEIL_DIV(n_rows, rows_per_workgroup),
@@ -7301,9 +7339,22 @@ static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subct
 
     if (up) {
         const vk_subbuffer up_buf = ggml_vk_tensor_subbuffer(ctx, up, true);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, sign_buf, up_buf }, pc, { workgroups_x, 1, 1 });
+        if (ctx->fwht_q8_consumer) {
+            const vk_subbuffer q8_buf = ggml_vk_fwht_q8_buffer(ctx, subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, sign_buf, up_buf, q8_buf }, pc, { workgroups_x, 1, 1 });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, sign_buf, up_buf }, pc, { workgroups_x, 1, 1 });
+        }
     } else {
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, sign_buf }, pc, { workgroups_x, 1, 1 });
+        if (ctx->fwht_q8_consumer) {
+            const vk_subbuffer q8_buf = ggml_vk_fwht_q8_buffer(ctx, subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, sign_buf, q8_buf }, pc, { workgroups_x, 1, 1 });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, sign_buf }, pc, { workgroups_x, 1, 1 });
+        }
+    }
+    if (ctx->fwht_q8_consumer) {
+        ggml_vk_fwht_q8_ready(ctx, subctx);
     }
 }
 
@@ -13794,6 +13845,43 @@ static bool ggml_vk_can_fuse_fwht_swiglu(const ggml_backend_vk_context * ctx, co
            ctx->device->pipeline_fwht_swiglu_f32[idx] != nullptr;
 }
 
+static const ggml_tensor * ggml_vk_fwht_q8_consumer(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph,
+                                                  int node_idx, const ggml_tensor * fwht) {
+    const int idx = ggml_vk_fwht_pipeline_idx(fwht->ne[0]);
+    if (idx < 0 || !ctx->device->pipeline_fwht_q8_f32[idx] || fwht->src[1]->type != GGML_TYPE_F32 ||
+        ggml_nelements(fwht) <= 0 || uint64_t(ggml_nelements(fwht)) > UINT32_MAX / sizeof(float)) {
+        return nullptr;
+    }
+
+    // Quantize only for the next dispatch. Keep F32 intact for other users or a later cache miss.
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * mm = cgraph->nodes[j];
+        if (ggml_op_is_empty(mm->op) || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            continue;
+        }
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_PTQ1_0) {
+            return nullptr;
+        }
+        const ggml_tensor * src = mm->src[1];
+        const ggml_tensor * w = mm->src[0];
+        const bool alias = src == fwht ||
+            (src->view_src == fwht && src->view_offs == 0 && ggml_nelements(src) == ggml_nelements(fwht));
+        if (!alias || src->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            src->ne[2] != 1 || src->ne[3] != 1 || w->ne[2] != 1 || w->ne[3] != 1 ||
+            src->ne[1] < 1 || src->ne[1] > mul_mat_vec_max_cols || src->ne[0] % 128 != 0 ||
+            ggml_nbytes(w) > ctx->device->properties.limits.maxStorageBufferRange ||
+            ggml_nelements(src) / 128 * 144 > ctx->device->properties.limits.maxStorageBufferRange ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(w) || !ggml_is_contiguous(mm) ||
+            get_misalign_bytes(ctx, src) != 0 || get_misalign_bytes(ctx, w) != 0 || get_misalign_bytes(ctx, mm) != 0 ||
+            !ggml_vk_should_use_mmvq(ctx->device, w->ne[1], src->ne[1], src->ne[0], w->type) ||
+            !ggml_vk_get_dequantize_mul_mat_vec(ctx, w->type, GGML_TYPE_Q8_1, src->ne[1], mm->ne[0], w->ne[0])) {
+            return nullptr;
+        }
+        return src;
+    }
+    return nullptr;
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -14656,6 +14744,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_fwht_signed = false;
+        ctx->fwht_q8_consumer = nullptr;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14920,6 +15009,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_fwht_signed = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
+            }
+        }
+
+        if (!ctx->device->disable_fusion) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            const ggml_tensor * fwht = ctx->fused_fwht_signed ? cgraph->nodes[i + ctx->num_additional_fused_ops] :
+                (node->op == GGML_OP_MUL_MAT && ggml_vk_can_use_fwht(ctx, node->src[1], node) ? node : nullptr);
+            if (fwht) {
+                ctx->fwht_q8_consumer = ggml_vk_fwht_q8_consumer(ctx, cgraph, i + ctx->num_additional_fused_ops, fwht);
+                if (ctx->fwht_q8_consumer) {
+                    fusion_string = ctx->num_additional_fused_ops == 3 ? "FWHT_SWIGLU_Q8" :
+                        ctx->num_additional_fused_ops == 2 ? "FWHT_SIGNED_Q8" : "FWHT_Q8";
+                }
             }
         }
 

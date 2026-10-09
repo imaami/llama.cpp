@@ -42,11 +42,61 @@ layout(binding = 2, std430) readonly buffer S { float data_s[]; };
 #ifdef FWHT_SWIGLU
 layout(binding = 3, std430) readonly buffer U { float data_u[]; };
 #endif
+#ifdef FWHT_Q8
+#ifdef FWHT_SWIGLU
+layout(binding = 4, std430) writeonly buffer Q { uint data_q[]; };
+#elif defined(FWHT_SIGNED)
+layout(binding = 3, std430) writeonly buffer Q { uint data_q[]; };
+#else
+layout(binding = 2, std430) writeonly buffer Q { uint data_q[]; };
+#endif
+#endif
 
 const uint EL_W = N / BLOCK_SIZE;
 
 #ifdef FWHT_SHMEM
 shared float shmem[ROWS * N];
+#endif
+
+#ifdef FWHT_Q8
+// Each Q8_1 block covers 32 values; four blocks share one 144-byte packed record.
+const uint Q8_LANES = BLOCK_SIZE < 32u ? BLOCK_SIZE : 32u;
+const uint Q8_REGS = 32u / Q8_LANES;
+
+void quantize_row(float values[EL_W], const uint row, const uint tid) {
+    [[unroll]] for (uint base = 0; base < EL_W; base += Q8_REGS) {
+        float amax = 0.0;
+        [[unroll]] for (uint j = 0; j < Q8_REGS; ++j) {
+            amax = max(amax, abs(values[base + j]));
+        }
+        [[unroll]] for (uint h = 1; h < Q8_LANES; h <<= 1) {
+            amax = max(amax, subgroupShuffleXor(amax, h));
+        }
+        precise float d = amax / 127.0;
+        precise float inv_d = d != 0.0 ? 1.0 / d : 0.0;
+        float sum = 0.0;
+        [[unroll]] for (uint j = 0; j < Q8_REGS; ++j) {
+            precise float q = round(values[base + j] * inv_d);
+            sum += q;
+            const uint byte = uint(int(q)) & 255u;
+            // All lanes execute the shuffles, including lanes which do not store.
+            const uint packed = byte | (subgroupShuffleXor(byte, 1u) << 8u) |
+                (subgroupShuffleXor(byte, 2u) << 16u) | (subgroupShuffleXor(byte, 3u) << 24u);
+            if (tid % 4u == 0) {
+                const uint e = row * N + (base + j) * BLOCK_SIZE + tid;
+                data_q[(e / 128u) * 36u + 4u + (e % 128u) / 4u] = packed;
+            }
+        }
+        [[unroll]] for (uint h = 1; h < Q8_LANES; h <<= 1) {
+            sum += subgroupShuffleXor(sum, h);
+        }
+        if (tid % 32u == 0) {
+            const uint e = row * N + base * BLOCK_SIZE + tid;
+            // Use the unrounded scale for s, as quantize_q8_1.comp does.
+            data_q[(e / 128u) * 36u + (e % 128u) / 32u] = packHalf2x16(vec2(d, sum * d));
+        }
+    }
+}
 #endif
 
 void main() {
@@ -136,6 +186,10 @@ void main() {
                 }
             }
         }
+
+#ifdef FWHT_Q8
+        quantize_row(reg, row, tid);
+#endif
 
 #ifdef FWHT_SHMEM
         if (row < n_rows) {
