@@ -52,7 +52,8 @@ The F32 `MUL(signs) -> RESHAPE -> Hadamard MUL_MAT` chain can execute in a singl
 FWHT shader. Both subgroup and shared-memory implementations load signs directly.
 For each eligible transform this removes one dispatch and the intermediate
 activation write/read: `8 * width * tokens` bytes. Signs wrap at the original
-activation row width, including Bonsai 2's 40 blocks of 128 per 5120-wide row.
+activation row width, including 40 blocks of 128 in the 5120-wide regression
+case. This test shape does not establish the Hadamard block size of a GGUF.
 
 The shader preserves `(input * sign) * normalization` rounding order. Fusion
 requires contiguous F32 inputs, whole transform blocks per row, compatible
