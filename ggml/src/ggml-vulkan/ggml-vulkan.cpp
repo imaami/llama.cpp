@@ -1554,7 +1554,7 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const 
         case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q8_0:
             break;
         case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_PTQ1_0:
             has_dm = true;                          break;
         case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_MXFP4:
             has_kvalues = true;                     break;
@@ -2422,6 +2422,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Some quants are not performant on RDNA4, those fall back to FP16 matmul
         const bool rdna3 = device->architecture == AMD_RDNA3;
         const bool rdna4 = device->architecture == AMD_RDNA4;
+        // Experimental: PTQ1 prefill switches activations from F16 to Q8_1.
+        // Keep it opt-in until performance and model quality are measured.
+        const char * ptq1_mmq = getenv("GGML_VK_PTQ1_MMQ");
+        const bool ptq1_mmq_enabled = ptq1_mmq != nullptr && strcmp(ptq1_mmq, "1") == 0;
 
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32",     matmul_f32_f32_cm1_len,     matmul_f32_f32_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16",     matmul_f32_f16_cm1_len,     matmul_f32_f16_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
@@ -2480,6 +2484,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef X_CM1
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
+            if (rdna4 && ptq1_mmq_enabled) {
+                cm1_create_mmq({GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int, "matmul_ptq1_0_q8_1", matmul_ptq1_0_q8_1_cm1_len, matmul_ptq1_0_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            }
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_1_q8_1",   matmul_q4_1_q8_1_cm1_len,   matmul_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
             cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
@@ -6457,7 +6464,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
     const bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
-                                src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+                                src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 &&
+                                (src0->type != GGML_TYPE_PTQ1_0 || (ne11 >= 16 && !x_non_contig));
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
