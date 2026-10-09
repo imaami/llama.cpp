@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # Generate a small seeded Qwen3.5 trunk plus one MTP head for CPU integration tests.
 # Based on PrismML-Eng PR #116's tiny-Qwen fixture; uses a self-contained byte vocab.
-# Usage: python3 tests/gen-tiny-qwen35-mtp.py <output.gguf>
+# Usage: python3 tests/gen-tiny-qwen35-mtp.py <output.gguf> [--tool-tokens]
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -31,7 +32,11 @@ HEAD_K_DIM   = N_EMBD // N_HEAD             # 32
 
 
 def main() -> None:
-    out_path = sys.argv[1] if len(sys.argv) > 1 else "tiny-qwen35-mtp.gguf"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", nargs="?", default="tiny-qwen35-mtp.gguf")
+    parser.add_argument("--tool-tokens", action="store_true", help="include thinking and ChatML control tokens")
+    args = parser.parse_args()
+    out_path = args.output
 
     rng = np.random.default_rng(1234)
 
@@ -62,14 +67,20 @@ def main() -> None:
     w.add_key_value("qwen35.full_attention_interval", N_LAYER, GGUFValueType.UINT32)
 
     tokens = ["<unk>", "<s>", "</s>"] + [f"<0x{i:02X}>" for i in range(256)]
+    token_types = [2, 3, 3] + [6] * 256
+    if args.tool_tokens:
+        tokens += ["<think>", "</think>", "<|im_start|>", "<|im_end|>"]
+        token_types += [3] * 4
     n_vocab = len(tokens)
     w.add_tokenizer_model("llama")
     w.add_token_list(tokens)
     w.add_token_scores([0.0] * n_vocab)
-    w.add_token_types([2, 3, 3] + [6] * 256)
+    w.add_token_types(token_types)
     w.add_unk_token_id(0)
     w.add_bos_token_id(1)
     w.add_eos_token_id(2)
+    if args.tool_tokens:
+        w.add_eot_token_id(262)
 
     # note: numpy shapes are the reverse of the ggml ne[] order
     w.add_tensor("token_embd.weight", rand(n_vocab, N_EMBD))

@@ -4,7 +4,9 @@
 #include "../tools/server/server-splice.h"
 
 #include <cstdio>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -126,8 +128,9 @@ struct route_fixture {
     server_context context;
     server_routes routes;
     std::thread worker;
+    int32_t n_vocab = 0;
 
-    route_fixture(const char * model, bool mtp) : routes(params, context) {
+    route_fixture(const char * model, bool mtp, bool tool_template = false) : routes(params, context) {
         params.model.path = model;
         params.n_ctx = 512;
         params.n_batch = params.n_ubatch = 64;
@@ -139,6 +142,11 @@ struct route_fixture {
         params.fit_params = false;
         params.ctx_shift = false;
         params.sampling.backend_sampling = false;
+        if (tool_template) {
+            std::ifstream file("models/templates/Qwen3.5-4B.jinja");
+            check(file.good(), "tool chat template missing");
+            params.chat_template.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        }
         if (mtp) {
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
             params.speculative.draft.n_max = 2;
@@ -146,6 +154,7 @@ struct route_fixture {
         }
         check(context.load_model(params), "fixture load failed");
         routes.update_meta(context);
+        n_vocab = context.get_meta().model_vocab_n_tokens;
         worker = std::thread([this] { context.start_loop(); });
     }
 
@@ -168,7 +177,7 @@ struct route_fixture {
     std::pair<json, llama_tokens> binary(const json & options, const llama_tokens & prompt) {
         const auto result = call(routes.post_completions_tokens, server_token_wire::encode(options.dump(), prompt));
         check(result.first == 200, "binary route: " + result.second);
-        const auto packet = server_token_wire::decode(result.second, 259);
+        const auto packet = server_token_wire::decode(result.second, n_vocab);
         return {json::parse(packet.metadata), packet.tokens};
     }
 
@@ -179,7 +188,7 @@ struct route_fixture {
         auto response = routes.post_completions_tokens(request);
         check(response && response->status == 200 && response->is_stream(), "binary stream request failed");
         check(response->content_type == "application/octet-stream", "wrong stream content type");
-        server_token_wire::stream_decoder parser(259, options.at("n_predict").get<size_t>());
+        server_token_wire::stream_decoder parser(n_vocab, options.at("n_predict").get<size_t>());
         streamed_result result;
         bool done = false;
         bool next;
@@ -371,15 +380,97 @@ static void test_routes(const char * model, bool mtp) {
     std::printf("binary completion routes (MTP=%d): passed\n", int(mtp));
 }
 
+static void test_tool_routes(const char * model, bool mtp) {
+    route_fixture fixture(model, mtp, true);
+    auto & routes = fixture.routes;
+    const auto info = json::parse(fixture.call(routes.get_tokens_info, "").second);
+    check(info.at("n_vocab") == 263 && info.at("tool_parse") == true, "wrong tool fixture or missing tool capability");
+    auto tokenize = [&](const std::string & text) {
+        const auto result = fixture.call(routes.post_tokenize,
+            json{{"content", text}, {"add_special", false}, {"parse_special", true}}.dump());
+        check(result.first == 200, "tokenizer route failed");
+        return json::parse(result.second).at("tokens").get<llama_tokens>();
+    };
+    const auto close = tokenize("</think>");
+    check(close.size() == 1, "tool fixture has no single-token think close");
+    const auto eog = tokenize("<|im_end|>");
+    check(eog.size() == 1, "tool fixture has no single-token ChatML EOG");
+    json options = {
+        {"n_predict", 16}, {"seed", 42}, {"temperature", 0}, {"cache_prompt", false},
+        {"preserved_tokens", json::array({"</think>"})}, {"grammar", "root ::= \"</think>\""},
+        {"logit_bias", json::array({json::array({close.front(), 1000})})},
+        {"splice", {{"sentence_after", 4096}, {"stop_on_think_close", true}}},
+    };
+    const llama_tokens prompt = {1, 259};
+    const auto plain = fixture.binary(options, prompt);
+    const auto streamed = fixture.binary_stream(options, prompt);
+    check(plain.second == close && streamed.tokens == close, "think closure lost or included following raw tokens");
+    check(plain.first.at("splice_boundary") == "tool" && streamed.metadata.at("splice_boundary") == "tool",
+        "think closure did not report tool boundary");
+    check(streamed.metadata.at("stop_type") == "limit", "think closure has wrong stop type");
+
+    options["splice"]["stop_on_think_close"] = false;
+    options["n_predict"] = 2;
+    options.erase("grammar");
+    const auto disabled = fixture.binary_stream(options, prompt);
+    check(disabled.tokens == llama_tokens({close.front(), close.front()}), "ordinary splice unexpectedly stopped at think close");
+    check(disabled.metadata.at("splice_boundary") == "limit", "ordinary splice reported a tool boundary");
+    options["splice"]["stop_on_think_close"] = "yes";
+    check(fixture.call(routes.post_completions_tokens, server_token_wire::encode(options.dump(), prompt)).first == 400,
+        "invalid think-close option accepted");
+
+    const auto output = tokenize("</think>\n\n<tool_call>\n<function=calculator>\n<parameter=expression>\n1+1\n</parameter>\n</function>\n</tool_call>");
+    json body = {
+        {"messages", json::array({{{"role", "user"}, {"content", "Calculate 1 + 1"}}})},
+        {"tools", json::array({{{"type", "function"}, {"function", {
+            {"name", "calculator"}, {"description", "Evaluate an expression"},
+            {"parameters", {{"type", "object"}, {"properties", {{"expression", {{"type", "string"}}}}},
+                {"required", json::array({"expression"})}}},
+        }}}})},
+        {"add_generation_prompt", true}, {"chat_template_kwargs", {{"enable_thinking", true}}},
+        {"parse_output", output},
+    };
+    const auto parsed = fixture.call(routes.post_apply_template, body.dump());
+    check(parsed.first == 200, "tool parser route failed");
+    const auto message = json::parse(parsed.second).at("message");
+    check(message.at("tool_calls").size() == 1, "native route did not parse tool call");
+    const auto & function = message.at("tool_calls").front().at("function");
+    check(function.at("name") == "calculator" && json::parse(function.at("arguments").get<std::string>()).at("expression") == "1+1",
+        "native route changed tool name or arguments");
+    for (llama_token token : {2, eog.front()}) {
+        body["parse_output"] = output;
+        body["parse_output"].push_back(token);
+        const auto ended = fixture.call(routes.post_apply_template, body.dump());
+        check(ended.first == 200 && json::parse(ended.second).at("message") == message, "parser did not trim final EOG");
+    }
+    for (const json & invalid : std::vector<json>{
+            "invalid", json::array({-1}), json::array({263}), json::array({1.5}),
+            json::array({UINT64_MAX}), json::array({2, 3}), json(llama_tokens(513, 3))}) {
+        body["parse_output"] = invalid;
+        bool rejected = false;
+        try {
+            rejected = fixture.call(routes.post_apply_template, body.dump()).first == 400;
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        check(rejected, "invalid parse_output accepted");
+    }
+    std::printf("native tool routes (MTP=%d): passed\n", int(mtp));
+}
+
 int main(int argc, char ** argv) {
     try {
-        check(argc <= 2, "usage: test-server-token-wire [tiny-qwen35-mtp.gguf]");
+        check(argc <= 3, "usage: test-server-token-wire [tiny-qwen35-mtp.gguf [tiny-qwen35-tools.gguf]]");
         test_codec();
         test_splice_scanner();
-        if (argc == 2) {
+        if (argc >= 2) {
             llama_backend_init();
             test_routes(argv[1], false);
             test_routes(argv[1], true);
+            if (argc == 3) {
+                test_tool_routes(argv[2], false);
+                test_tool_routes(argv[2], true);
+            }
             llama_backend_free();
         }
         std::puts("token wire tests: passed");

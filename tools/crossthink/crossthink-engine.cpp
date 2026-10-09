@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -17,11 +18,17 @@ static const char * peer_name(size_t index) {
 
 crossthink_session::crossthink_session(
         std::array<std::unique_ptr<crossthink_transport>, 2> transports,
-        const crossthink_options & opts) : options(opts) {
+        const crossthink_options & opts,
+        std::array<std::unique_ptr<crossthink_tool_service>, 2> tools) : options(opts) {
     if (options.chunk_tokens < 1 || options.chunk_tokens > 4096 ||
             options.sentence_after < 1 || options.sentence_after > 4096 ||
-            options.answer_tokens < 1 || options.answer_tokens > 65536) {
+            options.answer_tokens < 1 || options.answer_tokens > 65536 ||
+            options.tool_tokens < 1 || options.tool_tokens > 16384 ||
+            options.max_tool_rounds < 1 || options.max_tool_rounds > 64) {
         throw std::invalid_argument("chunk/answer token limits are outside supported bounds");
+    }
+    if (bool(tools[0]) != bool(tools[1]) || (tools[0] && !options.paragraph_splice)) {
+        throw std::invalid_argument("MCP requires paragraph rendezvous and a tool service for both peers");
     }
     for (size_t index = 0; index < peers.size(); ++index) {
         auto & peer = peers[index];
@@ -30,6 +37,13 @@ crossthink_session::crossthink_session(
             throw std::invalid_argument("two transports are required");
         }
         peer.info = peer.transport->describe();
+        peer.tools = std::move(tools[index]);
+        if (peer.tools) {
+            if (!peer.info.value("tool_parse", false) || peer.tools->tools().empty()) {
+                throw std::runtime_error("MCP requires updated model servers and at least one discovered tool");
+            }
+            peer.transport->configure_tools(peer.tools->tools());
+        }
         if (options.paragraph_splice && !peer.info.value("splice", false)) {
             throw std::runtime_error("paragraph splicing requires updated model servers with splice support");
         }
@@ -92,6 +106,7 @@ crossthink_session::~crossthink_session() {
     event_changed.notify_all();
     for (auto & peer : peers) {
         peer.transport->cancel();
+        if (peer.tools) { peer.tools->cancel(); }
     }
     controller.join();
     for (auto & thread : workers) {
@@ -104,6 +119,7 @@ json crossthink_session::state_locked() const {
         {"mode", mode}, {"busy", busy}, {"epoch", epoch}, {"round", round},
         {"error", error}, {"last_event_id", next_event_id - 1}, {"peers", json::array()},
         {"splice_mode", options.paragraph_splice ? "paragraph" : "fixed"}, {"exchanges", exchanges},
+        {"tools", peers[0].tools ? peers[0].tools->tools().size() : 0},
     };
     for (size_t index = 0; index < peers.size(); ++index) {
         const auto & peer = peers[index];
@@ -112,6 +128,7 @@ json crossthink_session::state_locked() const {
             {"generated", peer.generated}, {"imported", peer.imported},
             {"context_size", peer.context_size}, {"active", peer.active},
             {"waiting", peer.segment_done}, {"boundary", peer.boundary}, {"forced_splices", peer.forced_splices},
+            {"tool_calls", peer.tool_calls}, {"tool_status", peer.tool_status},
         });
     }
     return result;
@@ -183,7 +200,8 @@ void crossthink_session::command(const std::string & action, const std::string &
                 throw std::logic_error("only an active thinking session can be paused");
             }
         } else if (action == "resume") {
-            if (mode != "paused" || !error.empty() || peers[0].tape.empty() || !peers[0].thinking_open) {
+            if (mode != "paused" || !error.empty() || peers[0].tape.empty() ||
+                    (peers[0].answer_done && peers[1].answer_done)) {
                 throw std::logic_error("there is no paused reasoning session to resume");
             }
         } else if (action == "answer") {
@@ -198,12 +216,13 @@ void crossthink_session::command(const std::string & action, const std::string &
         busy = true;
         mode = "paused";
         pending = {action, text};
-        emit_state();
-    }
-    if (action == "reset") {
-        for (auto & peer : peers) {
-            peer.transport->cancel();
+        if (action == "reset") {
+            for (auto & peer : peers) {
+                peer.transport->cancel();
+                if (peer.tools) { peer.tools->cancel(); }
+            }
         }
+        emit_state();
     }
     changed.notify_all();
 }
@@ -211,6 +230,9 @@ void crossthink_session::command(const std::string & action, const std::string &
 void crossthink_session::fail(const std::string & message) {
     error = message;
     mode = "error";
+    for (auto & peer : peers) {
+        if (peer.tools) { peer.tools->cancel(); }
+    }
     emit({{"type", "error"}, {"message", message}});
     emit_state();
     changed.notify_all();
@@ -238,6 +260,7 @@ void crossthink_session::rendezvous() {
     for (auto & peer : peers) {
         drain(peer);
         peer.segment_done = false;
+        peer.tool_rounds = 0;
     }
     ++exchanges;
     emit({{"type", "splice"}, {"exchange", exchanges},
@@ -263,7 +286,8 @@ bool crossthink_session::receive(size_t index, uint64_t generation_epoch, bool a
         if (token < 0 || token >= peer.info.at("n_vocab").get<int64_t>()) {
             throw std::runtime_error("server returned a token outside the vocabulary");
         }
-        if (contains(peer.controls, token) && !(answer && contains(peer.eog, token))) {
+        if (contains(peer.controls, token) && !(answer && contains(peer.eog, token)) &&
+                !(!answer && peer.tools && token == peer.close_token)) {
             throw std::runtime_error("server generated a forbidden reasoning/chat control token");
         }
     }
@@ -274,7 +298,10 @@ bool crossthink_session::receive(size_t index, uint64_t generation_epoch, bool a
         }
         peer.tape.push_back(token);
         ++peer.generated;
-        if (!answer) {
+        if (!answer && peer.tools && token == peer.close_token) {
+            peer.thinking_open = false;
+            other.inbox.clear();
+        } else if (!answer && peer.thinking_open && !other.answer_done && mode != "answering") {
             other.inbox.push_back(token);
         }
     }
@@ -284,6 +311,167 @@ bool crossthink_session::receive(size_t index, uint64_t generation_epoch, bool a
     }
     changed.notify_all();
     return true;
+}
+
+bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std::unique_lock<std::mutex> & lock) {
+    auto & peer = peers[index];
+    auto & other = peers[1 - index];
+    if (stopping || epoch != generation_epoch || mode == "error") {
+        return false;
+    }
+    peer.tools->begin_turn();
+    const size_t budget = std::max(options.tool_tokens, options.answer_tokens);
+    if (peer.tape.size() + budget + 1 >= peer.context_size) {
+        throw std::runtime_error("context full for a tool/answer turn");
+    }
+    json bias = json::array();
+    for (llama_token token : peer.controls) {
+        if (!contains(peer.eog, token)) {
+            bias.push_back(json::array({token, false}));
+        }
+    }
+    const json parameters = {
+        {"n_predict", budget}, {"temperature", options.temperature},
+        {"seed", (uint64_t(options.seed) + index + 2 * (peer.sequence++ % UINT32_MAX)) % UINT32_MAX},
+        {"stream", true}, {"return_content", false}, {"cache_prompt", true},
+        {"reasoning_budget_tokens", -1}, {"logit_bias", bias}, {"stop", json::array()},
+    };
+    const auto prompt = peer.tape;
+    std::vector<llama_token> output{peer.close_token};
+    peer.tool_status = "generating tool call or answer";
+    emit_state();
+    lock.unlock();
+    try {
+        const auto result = peer.transport->generate(prompt, parameters, [&](const server_token_wire::packet & packet) {
+            std::lock_guard<std::mutex> guard(mutex);
+            if (stopping || epoch != generation_epoch || mode == "error") {
+                return false;
+            }
+            if (packet.tokens.size() > budget - (output.size() - 1)) {
+                throw std::runtime_error("private tool turn exceeded its token budget");
+            }
+            for (llama_token token : packet.tokens) {
+                if (token < 0 || token >= peer.info.at("n_vocab").get<int64_t>() ||
+                        (contains(peer.controls, token) && !contains(peer.eog, token))) {
+                    throw std::runtime_error("invalid control token in private tool turn");
+                }
+            }
+            output.insert(output.end(), packet.tokens.begin(), packet.tokens.end());
+            peer.tape.insert(peer.tape.end(), packet.tokens.begin(), packet.tokens.end());
+            peer.generated += packet.tokens.size();
+            return true;
+        });
+        lock.lock();
+        if (stopping || epoch != generation_epoch || mode == "error") {
+            return false;
+        }
+        if (!result.is_object() || result.value("type", std::string()) != "done" ||
+                result.value("truncated", false) || result.value("stop_type", std::string()) != "eos" ||
+                output.size() < 2 || !contains(peer.eog, output.back())) {
+            throw std::runtime_error("tool/answer turn did not finish; increase --tool-turn-tokens if it hit the limit");
+        }
+        lock.unlock();
+        auto assistant = peer.transport->parse_tool_turn(output);
+        const auto calls = assistant.value("tool_calls", json::array());
+        if (!calls.is_array() || calls.size() > 32) {
+            throw std::runtime_error("invalid number of tool calls in assistant turn");
+        }
+        lock.lock();
+        if (stopping || epoch != generation_epoch || mode == "error") {
+            return false;
+        }
+        if (calls.empty()) {
+            peer.tape.pop_back(); // next_user() supplies the assistant terminator.
+            peer.answer_done = true;
+            peer.segment_done = false;
+            peer.tool_status.clear();
+            peer.inbox.clear();
+            other.inbox.clear();
+            emit({{"type", "answer_start"}, {"peer", peer_name(index)}});
+            emit({{"type", "answer"}, {"peer", peer_name(index)}, {"text", assistant.value("content", std::string())}});
+            if (!busy) {
+                mode = other.answer_done ? "answered" : "answering";
+            }
+            changed.notify_all();
+            return false;
+        }
+        if (++peer.tool_rounds > options.max_tool_rounds) {
+            throw std::runtime_error("tool round limit reached before a shared paragraph; increase --max-tool-rounds or reset");
+        }
+        std::set<std::string> call_ids;
+        for (auto & call : assistant["tool_calls"]) {
+            call.at("function").at("name").get<std::string>();
+            call.at("function").at("arguments");
+            auto call_id = call.value("id", std::string());
+            if (call_id.empty()) {
+                call_id = "ct_" + std::to_string(generation_epoch) + "_" + peer_name(index) + "_" +
+                    std::to_string(peer.tool_calls + call_ids.size() + 1);
+                call["id"] = call_id;
+            }
+            if (!call_ids.insert(call_id).second) {
+                throw std::runtime_error("duplicate tool call ID in assistant turn");
+            }
+        }
+        json results = json::array();
+        for (size_t i = 0; i < calls.size(); ++i) {
+            auto & call = assistant["tool_calls"][i];
+            const auto name = call.at("function").at("name").get<std::string>();
+            const auto call_id = call.at("id").get<std::string>();
+            ++peer.tool_calls;
+            const auto arguments = call.at("function").at("arguments");
+            peer.tool_status = name;
+            emit({{"type", "tool_call"}, {"peer", peer_name(index)}, {"name", name},
+                {"call_id", call_id}, {"arguments", arguments}});
+            emit_state();
+            lock.unlock();
+            json response;
+            try {
+                const auto parsed = arguments.is_string() ? json::parse(arguments.get<std::string>()) : arguments;
+                if (!parsed.is_object()) {
+                    throw std::runtime_error("tool arguments must be a JSON object");
+                }
+                response = peer.tools->call(name, parsed);
+            } catch (const std::exception & exception) {
+                response = {{"isError", true}, {"content", json::array({{
+                    {"type", "text"}, {"text", std::string("Tool request failed: ") + exception.what() +
+                        ". A transport failure may occur after execution; do not blindly repeat a side effect."},
+                }})}};
+            }
+            lock.lock();
+            if (stopping || epoch != generation_epoch || mode == "error") {
+                return false;
+            }
+            emit({{"type", "tool_result"}, {"peer", peer_name(index)}, {"name", name},
+                {"call_id", call_id}, {"result", response}});
+            std::string content = response.dump();
+            if (content.size() > 65536) {
+                size_t length = 65536;
+                while (length && (static_cast<unsigned char>(content[length]) & 0xc0) == 0x80) { --length; }
+                content.resize(length);
+                content += "\n[Tool result truncated at 64 KiB]";
+            }
+            results.push_back({{"role", "tool"}, {"tool_call_id", call_id}, {"name", name}, {"content", content}});
+        }
+        lock.unlock();
+        const auto suffix = peer.transport->tool_results(assistant, results);
+        lock.lock();
+        if (stopping || epoch != generation_epoch || mode == "error") {
+            return false;
+        }
+        const uint64_t reserve = 2 * options.chunk_tokens + budget + options.answer_tokens + 2;
+        if (suffix.empty() || peer.tape.size() + suffix.size() + reserve >= peer.context_size) {
+            throw std::runtime_error("tool results do not fit the remaining context; reset or reduce token budgets");
+        }
+        peer.tape.insert(peer.tape.end(), suffix.begin(), suffix.end());
+        peer.thinking_open = true;
+        peer.tool_status.clear();
+        return true;
+    } catch (...) {
+        if (!lock.owns_lock()) { lock.lock(); }
+        peer.tool_status.clear();
+        if (stopping || epoch != generation_epoch || mode == "error") { return false; }
+        throw;
+    }
 }
 
 void crossthink_session::worker(size_t index) {
@@ -300,13 +488,26 @@ void crossthink_session::worker(size_t index) {
         }
         const bool answer = mode == "answering";
         try {
+            if (answer && peer.tools) {
+                peer.active = true;
+                if (peer.thinking_open) {
+                    peer.tape.push_back(peer.close_token);
+                    peer.thinking_open = false;
+                }
+                tool_turn(index, epoch, lock);
+                peer.active = false;
+                emit_state();
+                changed.notify_all();
+                continue;
+            }
             if (!answer) {
                 const size_t queue_limit = static_cast<size_t>(options.chunk_tokens) * 4;
                 if (!options.paragraph_splice) {
                     drain(peer);
                 }
                 const uint64_t reserve = (options.paragraph_splice ? 2 * options.chunk_tokens
-                    : options.chunk_tokens + queue_limit) + options.answer_tokens + 2;
+                    : options.chunk_tokens + queue_limit) + options.answer_tokens + 2 +
+                    (peer.tools ? std::max(options.tool_tokens, options.answer_tokens) : 0);
                 if (peer.tape.size() + reserve >= peer.context_size) {
                     error = std::string(peer_name(index)) + ": context full for further crossthink; request answers or reset";
                     mode = "paused";
@@ -332,7 +533,7 @@ void crossthink_session::worker(size_t index) {
             const uint32_t seed = (uint64_t(options.seed) + index + 2 * (peer.sequence++ % UINT32_MAX)) % UINT32_MAX;
             json bias = json::array();
             for (llama_token token : peer.controls) {
-                if (!answer || !contains(peer.eog, token)) {
+                if ((!answer || !contains(peer.eog, token)) && !(peer.tools && token == peer.close_token)) {
                     bias.push_back(json::array({token, false}));
                 }
             }
@@ -344,6 +545,10 @@ void crossthink_session::worker(size_t index) {
             };
             if (!answer && options.paragraph_splice) {
                 parameters["splice"] = {{"sentence_after", options.sentence_after}};
+                if (peer.tools) {
+                    parameters["splice"]["stop_on_think_close"] = true;
+                    parameters["preserved_tokens"] = json::array({"</think>"});
+                }
             }
             peer.active = true;
             if (answer) {
@@ -363,7 +568,7 @@ void crossthink_session::worker(size_t index) {
             lock.lock();
             peer.active = false;
             changed.notify_all();
-            if (stopping || epoch != generation_epoch) {
+            if (stopping || epoch != generation_epoch || mode == "error") {
                 continue;
             }
             if (!failure.empty()) {
@@ -378,6 +583,17 @@ void crossthink_session::worker(size_t index) {
             }
             if (!answer && options.paragraph_splice) {
                 const auto boundary = result.value("splice_boundary", std::string());
+                if (boundary == "tool" && peer.tools) {
+                    if (peer.thinking_open || peer.tape.back() != peer.close_token) {
+                        throw std::runtime_error("tool boundary did not end with the reasoning terminator");
+                    }
+                    peer.active = true;
+                    tool_turn(index, generation_epoch, lock);
+                    peer.active = false;
+                    emit_state();
+                    changed.notify_all();
+                    continue;
+                }
                 if ((boundary != "paragraph" && boundary != "sentence" && boundary != "limit") ||
                         (boundary == "limit" && received != static_cast<size_t>(options.chunk_tokens))) {
                     throw std::runtime_error("completion did not report a valid splice boundary");
@@ -403,6 +619,7 @@ void crossthink_session::worker(size_t index) {
             }
             emit_state();
         } catch (const std::exception & exception) {
+            peer.active = false;
             fail(std::string(peer_name(index)) + ": " + exception.what());
         }
     }
@@ -452,7 +669,8 @@ void crossthink_session::apply(const pending_command & command) {
                 ? peer.transport->initial_prompt(command.text)
                 : peer.transport->next_user(command.text);
             const uint64_t retained = reset ? 0 : peer.tape.size() + peer.inbox.size() + (peer.thinking_open ? 1 : 0);
-            const uint64_t reserve = (options.paragraph_splice ? 2 : 5) * options.chunk_tokens + options.answer_tokens + 2;
+            const uint64_t reserve = (options.paragraph_splice ? 2 : 5) * options.chunk_tokens + options.answer_tokens + 2 +
+                (peer.tools ? std::max(options.tool_tokens, options.answer_tokens) : 0);
             if (prepared[index].empty() || retained + prepared[index].size() + reserve >= peer.context_size) {
                 throw std::runtime_error(std::string(peer_name(index)) + ": message does not fit with the reasoning/answer reserve; reset or use smaller budgets");
             }
@@ -475,6 +693,9 @@ void crossthink_session::apply(const pending_command & command) {
             peer.segment_done = false;
             peer.boundary.clear();
             peer.forced_splices = 0;
+            peer.tool_calls = 0;
+            peer.tool_rounds = 0;
+            peer.tool_status.clear();
         }
         round = 0;
         exchanges = 0;
@@ -493,17 +714,21 @@ void crossthink_session::apply(const pending_command & command) {
             peer.thinking_open = true;
             peer.answer_done = false;
             peer.segment_done = false;
+            peer.tool_rounds = 0;
         }
         emit({{"type", "user"}, {"text", command.text}});
         mode = "thinking";
     } else if (command.action == "answer") {
         for (auto & peer : peers) {
+            if (peer.answer_done) { continue; }
             drain(peer);
-            if (peer.tape.size() + options.answer_tokens + 2 >= peer.context_size) {
+            if (peer.tape.size() + (peer.tools ? std::max(options.tool_tokens, options.answer_tokens)
+                    : options.answer_tokens) + 2 >= peer.context_size) {
                 throw std::runtime_error("context full for answers; reset or use a smaller answer budget");
             }
         }
         for (auto & peer : peers) {
+            if (peer.answer_done) { continue; }
             if (peer.thinking_open) {
                 peer.tape.push_back(peer.close_token);
                 peer.thinking_open = false;
@@ -514,6 +739,8 @@ void crossthink_session::apply(const pending_command & command) {
         mode = "answering";
     } else if (command.action == "resume") {
         rendezvous();
-        mode = "thinking";
+        mode = peers[0].answer_done || peers[1].answer_done ? "answering" : "thinking";
+    } else if (command.action == "pause" && peers[0].answer_done && peers[1].answer_done) {
+        mode = "answered";
     }
 }

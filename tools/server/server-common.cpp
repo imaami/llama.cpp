@@ -1371,6 +1371,7 @@ json oaicompat_chat_params_parse(
         common_chat_continuation_parse(body.at("continue_final_message")) :
         COMMON_CHAT_CONTINUATION_NONE;
     if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant
+        && json_value(body, "add_generation_prompt", true)
         && !inputs.messages.empty() && inputs.messages.back().role == "assistant") {
         if (inputs.messages.size() >= 2 && inputs.messages[inputs.messages.size() - 2].role == "assistant") {
             throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");

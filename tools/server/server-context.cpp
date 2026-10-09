@@ -96,6 +96,7 @@ static json server_token_wire_info(const llama_vocab * vocab, int32_t n_ctx) {
         {"protocol", server_token_wire::magic},
         {"stream", true},
         {"splice", true},
+        {"tool_parse", true},
         {"fingerprint", string_format("%016" PRIx64, hash)},
         {"n_vocab", n_vocab},
         {"eog_ids", std::move(eog_ids)},
@@ -2193,8 +2194,12 @@ private:
 
         if (slot.task->params.splice_sentence_after) {
             slot.splice.feed(common_token_to_piece(vocab, result.tok, true));
-            if (!incomplete && (slot.has_next_token || (slot.stop == STOP_TYPE_LIMIT && !slot.truncated))) {
-                const char * boundary = slot.splice.boundary(slot.stats.n_gen >= slot.task->params.splice_sentence_after);
+            if (result.tok == slot.task->params.splice_think_close && !slot.truncated) {
+                slot.splice_boundary = "tool";
+                slot.stop = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
+            } else if (!incomplete && (slot.has_next_token || (slot.stop == STOP_TYPE_LIMIT && !slot.truncated))) {
+                const char * boundary = slot.splice.boundary(slot.stats.n_gen >= static_cast<size_t>(slot.task->params.splice_sentence_after));
                 if (*boundary) {
                     slot.splice_boundary = boundary;
                     slot.stop = STOP_TYPE_LIMIT;
@@ -5037,6 +5042,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         throw std::invalid_argument("splice does not support stop strings, indentation or time limits");
                     }
                     task.params.splice_sentence_after = data.at("splice").at("sentence_after").get<int32_t>();
+                    if (json_value(data.at("splice"), "stop_on_think_close", false)) {
+                        const auto close = common_tokenize(ctx_server.vocab, "</think>", false, true);
+                        if (close.size() != 1) {
+                            throw std::invalid_argument("stop_on_think_close requires a single-token </think> delimiter");
+                        }
+                        task.params.splice_think_close = close.front();
+                    }
                     auto & scanner = task.params.splice_prompt;
                     for (llama_token token : task.tokens.get_tokens()) {
                         const std::string piece = common_token_to_piece(ctx_server.vocab, token, true);
@@ -5736,11 +5748,19 @@ void server_routes::init_routes() {
             }
             if (body.contains("splice")) {
                 const auto & splice = body.at("splice");
-                if (!splice.is_object() || splice.size() != 1 || !splice.contains("sentence_after") ||
+                if (!splice.is_object() || !splice.contains("sentence_after") ||
                         !splice.at("sentence_after").is_number_integer() ||
                         splice.at("sentence_after").get<uint64_t>() == 0 ||
                         splice.at("sentence_after").get<uint64_t>() > 4096) {
-                    throw std::invalid_argument("splice must contain only an integer sentence_after in [1, 4096]");
+                    throw std::invalid_argument("splice requires an integer sentence_after in [1, 4096]");
+                }
+                for (const auto & field : splice.items()) {
+                    if (field.key() == "sentence_after") {
+                        continue;
+                    }
+                    if (field.key() != "stop_on_think_close" || !field.value().is_boolean()) {
+                        throw std::invalid_argument("splice accepts only sentence_after and boolean stop_on_think_close");
+                    }
                 }
             }
             if (packet.tokens.size() >= static_cast<size_t>(meta->slot_n_ctx) ||
@@ -5918,15 +5938,47 @@ void server_routes::init_routes() {
     this->post_apply_template = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy, unused
-        common_chat_session session;   // dummy, unused
+        common_chat_session session;
         json body = json::parse(req.body);
+        common_chat_input output;
+        const bool parse_output = body.contains("parse_output");
+        if (parse_output) {
+            const auto & tokens = body.at("parse_output");
+            if (!tokens.is_array() || tokens.size() > static_cast<size_t>(meta->slot_n_ctx)) {
+                throw std::invalid_argument("parse_output must be a token array no larger than context_size");
+            }
+            bool ended = false;
+            for (const auto & value : tokens) {
+                if (!value.is_number_integer() || value.get<uint64_t>() >= static_cast<uint64_t>(meta->model_vocab_n_tokens)) {
+                    throw std::invalid_argument("parse_output contains an invalid token ID");
+                }
+                if (ended) {
+                    throw std::invalid_argument("parse_output contains tokens after the end of the assistant turn");
+                }
+                const llama_token token = value.get<llama_token>();
+                if (llama_vocab_is_eog(ctx_server.vocab, token)) {
+                    ended = true;
+                    continue;
+                }
+                const auto piece = common_token_to_piece(ctx_server.vocab, token, true);
+                if (piece.size() > 4 * 1024 * 1024 - output.size()) {
+                    throw std::invalid_argument("parse_output exceeds 4 MiB of decoded text");
+                }
+                output.append(piece, token);
+            }
+            body.erase("parse_output");
+        }
         json data = oaicompat_chat_params_parse(
             ctx_server.vocab,
             body,
             meta->chat_params,
             files,
             session);
-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
+        json result = {{"prompt", std::move(data.at("prompt"))}};
+        if (parse_output) {
+            result["message"] = session.finish(output).to_json_oaicompat();
+        }
+        res->ok(result);
         return res;
     };
 

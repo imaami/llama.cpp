@@ -22,9 +22,11 @@ struct options {
     std::string socket_a;
     std::string socket_b;
     std::string api_key;
+    std::string mcp_config;
     std::string prompt;
     std::string host = "127.0.0.1";
     int port = 8090;
+    int mcp_timeout = 60;
 };
 
 static uint64_t number(const char * text, uint64_t maximum) {
@@ -38,7 +40,11 @@ static uint64_t number(const char * text, uint64_t maximum) {
 }
 
 static bool parse(int argc, char ** argv, options & opts) {
-    enum { OPT_HOST = 256, OPT_PORT, OPT_CHUNK, OPT_SPLICE_MODE, OPT_SENTENCE_AFTER, OPT_ANSWER, OPT_SEED, OPT_TEMPERATURE, OPT_KEY };
+    enum {
+        OPT_HOST = 256, OPT_PORT, OPT_CHUNK, OPT_SPLICE_MODE, OPT_SENTENCE_AFTER,
+        OPT_ANSWER, OPT_SEED, OPT_TEMPERATURE, OPT_KEY, OPT_MCP_CONFIG, OPT_MCP_TIMEOUT,
+        OPT_TOOL_TOKENS, OPT_TOOL_ROUNDS,
+    };
     const struct option names[] = {
         {"socket-a", required_argument, nullptr, 'a'},
         {"socket-b", required_argument, nullptr, 'b'},
@@ -54,6 +60,10 @@ static bool parse(int argc, char ** argv, options & opts) {
         {"seed", required_argument, nullptr, OPT_SEED},
         {"temperature", required_argument, nullptr, OPT_TEMPERATURE},
         {"api-key", required_argument, nullptr, OPT_KEY},
+        {"mcp-config", required_argument, nullptr, OPT_MCP_CONFIG},
+        {"mcp-timeout", required_argument, nullptr, OPT_MCP_TIMEOUT},
+        {"tool-turn-tokens", required_argument, nullptr, OPT_TOOL_TOKENS},
+        {"max-tool-rounds", required_argument, nullptr, OPT_TOOL_ROUNDS},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
@@ -103,6 +113,15 @@ static bool parse(int argc, char ** argv, options & opts) {
             case OPT_ANSWER: opts.session.answer_tokens = static_cast<int32_t>(number(optarg, 65536)); break;
             case OPT_SEED: opts.session.seed = static_cast<uint32_t>(number(optarg, UINT32_MAX - 1)); break;
             case OPT_KEY: opts.api_key = optarg; break;
+            case OPT_MCP_CONFIG:
+                if (!opts.mcp_config.empty() || !*optarg) {
+                    throw std::invalid_argument("use --mcp-config once with a nonempty file path");
+                }
+                opts.mcp_config = optarg;
+                break;
+            case OPT_MCP_TIMEOUT: opts.mcp_timeout = static_cast<int>(number(optarg, 600)); break;
+            case OPT_TOOL_TOKENS: opts.session.tool_tokens = static_cast<int32_t>(number(optarg, 16384)); break;
+            case OPT_TOOL_ROUNDS: opts.session.max_tool_rounds = static_cast<int32_t>(number(optarg, 64)); break;
             case OPT_TEMPERATURE: {
                 char * end = nullptr;
                 errno = 0;
@@ -129,6 +148,11 @@ static bool parse(int argc, char ** argv, options & opts) {
                     "      --seed N              Initial sampling seed (default: 42)\n"
                     "      --temperature N       Sampling temperature (default: 1.0)\n"
                     "      --api-key KEY         Bearer key for both model servers (default: none)\n"
+                    "      --mcp-config FILE     JSON mcpServers with HTTP/HTTPS urls and optional headers\n"
+                    "      --mcp-timeout N       MCP HTTP timeout, 1..600 seconds (default: 60)\n"
+                    "      --tool-turn-tokens N  Private turn budget, 1..16384 (default: 2048)\n"
+                    "                           Effective budget is max(N, --answer-tokens)\n"
+                    "      --max-tool-rounds N   Tool rounds between paragraphs, 1..64 (default: 8)\n"
                     "  -h, --help                Show help\n";
                 return false;
             default: throw std::invalid_argument("unknown option; use --help");
@@ -137,11 +161,34 @@ static bool parse(int argc, char ** argv, options & opts) {
     if (!opts.session.chunk_tokens || !opts.session.sentence_after) {
         throw std::invalid_argument("segment ceiling and sentence threshold must be at least 1");
     }
+    if (!opts.mcp_timeout || !opts.session.tool_tokens || !opts.session.max_tool_rounds) {
+        throw std::invalid_argument("MCP timeout, tool turn budget and tool round limit must be at least 1");
+    }
     if (optind != argc || opts.socket_a.empty() || opts.socket_b.empty() || opts.socket_a == opts.socket_b ||
             opts.host.empty() || !opts.port || (has_prompt && opts.prompt.empty())) {
         throw std::invalid_argument("two different sockets and a valid console address are required; use --help");
     }
     return true;
+}
+
+static std::vector<crossthink_mcp_config> load_mcp_config(const std::string & path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open MCP config: " + path);
+    }
+    std::string contents;
+    char buffer[4096];
+    while (input.read(buffer, sizeof(buffer)) || input.gcount()) {
+        const size_t size = static_cast<size_t>(input.gcount());
+        if (contents.size() + size > 1024 * 1024) {
+            throw std::invalid_argument("MCP config exceeds 1 MiB");
+        }
+        contents.append(buffer, size);
+    }
+    if (input.bad()) {
+        throw std::runtime_error("cannot read MCP config: " + path);
+    }
+    return parse_crossthink_mcp_config(json::parse(contents));
 }
 
 static void routes(httplib::Server & http, crossthink_session & session) {
@@ -225,7 +272,17 @@ int main(int argc, char ** argv) {
             crossthink_unix_transport(opts.socket_a, opts.api_key),
             crossthink_unix_transport(opts.socket_b, opts.api_key),
         };
-        crossthink_session session(std::move(transports), opts.session);
+        std::array<std::unique_ptr<crossthink_tool_service>, 2> tool_services;
+        if (!opts.mcp_config.empty()) {
+            const auto configs = load_mcp_config(opts.mcp_config);
+            for (auto & service : tool_services) {
+                service = crossthink_mcp_service(configs, opts.mcp_timeout);
+                if (!opts.session.paragraph_splice && !service->tools().empty()) {
+                    throw std::invalid_argument("MCP tools require --splice-mode paragraph");
+                }
+            }
+        }
+        crossthink_session session(std::move(transports), opts.session, std::move(tool_services));
         httplib::Server http;
         routes(http, session);
         if (!http.bind_to_port(opts.host, opts.port)) {

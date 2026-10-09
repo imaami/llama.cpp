@@ -50,6 +50,10 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
     .thought { height: min(43vh, 480px); min-height: 230px; color: #c0c8d7; font: 13px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace; }
     .answer-wrap { background: #1c232c; border-top: 1px solid #343b48; }
     .answer { min-height: 130px; max-height: 320px; font: 15px/1.6 system-ui, sans-serif; }
+    .tools-wrap { border-top: 1px solid #343b48; }
+    .tools-wrap summary { cursor: pointer; padding: 10px 16px; font-size: 13px; color: #b3bbcb; }
+    .tools-wrap summary span { margin-left: 8px; color: #a3acbc; }
+    .tools { max-height: 300px; font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
     .output.empty::before { content: attr(data-empty); color: #788399; font: 13px/1.6 system-ui, sans-serif; }
     .clipped { font-size: 11px; color: #c7b089; padding: 0 16px; }
     .messages { max-height: 170px; overflow-y: auto; margin: 16px 0 8px; }
@@ -88,6 +92,7 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
     </div>
 </div>
 <p id="splice-status" class="muted" role="status"></p>
+<p id="tools-status" class="muted" role="status"></p>
 <div id="error" class="notice error" role="alert" hidden></div>
 <div id="warning" class="notice" role="status" hidden></div>
 <main class="peers">
@@ -103,6 +108,11 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
             <div class="panel-head"><h3>Answer</h3></div>
             <div id="answer-A" class="output answer empty" data-empty="Choose Answer now to finish reasoning and generate answers."></div>
         </div>
+        <details class="tools-wrap">
+            <summary>Tool activity <span id="tool-status-A">No calls</span></summary>
+            <div id="tools-clipped-A" class="clipped" hidden>Older displayed tool activity was trimmed.</div>
+            <pre id="tools-A" class="output tools empty" data-empty="Tool calls and results appear here."></pre>
+        </details>
     </section>
     <section class="peer peer-b" aria-label="Model B">
         <div class="peer-header">
@@ -116,6 +126,11 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
             <div class="panel-head"><h3>Answer</h3></div>
             <div id="answer-B" class="output answer empty" data-empty="Choose Answer now to finish reasoning and generate answers."></div>
         </div>
+        <details class="tools-wrap">
+            <summary>Tool activity <span id="tool-status-B">No calls</span></summary>
+            <div id="tools-clipped-B" class="clipped" hidden>Older displayed tool activity was trimmed.</div>
+            <pre id="tools-B" class="output tools empty" data-empty="Tool calls and results appear here."></pre>
+        </details>
     </section>
 </main>
 <div id="messages" class="messages" aria-label="Your messages"></div>
@@ -219,11 +234,19 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         const paragraph = state.splice_mode === 'paragraph';
         byId('splice-status').textContent = paragraph ?
             'Paragraph rendezvous / ' + number(state.exchanges) + ' exchanges' : 'Fixed intervals';
+        const hasTools = Number(state.tools) > 0;
+        byId('tools-status').textContent = hasTools ?
+            'MCP / ' + number(state.tools) + ' tools available to each model' : 'MCP tools not configured';
         for (const peer of state.peers || []) {
             if (!peers.includes(peer.name)) {
                 continue;
             }
             const stats = byId('stats-' + peer.name);
+            byId('tool-status-' + peer.name).textContent = number(peer.tool_calls || 0) + ' calls' +
+                (peer.tool_status ? ' / ' + peer.tool_status : '');
+            byId('answer-' + peer.name).dataset.empty = hasTools ?
+                'Answers appear when a model finishes or you choose Answer now.' :
+                'Choose Answer now to finish reasoning and generate answers.';
             stats.replaceChildren();
             const details = [
                 'Context ' + number(peer.tokens) + ' / ' + number(peer.context_size),
@@ -253,6 +276,12 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         for (const key of Object.keys(outputs)) {
             clearOutput(key);
         }
+        for (const peer of peers) {
+            byId('tools-' + peer).textContent = '';
+            byId('tools-' + peer).classList.add('empty');
+            byId('tools-clipped-' + peer).hidden = true;
+            byId('tool-status-' + peer).textContent = 'No calls';
+        }
         byId('messages').replaceChildren();
         notice('error', '');
         notice('warning', '');
@@ -277,6 +306,25 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
             if (outputs['thought-' + peer].node.length) {
                 appendOutput('thought-' + peer, '\n\n--- New message ---\n\n');
             }
+        }
+    }
+
+    function showTool(peer, record) {
+        const output = byId('tools-' + peer);
+        const follow = output.scrollHeight - output.scrollTop - output.clientHeight < 50;
+        const result = record.type === 'tool_result';
+        const value = result ? record.result : record.arguments;
+        const header = (result ? 'RESULT ' : 'CALL ') + (record.name || 'tool') +
+            (record.call_id ? ' [' + record.call_id + ']' : '');
+        let text = output.textContent + header + '\n' + (JSON.stringify(value, null, 2) || 'null') + '\n\n';
+        if (text.length > textLimit) {
+            text = text.slice(-textLimit);
+            byId('tools-clipped-' + peer).hidden = false;
+        }
+        output.textContent = text;
+        output.classList.remove('empty');
+        if (follow) {
+            output.scrollTop = output.scrollHeight;
         }
     }
 
@@ -308,6 +356,10 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
                 break;
             case 'answer':
                 if (peer) { appendOutput('answer-' + peer, record.text); }
+                break;
+            case 'tool_call':
+            case 'tool_result':
+                if (peer) { showTool(peer, record); }
                 break;
             case 'state': applyState(record.state); break;
             case 'user': showUser(record.text); break;

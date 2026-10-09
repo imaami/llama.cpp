@@ -1,6 +1,7 @@
 #pragma once
 
 #include "server-token-wire.h"
+#include "crossthink-mcp.h"
 
 #include <nlohmann/json.hpp>
 
@@ -11,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +26,8 @@ struct crossthink_options {
     int32_t answer_tokens = 1024;
     uint32_t seed = 42;
     double temperature = 1.0;
+    int32_t tool_tokens = 2048;
+    int32_t max_tool_rounds = 8;
 };
 
 class crossthink_transport {
@@ -33,6 +37,11 @@ public:
     virtual crossthink_json describe() = 0;
     virtual std::vector<llama_token> initial_prompt(const std::string & text) = 0;
     virtual std::vector<llama_token> next_user(const std::string & text) = 0;
+    virtual void configure_tools(const crossthink_json &) { throw std::runtime_error("transport does not support tools"); }
+    virtual crossthink_json parse_tool_turn(const std::vector<llama_token> &) { throw std::runtime_error("transport does not support tool parsing"); }
+    virtual std::vector<llama_token> tool_results(const crossthink_json &, const crossthink_json &) {
+        throw std::runtime_error("transport does not support tool results");
+    }
     virtual crossthink_json generate(const std::vector<llama_token> & prompt,
             const crossthink_json & parameters,
             const std::function<bool(const server_token_wire::packet &)> & receive) = 0;
@@ -45,7 +54,8 @@ std::unique_ptr<crossthink_transport> crossthink_unix_transport(
 class crossthink_session {
 public:
     crossthink_session(std::array<std::unique_ptr<crossthink_transport>, 2> transports,
-            const crossthink_options & options);
+            const crossthink_options & options,
+            std::array<std::unique_ptr<crossthink_tool_service>, 2> tools = {});
     ~crossthink_session();
     crossthink_session(const crossthink_session &) = delete;
     crossthink_session & operator=(const crossthink_session &) = delete;
@@ -58,6 +68,7 @@ public:
 private:
     struct peer_state {
         std::unique_ptr<crossthink_transport> transport;
+        std::unique_ptr<crossthink_tool_service> tools;
         crossthink_json info;
         std::vector<llama_token> tape;
         std::vector<llama_token> inbox;
@@ -68,6 +79,9 @@ private:
         uint64_t imported = 0;
         uint64_t sequence = 0;
         uint64_t forced_splices = 0;
+        uint64_t tool_calls = 0;
+        int32_t tool_rounds = 0;
+        std::string tool_status;
         std::string boundary;
         llama_token close_token = -1;
         bool active = false;
@@ -106,6 +120,7 @@ private:
     void fail(const std::string & message);
     void drain(peer_state & peer);
     void rendezvous();
+    bool tool_turn(size_t index, uint64_t generation_epoch, std::unique_lock<std::mutex> & lock);
     void worker(size_t index);
     void control();
     void apply(const pending_command & command);

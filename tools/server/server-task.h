@@ -58,6 +58,7 @@ struct task_params {
     bool return_progress = false;
 
     int32_t splice_sentence_after = 0; // zero disables clean splice stopping
+    llama_token splice_think_close = LLAMA_TOKEN_NULL;
     server_splice_scanner splice_prompt;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables

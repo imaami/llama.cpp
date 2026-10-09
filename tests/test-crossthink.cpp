@@ -69,6 +69,37 @@ struct fake_request {
     }
 };
 
+struct fake_operation {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool released = false;
+    bool cancelled = false;
+    bool throw_on_cancel = false;
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return released || cancelled; });
+        if (cancelled && throw_on_cancel) {
+            throw std::runtime_error("stale template operation failed after cancellation");
+        }
+    }
+
+    void wait_entered() {
+        std::unique_lock<std::mutex> lock(mutex);
+        await(changed, lock, [&] { return entered; }, "enter fake template operation");
+    }
+
+    void release(bool cancel = false) {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        cancelled = cancelled || cancel;
+        changed.notify_all();
+    }
+};
+
 class fake_transport final : public crossthink_transport {
 public:
     uint64_t context_size = 256;
@@ -78,12 +109,19 @@ public:
     std::vector<std::shared_ptr<fake_request>> requests;
     std::vector<std::string> initial_texts;
     std::vector<std::string> user_texts;
+    crossthink_json configured_tools;
+    crossthink_json parsed_assistant;
+    std::vector<std::vector<llama_token>> parsed_turns;
+    std::vector<crossthink_json> result_assistants;
+    std::vector<crossthink_json> result_messages;
+    std::shared_ptr<fake_operation> parse_gate;
+    std::shared_ptr<fake_operation> results_gate;
 
     crossthink_json describe() override {
         return {
             {"protocol", "LLMTOK01"}, {"fingerprint", fingerprint},
             {"n_vocab", 4096}, {"eog_ids", {3}}, {"context_size", context_size},
-            {"close_token", 2}, {"control_ids", {1, 2, 3}}, {"splice", true},
+            {"close_token", 2}, {"control_ids", {1, 2, 3}}, {"splice", true}, {"tool_parse", true},
         };
     }
 
@@ -97,6 +135,41 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         user_texts.push_back(text);
         return {3, 20, 21, 1};
+    }
+
+    void configure_tools(const crossthink_json & tools) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        configured_tools = tools;
+    }
+
+    crossthink_json parse_tool_turn(const std::vector<llama_token> & tokens) override {
+        crossthink_json result;
+        std::shared_ptr<fake_operation> gate;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            parsed_turns.push_back(tokens);
+            result = parsed_assistant;
+            gate = parse_gate;
+        }
+        if (gate) {
+            gate->run();
+        }
+        return result;
+    }
+
+    std::vector<llama_token> tool_results(const crossthink_json & assistant,
+            const crossthink_json & results) override {
+        std::shared_ptr<fake_operation> gate;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            result_assistants.push_back(assistant);
+            result_messages.push_back(results);
+            gate = results_gate;
+        }
+        if (gate) {
+            gate->run();
+        }
+        return {40, 1};
     }
 
     crossthink_json generate(const std::vector<llama_token> & prompt,
@@ -145,6 +218,12 @@ public:
 
     void cancel() override {
         std::lock_guard<std::mutex> lock(mutex);
+        if (parse_gate) {
+            parse_gate->release(true);
+        }
+        if (results_gate) {
+            results_gate->release(true);
+        }
         if (requests.empty()) {
             return;
         }
@@ -171,25 +250,114 @@ private:
     }
 };
 
+struct fake_tool_call {
+    std::string name;
+    crossthink_json arguments;
+    std::mutex mutex;
+    std::condition_variable changed;
+    crossthink_json result;
+    bool finished = false;
+    bool cancelled = false;
+    bool returned = false;
+
+    void finish(crossthink_json value) {
+        std::lock_guard<std::mutex> lock(mutex);
+        result = std::move(value);
+        finished = true;
+        changed.notify_all();
+    }
+};
+
+class fake_tool_service final : public crossthink_tool_service {
+public:
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<std::shared_ptr<fake_tool_call>> calls;
+
+    crossthink_json tools() const override {
+        return crossthink_json::array({{
+            {"type", "function"}, {"function", {
+                {"name", "calculator"}, {"description", "Evaluate an expression"},
+                {"parameters", {{"type", "object"}, {"properties", {
+                    {"expression", {{"type", "string"}}}}}, {"required", {"expression"}}}},
+            }},
+        }});
+    }
+
+    crossthink_json call(const std::string & name, const crossthink_json & arguments) override {
+        auto request = std::make_shared<fake_tool_call>();
+        request->name = name;
+        request->arguments = arguments;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            calls.push_back(request);
+            changed.notify_all();
+        }
+        std::unique_lock<std::mutex> lock(request->mutex);
+        request->changed.wait(lock, [&] { return request->finished || request->cancelled; });
+        request->returned = true;
+        request->changed.notify_all();
+        // A completed response may race cancellation; the engine must reject its stale epoch.
+        return request->cancelled ? crossthink_json{{"content", {{{"type", "text"}, {"text", "stale"}}}}}
+            : request->result;
+    }
+
+    void cancel() override {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!calls.empty()) {
+            auto & request = *calls.back();
+            std::lock_guard<std::mutex> request_lock(request.mutex);
+            request.cancelled = true;
+            request.changed.notify_all();
+        }
+    }
+
+    std::shared_ptr<fake_tool_call> request(size_t index) {
+        std::unique_lock<std::mutex> lock(mutex);
+        await(changed, lock, [&] { return calls.size() > index; }, "start fake tool call");
+        return calls[index];
+    }
+
+    size_t call_count() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return calls.size();
+    }
+};
+
 struct fixture {
     std::array<fake_transport *, 2> peers;
+    std::array<fake_tool_service *, 2> tools = {};
     std::unique_ptr<crossthink_session> session;
     uint64_t cursor = 0;
 
-    fixture(int32_t chunk = 2, uint64_t context = 256, bool paragraph_splice = false) {
+    fixture(int32_t chunk = 2, uint64_t context = 256, bool paragraph_splice = false, bool enable_tools = false) {
         std::array<std::unique_ptr<crossthink_transport>, 2> transports;
+        std::array<std::unique_ptr<crossthink_tool_service>, 2> services;
         for (size_t i = 0; i < peers.size(); ++i) {
             auto peer = std::make_unique<fake_transport>();
             peer->context_size = context;
             peers[i] = peer.get();
             transports[i] = std::move(peer);
+            if (enable_tools) {
+                auto service = std::make_unique<fake_tool_service>();
+                tools[i] = service.get();
+                services[i] = std::move(service);
+                peers[i]->parsed_assistant = {
+                    {"role", "assistant"}, {"content", ""}, {"tool_calls", crossthink_json::array({{
+                        {"id", "call_calculator"}, {"type", "function"}, {"function", {
+                            {"name", "calculator"}, {"arguments", "{\"expression\":\"6*7\"}"},
+                        }},
+                    }})},
+                };
+            }
         }
         crossthink_options options;
         options.chunk_tokens = chunk;
         options.answer_tokens = 8;
+        options.tool_tokens = 8;
         options.paragraph_splice = paragraph_splice;
         options.sentence_after = 2;
-        session = std::make_unique<crossthink_session>(std::move(transports), options);
+        session = std::make_unique<crossthink_session>(std::move(transports), options, std::move(services));
     }
 
     template<typename Predicate>
@@ -530,6 +698,230 @@ static void test_paragraph_failure_during_command() {
     }
 }
 
+static std::shared_ptr<fake_request> start_private_turn(fixture & f, size_t index) {
+    auto reasoning = f.peers[index]->request(0);
+    reasoning->send({static_cast<llama_token>(101 + index), 2});
+    reasoning->finish("limit", "tool");
+    auto request = f.peers[index]->request(1);
+    check(request->prompt.back() == 2, "private assistant turn did not follow the reasoning-close token");
+    check(request->parameters.at("n_predict") == 8, "private assistant turn has the wrong token budget");
+    check(!request->parameters.contains("splice"), "private assistant turn inherited paragraph stopping");
+    return request;
+}
+
+static void test_tool_result_is_private() {
+    fixture f(4, 256, true, true);
+    f.start();
+    auto b1 = f.peers[1]->request(0);
+    b1->send({201});
+    b1->finish();
+    f.wait_peer(1);
+    auto a2 = start_private_turn(f, 0);
+    a2->send({501, 3});
+    a2->finish("eos", "");
+    auto call = f.tools[0]->request(0);
+    check(call->name == "calculator" && call->arguments == crossthink_json{{"expression", "6*7"}},
+            "native tool arguments did not reach MCP intact");
+    check(f.tools[1]->call_count() == 0, "peer executed the other model's tool call");
+    const auto blocked = f.session->state();
+    check(blocked.at("peers").at(1).at("queued") == 0, "incomplete pre-tool thought remained queued for the peer");
+    check(blocked.at("peers").at(0).at("active").get<bool>(), "tool call released the active-turn guard");
+    check(f.peers[1]->request_count() == 1, "waiting peer continued before tool user's paragraph");
+    const crossthink_json result = {
+        {"content", {{{"type", "text"}, {"text", "42"}}}},
+        {"structuredContent", {{"value", 42}}}, {"isError", false},
+    };
+    call->finish(result);
+    auto a3 = f.peers[0]->request(2);
+    check(ends_with(a3->prompt, {3, 40, 1}), "tool response was not followed by a fresh thinking prefix");
+    check(count(a3->prompt, 501) == 1 && count(a3->prompt, 3) == 1,
+            "private assistant body was lost or its terminator was duplicated");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        check(f.peers[0]->configured_tools == f.tools[0]->tools(), "discovered tools were not applied to the template");
+        check(f.peers[0]->parsed_turns == std::vector<std::vector<llama_token>>{{2, 501, 3}},
+                "native parser received an incomplete or contaminated assistant turn");
+        check(f.peers[0]->result_assistants.size() == 1, "tool result template received multiple assistant turns");
+        check(f.peers[0]->result_messages.size() == 1, "tool response was omitted or delivered twice");
+        const auto & assistant_call = f.peers[0]->result_assistants.front().at("tool_calls").at(0);
+        const auto & message = f.peers[0]->result_messages.front().at(0);
+        check(assistant_call.at("id") == "call_calculator", "native tool-call ID was replaced during execution");
+        check(assistant_call.at("function") == f.peers[0]->parsed_assistant.at("tool_calls").at(0).at("function"),
+                "tool result template received a different function call");
+        check(message.at("role") == "tool" && message.at("name") == "calculator" &&
+                message.at("tool_call_id") == assistant_call.at("id"), "tool result was not matched to its native call ID");
+        check(crossthink_json::parse(message.at("content").get<std::string>()) == result,
+                "tool content or structured MCP result was lost before template rendering");
+    }
+    a3->send({102});
+    a3->finish();
+    auto a4 = f.peers[0]->request(3);
+    auto b2 = f.peers[1]->request(1);
+    check(b2->prompt == std::vector<llama_token>({1, 10, 11, 201, 102}),
+            "private tool turn or incomplete reasoning leaked into the peer's paragraph splice");
+    check(count(a4->prompt, 201) == 1 && count(a4->prompt, 101) == 1 && count(a4->prompt, 40) == 1,
+            "tool user lost its private context or imported the peer twice");
+    check(f.session->state().at("exchanges") == 1, "tool turn itself was counted as a paragraph exchange");
+    f.pause();
+}
+
+static void test_reset_cancels_tool_call() {
+    fixture f(4, 256, true, true);
+    f.start();
+    auto b1 = f.peers[1]->request(0);
+    b1->send({201});
+    b1->finish();
+    f.wait_peer(1);
+    auto a2 = start_private_turn(f, 0);
+    a2->send({501, 3});
+    a2->finish("eos", "");
+    auto call = f.tools[0]->request(0);
+    f.session->command("reset");
+    const auto reset = f.wait_mode("idle");
+    {
+        std::lock_guard<std::mutex> lock(call->mutex);
+        check(call->cancelled && call->returned, "reset did not interrupt the pending MCP call");
+    }
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        check(f.peers[0]->result_messages.empty(), "cancelled MCP result reached the prompt template");
+    }
+    for (const auto & peer : reset.at("peers")) {
+        check(peer.at("tool_calls") == 0 && peer.at("tool_status") == "", "reset retained tool-call state");
+        check(peer.at("tokens") == 0 && peer.at("queued") == 0, "reset retained private tool tokens");
+    }
+    f.start("new question");
+    check(f.peers[0]->request(2)->prompt == std::vector<llama_token>({1, 10, 11}),
+            "late tool response contaminated A's new session");
+    check(f.peers[1]->request(1)->prompt == std::vector<llama_token>({1, 10, 11}),
+            "late tool response contaminated B's new session");
+    f.pause();
+}
+
+static void test_incomplete_tool_turn_does_not_execute() {
+    for (const std::string failure : {"limit", "truncated", "error"}) {
+        fixture f(4, 256, true, true);
+        f.start();
+        auto b1 = f.peers[1]->request(0);
+        b1->send({201});
+        b1->finish();
+        f.wait_peer(1);
+        auto a2 = start_private_turn(f, 0);
+        a2->send(failure == "limit" ? std::vector<llama_token>{501} : std::vector<llama_token>{501, 3});
+        if (failure == "error") {
+            a2->finish_result({{"type", "error"}, {"message", "broken stream"}});
+        } else {
+            a2->finish_result({{"type", "done"}, {"stop_type", failure == "limit" ? "limit" : "eos"},
+                {"truncated", failure == "truncated"}});
+        }
+        f.wait_mode("error");
+        check(f.tools[0]->call_count() == 0 && f.tools[1]->call_count() == 0,
+                "invalid private assistant completion executed a tool");
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        check(f.peers[0]->parsed_turns.empty() && f.peers[0]->result_messages.empty(),
+                "invalid private assistant completion reached the tool parser or template");
+    }
+}
+
+static void test_natural_final_answer_with_tools() {
+    fixture f(4, 256, true, true);
+    for (size_t i = 0; i < f.peers.size(); ++i) {
+        std::lock_guard<std::mutex> lock(f.peers[i]->mutex);
+        f.peers[i]->parsed_assistant = {{"role", "assistant"}, {"content", i ? "B answer" : "A answer"}};
+    }
+    f.start();
+    auto b1 = f.peers[1]->request(0);
+    b1->send({201});
+    b1->finish();
+    f.wait_peer(1);
+    auto a2 = start_private_turn(f, 0);
+    a2->send({501, 3});
+    a2->finish("eos", "");
+    auto b2 = f.peers[1]->request(1);
+    check(b2->prompt.back() == 2, "other peer's final answer did not close its reasoning");
+    check(!count(b2->prompt, 101) && !count(b2->prompt, 501), "natural final answer was spliced into peer reasoning");
+    b2->send({601, 3});
+    b2->finish("eos", "");
+    f.wait_mode("answered");
+    check(f.tools[0]->call_count() == 0 && f.tools[1]->call_count() == 0, "ordinary final answer executed an MCP tool");
+    std::array<bool, 2> answer_seen = {};
+    for (const auto & event : f.session->events_after(0)) {
+        if (event.value("type", std::string()) == "answer") {
+            if (event.value("peer", std::string()) == "A" && event.value("text", std::string()) == "A answer") {
+                answer_seen[0] = true;
+            }
+            if (event.value("peer", std::string()) == "B" && event.value("text", std::string()) == "B answer") {
+                answer_seen[1] = true;
+            }
+        }
+    }
+    check(answer_seen[0] && answer_seen[1], "native final answer content did not reach both answer panes");
+}
+
+static void test_reset_during_tool_template_operation() {
+    for (bool rendering : {false, true}) {
+        fixture f(4, 256, true, true);
+        auto gate = std::make_shared<fake_operation>();
+        gate->throw_on_cancel = true;
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            (rendering ? f.peers[0]->results_gate : f.peers[0]->parse_gate) = gate;
+        }
+        f.start();
+        auto b1 = f.peers[1]->request(0);
+        b1->send({201});
+        b1->finish();
+        f.wait_peer(1);
+        auto a2 = start_private_turn(f, 0);
+        a2->send({501, 3});
+        a2->finish("eos", "");
+        if (rendering) {
+            f.tools[0]->request(0)->finish({{"content", {{{"type", "text"}, {"text", "42"}}}}});
+        }
+        gate->wait_entered();
+        f.session->command("reset", "replacement question");
+        const auto replacement = f.wait_mode("thinking");
+        check(replacement.at("error") == "", "stale template exception failed the replacement session");
+        check(f.peers[0]->request(2)->prompt == std::vector<llama_token>({1, 10, 11}) &&
+                f.peers[1]->request(1)->prompt == std::vector<llama_token>({1, 10, 11}),
+                "cancelled template operation contaminated a replacement prompt");
+        check(f.tools[0]->call_count() == (rendering ? 1 : 0), "cancelled parser dispatched a tool call");
+        {
+            std::lock_guard<std::mutex> lock(gate->mutex);
+            check(gate->cancelled, "reset did not cancel the pending template operation");
+        }
+        f.pause();
+    }
+}
+
+static void test_peer_error_survives_private_final_answer() {
+    fixture f(4, 256, true, true);
+    auto gate = std::make_shared<fake_operation>();
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parse_gate = gate;
+        f.peers[0]->parsed_assistant = {{"role", "assistant"}, {"content", "A final answer"}};
+    }
+    f.start();
+    auto b1 = f.peers[1]->request(0);
+    b1->send({201});
+    b1->wait_consumed(1);
+    auto a2 = start_private_turn(f, 0);
+    a2->send({501, 3});
+    a2->finish("eos", "");
+    gate->wait_entered();
+    b1->finish_result({{"type", "error"}, {"message", "peer stream failed"}});
+    const auto failed = f.wait_mode("error");
+    gate->release();
+    const auto finished = f.wait_state([](const crossthink_json & state) {
+        return !state.at("peers").at(0).at("active").get<bool>();
+    }, "finish private answer after peer failure", true);
+    check(finished.at("mode") == "error" && finished.at("error") == failed.at("error"),
+            "successful private answer cleared its peer's error and restarted generation");
+    check(f.peers[0]->request_count() == 2 && f.peers[1]->request_count() == 1,
+            "a private final answer started another request after peer failure");
+}
+
 int main() {
     try {
         test_streaming_boundary_and_resume();
@@ -539,6 +931,12 @@ int main() {
         test_paragraph_pause_and_resume();
         test_invalid_paragraph_result();
         test_paragraph_failure_during_command();
+        test_tool_result_is_private();
+        test_reset_cancels_tool_call();
+        test_incomplete_tool_turn_does_not_execute();
+        test_natural_final_answer_with_tools();
+        test_reset_during_tool_template_operation();
+        test_peer_error_survives_private_final_answer();
         std::puts("crossthink tests: passed");
         return 0;
     } catch (const std::exception & error) {

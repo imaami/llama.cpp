@@ -15,6 +15,8 @@ class unix_transport final : public crossthink_transport {
     httplib::Client client;
     int32_t n_vocab = 0;
     std::string initial_text;
+    json tools = json::array();
+    std::vector<llama_token> eog;
     std::atomic<uint64_t> cancellation{0};
 
     std::string response(const httplib::Result & result) const {
@@ -47,13 +49,18 @@ class unix_transport final : public crossthink_transport {
         return tokens;
     }
 
-    std::string render(const json & messages) {
-        const auto result = post("/apply-template", {
-            {"messages", messages}, {"chat_template_kwargs", {{"enable_thinking", true}}},
-        });
+    json template_request(const json & messages, bool generation = true) const {
+        return {
+            {"messages", messages}, {"tools", tools}, {"add_generation_prompt", generation},
+            {"chat_template_kwargs", {{"enable_thinking", true}}}, {"reasoning_format", "deepseek"},
+        };
+    }
+
+    std::string render(const json & messages, bool generation = true) {
+        const auto result = post("/apply-template", template_request(messages, generation));
         const auto text = result.at("prompt").get<std::string>();
         const auto opening = text.rfind("<think>");
-        if (opening == std::string::npos || text.find_first_not_of(" \t\r\n", opening + 7) != std::string::npos) {
+        if (generation && (opening == std::string::npos || text.find_first_not_of(" \t\r\n", opening + 7) != std::string::npos)) {
             throw std::runtime_error("chat template must end in an open <think> section; use --jinja and a thinking-enabled model");
         }
         return text;
@@ -78,6 +85,7 @@ public:
             throw std::runtime_error("invalid vocabulary size");
         }
         n_vocab = static_cast<int32_t>(count);
+        eog = result.at("eog_ids").get<std::vector<llama_token>>();
         const auto close = tokenize("</think>");
         const auto open = tokenize("<think>");
         if (close.size() != 1 || open.size() != 1) {
@@ -92,6 +100,43 @@ public:
             }
         }
         return result;
+    }
+
+    void configure_tools(const json & definitions) override {
+        if (!definitions.is_array()) {
+            throw std::invalid_argument("tool definitions must be an array");
+        }
+        tools = definitions;
+    }
+
+    json parse_tool_turn(const std::vector<llama_token> & tokens) override {
+        auto request = template_request(json::array({{{"role", "user"}, {"content", initial_text}}}));
+        request["parse_output"] = tokens;
+        return post("/apply-template", request).at("message");
+    }
+
+    std::vector<llama_token> tool_results(const json & assistant, const json & results) override {
+        if (!results.is_array() || results.empty()) {
+            throw std::invalid_argument("tool results must be a nonempty array");
+        }
+        // Only the suffix is appended. The original assistant content remains on the raw tape.
+        auto rendered_assistant = assistant;
+        rendered_assistant["content"] = "";
+        rendered_assistant.erase("reasoning_content");
+        auto messages = json::array({{{"role", "user"}, {"content", initial_text}}, rendered_assistant});
+        const auto before = tokenize(render(messages, false));
+        messages.insert(messages.end(), results.begin(), results.end());
+        const auto after = tokenize(render(messages));
+        auto boundary = before.size();
+        while (boundary && std::find(eog.begin(), eog.end(), before[boundary - 1]) == eog.end()) {
+            --boundary;
+        }
+        if (!boundary || boundary >= after.size() ||
+                !std::equal(before.begin(), before.begin() + boundary, after.begin())) {
+            throw std::runtime_error("chat template cannot append tool results without replacing existing tokens");
+        }
+        // The raw tape already ends in EOG; include the template's following newline in the suffix.
+        return {after.begin() + boundary, after.end()};
     }
 
     std::vector<llama_token> initial_prompt(const std::string & text) override {
