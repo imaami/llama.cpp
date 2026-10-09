@@ -13891,6 +13891,7 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
 
             // Only the dense PTQ mat-vec route handles several columns of fused residuals.
             if (a->type != GGML_TYPE_PTQ1_0 || b->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+                ggml_get_op_params_i32(mul, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
                 mul->ne[1] > mul_mat_vec_max_cols || mul->ne[2] != 1 || mul->ne[3] != 1 ||
                 a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1 ||
                 !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(mul) ||
