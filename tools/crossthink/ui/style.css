@@ -25,6 +25,7 @@
     .mode[data-mode="thinking"] .status-dot { background: #c3dfaa; }
     .mode[data-mode="answering"] .status-dot { background: #8dbbff; }
     .mode[data-mode="error"] .status-dot { background: #ff9992; }
+    .mode[data-mode="incomplete"] .status-dot { background: #e7b77d; }
     .notice { padding: 10px 12px; border: 1px solid #67523b; border-radius: 6px; background: #2b231c; color: #f5d3a8; margin: 10px 0; font-size: 13px; }
     .notice.error { background: #301f23; border-color: #775059; color: #ffc0c0; }
     [hidden] { display: none !important; }
@@ -85,6 +86,7 @@ select { padding: 7px 12px; border: 1px solid #4d596c; border-radius: 6px; backg
 .metrics .speed { color: #c3dfaa; }
 .stats { font-size: 10px; }
 .stats .peer-phase { flex-basis: 100%; color: #c3dfaa; font-size: 12px; }
+.stats .peer-phase[data-phase="empty_response"] { color: #e7b77d; }
 .panel-actions { display: flex; gap: 10px; align-items: center; }
 .copy-all { border: 0; background: transparent; color: #9aa9c0; font-size: 11px; padding: 0; }
 .copy-all:hover:not(:disabled) { background: transparent; color: #e7e9ef; }

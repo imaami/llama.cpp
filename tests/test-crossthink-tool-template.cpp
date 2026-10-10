@@ -135,6 +135,77 @@ static void test_thought_prompt() {
     std::puts("reasoning-only thought prompt: passed");
 }
 
+static void test_native_answers() {
+    std::ifstream file("models/templates/Qwen3.5-4B.jinja");
+    check(file.good(), "could not open answer chat template");
+    server_chat_params options{};
+    options.tmpls = common_chat_templates_init(nullptr,
+        std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>()));
+    options.use_jinja = true;
+    options.enable_thinking = true;
+    options.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"calculator",
+        "description":"Evaluate an expression","parameters":{"type":"object",
+        "properties":{"expression":{"type":"string"}},"required":["expression"]}}}])");
+    for (const bool with_tools : {false, true}) {
+        for (const std::string & content : {
+                std::string("The answer is **42**."),
+                std::string("<ct:send>My plan</ct:send>"),
+                std::string("<ct:inbox/>"),
+                std::string("```xml\n<ct:peek/>\n```"),
+                std::string()}) {
+            json body = {
+                {"messages", json::array({{{"role", "user"}, {"content", "Work together."}}})},
+                {"tools", with_tools ? tools : json::array()}, {"add_generation_prompt", true},
+                {"chat_template_kwargs", {{"enable_thinking", true}}},
+            };
+            std::vector<raw_buffer> files;
+            common_chat_session session;
+            oaicompat_chat_params_parse(nullptr, body, options, files, session);
+            const auto message = session.finish(common_chat_input("</think>\n\n" + content));
+            check(message.content == content, "native answer content was lost or changed");
+            check(message.tool_calls.empty(), "native answer text executed as a tool call");
+            check(message.reasoning_content.empty(), "native answer leaked into reasoning");
+        }
+    }
+    json body = {
+        {"messages", json::array({{{"role", "user"}, {"content", "Work together."}}})},
+        {"tools", tools}, {"add_generation_prompt", true},
+        {"chat_template_kwargs", {{"enable_thinking", true}}},
+    };
+    const std::string unknown_call = "<tool_call>\n<function=ct:send>\n<parameter=message>\n"
+        "My plan\n</parameter>\n</function>\n</tool_call>";
+    const std::string valid_call = "<tool_call>\n<function=calculator>\n<parameter=expression>\n"
+        "1 + 1\n</parameter>\n</function>\n</tool_call>";
+    for (const std::string & output : {
+            unknown_call,
+            std::string("My plan is ready.\n") + unknown_call,
+            valid_call + '\n' + unknown_call,
+            std::string("<tool_call>\n<function=calculator>\n</function>\n</tool_call>"),
+            std::string("<tool_call>\n{\"name\":\"ct:send\",\"arguments\":{\"message\":\"hello\"}}\n</tool_call>")}) {
+        std::vector<raw_buffer> files;
+        common_chat_session session;
+        oaicompat_chat_params_parse(nullptr, body, options, files, session);
+        bool rejected = false;
+        try { session.finish(common_chat_input("</think>\n\n" + output)); }
+        catch (const std::runtime_error &) { rejected = true; }
+        check(rejected, "malformed native tool call was silently discarded");
+    }
+    // Requiring full consumption must not reject an unfinished streaming call.
+    std::vector<raw_buffer> files;
+    common_chat_session streaming;
+    oaicompat_chat_params_parse(nullptr, body, options, files, streaming);
+    for (const char byte : "</think>\n\n" + valid_call) {
+        streaming.feed(common_chat_input(std::string(1, byte)));
+    }
+    const auto message = streaming.finish(common_chat_input());
+    check(message.tool_calls.size() == 1 && message.tool_calls.front().name == "calculator",
+        "streaming native tool call failed after strict final parsing");
+    check(json::parse(message.tool_calls.front().arguments).at("expression") == "1 + 1",
+        "streaming native tool arguments changed");
+    std::puts("native answers with and without tools: passed");
+}
+
 int main() {
     try {
         test_template("models/templates/Qwen3.5-4B.jinja",
@@ -146,6 +217,7 @@ int main() {
         test_template("models/templates/Qwen-QwQ-32B.jinja",
             "</think>\n\n<tool_call>\n{\"name\":\"calculator\",\"arguments\":{\"expression\":\"1 + 1\"}}\n</tool_call>");
         test_thought_prompt();
+        test_native_answers();
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "tool template test: %s\n", error.what());

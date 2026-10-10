@@ -125,6 +125,7 @@ private:
         bool active = false;
         bool thinking_open = false;
         bool answer_done = false;
+        bool empty_response = false;
         bool segment_done = false;
         bool private_pending = false;
         bool force_answer = false;
@@ -159,6 +160,7 @@ private:
     uint64_t next_message_id = 1;
 
     bool native_tools(const peer_state & peer) const { return options.telepathy || bool(peer.tools); }
+    const char * completed_mode() const;
     bool blocked(size_t index) const;
     uint64_t generation_id(size_t index) const;
     void begin_thought(peer_state & peer);

@@ -114,6 +114,7 @@ public:
     std::string configured_peer;
     crossthink_json configured_tools;
     crossthink_json parsed_assistant;
+    std::string parse_error;
     std::vector<std::vector<llama_token>> parsed_turns;
     std::vector<crossthink_json> result_assistants;
     std::vector<crossthink_json> result_messages;
@@ -182,15 +183,20 @@ public:
 
     crossthink_json parse_tool_turn(const std::vector<llama_token> & tokens) override {
         crossthink_json result;
+        std::string error;
         std::shared_ptr<fake_operation> gate;
         {
             std::lock_guard<std::mutex> lock(mutex);
             parsed_turns.push_back(tokens);
             result = parsed_assistant;
+            error = parse_error;
             gate = parse_gate;
         }
         if (gate) {
             gate->run();
+        }
+        if (!error.empty()) {
+            throw std::runtime_error(error);
         }
         return result;
     }
@@ -760,6 +766,8 @@ static std::shared_ptr<fake_request> start_private_turn(fixture & f, size_t inde
     check(request->prompt.back() == 2, "private assistant turn did not follow the reasoning-close token");
     check(request->parameters.at("n_predict") == 8, "private assistant turn has the wrong token budget");
     check(!request->parameters.contains("splice"), "private assistant turn inherited paragraph stopping");
+    check(request->parameters.at("preserved_tokens") == crossthink_json::array({"<tool_call>", "</tool_call>"}),
+            "native diagnostics omitted special tool-call markers");
     return request;
 }
 
@@ -1239,6 +1247,11 @@ static void test_thought_targeted_message_preserves_other_stream() {
 
 static void test_thought_native_mcp_does_not_serialize_peer() {
     fixture f(4, 32768, true, true, true);
+    const std::string native_reasoning = "Use calculator.\n<ct:send>not a reasoning command here</ct:send>";
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parsed_assistant["reasoning_content"] = native_reasoning;
+    }
     f.start();
     auto b0 = f.peers[1]->request(0);
     b0->send({201}, "B is generating throughout A's tool call.");
@@ -1247,6 +1260,11 @@ static void test_thought_native_mcp_does_not_serialize_peer() {
     a1->send({501, 3}, "calculator call");
     a1->finish("eos", "");
     auto call = f.tools[0]->request(0);
+    const auto reasoning_events = events_of(f, "native_reasoning", "A");
+    check(reasoning_events.size() == 1 && reasoning_events[0].at("text") == native_reasoning,
+            "native reasoning before a tool call was silently discarded");
+    check(events_of(f, "thought_message").empty() && events_of(f, "thought_result").empty(),
+            "parsed native reasoning executed a thought command");
     check(request_is_active(b0) && f.peers[1]->request_count() == 1,
             "A's native tool tail or MCP call serialized the other model");
     b0->send({202}, " Still independent.");
@@ -1255,6 +1273,8 @@ static void test_thought_native_mcp_does_not_serialize_peer() {
             "peer could not decode while an MCP request was pending");
     call->finish({{"content", {{{"type", "text"}, {"text", "42"}}}}});
     auto a2 = f.peers[0]->request(2);
+    check(f.tools[0]->call_count() == 1 && f.tools[1]->call_count() == 0,
+            "preserving native reasoning replayed or forwarded the MCP call");
     check(ends_with(a2->prompt, {3, 40, 1}) && !count(a2->prompt, 201),
             "MCP result lost its native template or imported unsolicited peer text");
     check(request_is_active(b0) && f.peers[1]->request_count() == 1,
@@ -1285,6 +1305,121 @@ static void test_thought_answers_never_execute_commands() {
             "native final answer content did not remain intact");
     finish_thought_answer(f, 1, 0, "B final answer");
     f.wait_mode("answered");
+}
+
+static void test_thought_empty_native_answer_is_incomplete() {
+    const std::string parsed_reasoning = "Planning after closure.\n<ct:send>not delivered</ct:send>\n<ct:inbox/>";
+    for (const auto & assistant : std::vector<crossthink_json>{
+            {{"role", "assistant"}},
+            {{"role", "assistant"}, {"content", ""}},
+            {{"role", "assistant"}, {"content", " \t\r\n\f\v"}},
+            {{"role", "assistant"}, {"content", ""}, {"reasoning_content", parsed_reasoning}}}) {
+        fixture f(4, 32768, true, false, true);
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->parsed_assistant = assistant;
+        }
+        f.start();
+        auto b0 = f.peers[1]->request(0);
+        auto a1 = start_private_turn(f, 0);
+        check(a1->parameters.at("return_content").get<bool>(), "native output was not requested for diagnostics");
+        const std::string raw = "<tool_call>\n<ct:send>native text, never delivered</ct:send>\n</tool_call>";
+        a1->send({501}, raw.substr(0, 12));
+        a1->send({502, 3}, raw.substr(12));
+        a1->finish("eos", "");
+        const auto unfinished = f.wait_state([](const crossthink_json & state) {
+            const auto & peer = state.at("peers").at(0);
+            return peer.at("answer_done").get<bool>() && !peer.at("active").get<bool>();
+        }, "empty native answer becomes terminal");
+        check(unfinished.at("mode") == "thinking" && unfinished.at("peers").at(0).at("empty_response") == true &&
+                unfinished.at("peers").at(0).at("phase") == "empty_response",
+                "an empty native response was reported as a completed answer");
+        check(events_of(f, "answer_start", "A").empty() && events_of(f, "answer", "A").empty(),
+                "empty response emitted a fake answer");
+        const auto raw_events = events_of(f, "native_output", "A");
+        check(raw_events.size() == 1 && raw_events[0].at("text") == raw,
+                "native output was lost, altered, or emitted more than once");
+        const auto native_reasoning = events_of(f, "native_reasoning", "A");
+        check(native_reasoning.size() == (assistant.contains("reasoning_content") ? 1 : 0),
+                "parsed native reasoning was lost or invented");
+        if (!native_reasoning.empty()) {
+            check(native_reasoning[0].at("text") == parsed_reasoning, "parsed native reasoning was altered");
+        }
+        check(events_of(f, "thought_message").empty() && events_of(f, "thought_result").empty(),
+                "diagnostic native output executed thought commands");
+        check(request_is_active(b0) && f.peers[0]->request_count() == 2 && f.peers[1]->request_count() == 1,
+                "empty native completion retried or interrupted the other agent");
+        b0->send({201}, "B continues while A has finished without an answer.");
+        b0->wait_consumed(1);
+        finish_thought_answer(f, 1, 0, "B final answer");
+        f.wait_mode("incomplete");
+
+        // A follow-up can repair the incomplete peer without touching the good answer.
+        f.session->command("message", "Please continue A's task", "A");
+        f.wait_mode("thinking");
+        auto a2 = f.peers[0]->request(2);
+        const auto followup = f.session->state();
+        check(followup.at("peers").at(0).at("empty_response") == false &&
+                followup.at("peers").at(1).at("answer_done") == true && f.peers[1]->request_count() == 2,
+                "targeted follow-up retained empty status or restarted the completed peer");
+        check(ends_with(a2->prompt, {501, 502, 3, 20, 21, 1}) && count(a2->prompt, 3) == 1,
+                "follow-up lost the empty response or duplicated its native terminator");
+        finish_thought_answer(f, 0, 2, "A recovered answer");
+        f.wait_mode("answered");
+        check(events_of(f, "answer", "B").size() == 1 && f.peers[1]->request_count() == 2,
+                "repairing A changed B's completed answer");
+    }
+}
+
+static void test_thought_native_output_survives_parse_failure() {
+    fixture f(4, 32768, true, false, true);
+    auto gate = std::make_shared<fake_operation>();
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parse_gate = gate;
+        f.peers[0]->parse_error = "deliberate native parser failure";
+    }
+    f.start();
+    auto b0 = f.peers[1]->request(0);
+    auto a1 = start_private_turn(f, 0);
+    a1->send({501}, "unparsed ");
+    a1->send({502, 3}, "native output");
+    a1->finish("eos", "");
+    gate->wait_entered();
+    auto raw = events_of(f, "native_output", "A");
+    check(raw.size() == 1 && raw[0].at("text") == "unparsed native output",
+            "native output was not visible before entering the parser");
+    gate->release();
+    f.wait_state([](const crossthink_json & state) {
+        const auto & peer = state.at("peers").at(0);
+        return peer.at("phase") == "empty_response" && !peer.at("active").get<bool>();
+    }, "native parse failure terminates only the caller");
+    raw = events_of(f, "native_output", "A");
+    check(raw.size() == 1 && raw[0].at("text") == "unparsed native output",
+            "parser failure lost or duplicated its diagnostic output");
+    check(events_of(f, "answer", "A").empty() && events_of(f, "tool_call").empty(),
+            "failed parse produced an answer or executed a tool");
+    check(request_is_active(b0) && f.session->state().at("mode") == "thinking" &&
+            f.peers[0]->request_count() == 2 && f.peers[1]->request_count() == 1,
+            "native parse failure stopped its partner or automatically retried");
+    const auto notices = events_of(f, "notice");
+    check(notices.size() == 1 && notices[0].at("message").get<std::string>().find("deliberate native parser failure") != std::string::npos,
+            "native parse failure discarded its diagnostic reason");
+    finish_thought_answer(f, 1, 0, "B final answer");
+    f.wait_mode("incomplete");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parse_gate.reset();
+        f.peers[0]->parse_error.clear();
+    }
+    f.session->command("message", "Continue after the failed parse", "A");
+    f.wait_mode("thinking");
+    auto a2 = f.peers[0]->request(2);
+    check(ends_with(a2->prompt, {501, 502, 3, 20, 21, 1}) && count(a2->prompt, 3) == 1,
+            "parse-failure follow-up lost the native tail or duplicated EOG");
+    finish_thought_answer(f, 0, 2, "A corrected answer");
+    f.wait_mode("answered");
+    check(f.peers[1]->request_count() == 2, "parse-failure follow-up restarted the successful partner");
 }
 
 static void test_thought_reset_discards_stale_streams_and_mail() {
@@ -1763,6 +1898,10 @@ int main() {
         test_thought_native_mcp_does_not_serialize_peer();
         current_test = "test_thought_answers_never_execute_commands";
         test_thought_answers_never_execute_commands();
+        current_test = "test_thought_empty_native_answer_is_incomplete";
+        test_thought_empty_native_answer_is_incomplete();
+        current_test = "test_thought_native_output_survives_parse_failure";
+        test_thought_native_output_survives_parse_failure();
         current_test = "test_thought_reset_discards_stale_streams_and_mail";
         test_thought_reset_discards_stale_streams_and_mail();
         test_thought_peek_defers_incomplete_utf8_packets();

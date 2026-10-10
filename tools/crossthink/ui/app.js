@@ -26,11 +26,12 @@ function follow(element, checkbox) {
     if (checkbox.checked) element.scrollTop = element.scrollHeight;
 }
 
-function initOutput(key, followId, clippedId = null) {
+function initOutput(key, followId, clippedId = null, render = text => text) {
     const element = byId(key);
     const checkbox = byId(followId);
     const output = { element, raw: '', segments: [], current: null, nextLabel: null,
-        follow: checkbox, clipped: clippedId ? byId(clippedId) : null };
+        follow: checkbox, clipped: clippedId ? byId(clippedId) : null,
+        render, empty: element.dataset.empty };
     outputs[key] = output;
     // Scroll/layout changes NEVER change this explicit preference.
     checkbox.addEventListener('change', () => follow(element, checkbox));
@@ -40,6 +41,8 @@ for (const peer of peers) {
     initOutput('thought-' + peer, 'follow-' + peer, 'clipped-' + peer);
     initOutput('answer-' + peer, 'follow-answer-' + peer);
     initOutput('tools-' + peer, 'follow-tools-' + peer, 'tools-clipped-' + peer);
+    initOutput('native-' + peer, 'follow-native-' + peer, 'native-clipped-' + peer,
+        text => fence(text, 'text'));
 }
 byId('follow-messages').addEventListener('change', () => follow(byId('thread'), byId('follow-messages')));
 
@@ -52,6 +55,7 @@ function clearOutput(key) {
     output.nextLabel = null;
     output.element.replaceChildren();
     output.element.classList.add('empty');
+    output.element.dataset.empty = output.empty;
     if (output.clipped) output.clipped.hidden = true;
 }
 
@@ -61,10 +65,11 @@ function outputBoundary(key, label = null) {
     output.nextLabel = output.raw ? label : null;
 }
 
-function appendOutput(key, text, isolated = false) {
+function appendOutput(key, text, isolated = false, label = null) {
     const output = outputs[key];
-    if (!output || typeof text !== 'string' || !text) return;
+    if (!output || typeof text !== 'string' || (!text && !label)) return;
     if (isolated) output.current = null;
+    if (label) output.nextLabel = label;
     if (!output.current) {
         const element = document.createElement('section');
         element.className = 'output-segment' + (isolated ? ' isolated-output' : '');
@@ -100,14 +105,14 @@ function appendOutput(key, text, isolated = false) {
             first.raw = first.raw.slice(excess);
             removed += excess;
             excess = 0;
-            first.renderer.update(first.raw);
+            first.renderer.update(output.render(first.raw));
         }
     }
     if (removed) {
         output.raw = output.raw.slice(removed);
         if (output.clipped) output.clipped.hidden = false;
     }
-    output.current.renderer.update(output.current.raw);
+    output.current.renderer.update(output.render(output.current.raw));
     // Each received result is a separate Markdown document. Neither side of
     // an import may inherit an unfinished code fence from the other.
     if (isolated) output.current = null;
@@ -128,6 +133,7 @@ const number = value => Number.isFinite(value) ? value.toLocaleString() : '0';
 const rate = value => Number.isFinite(value) ? value.toFixed(1) : '0.0';
 const phaseLabels = {
     idle: 'Idle', ready: 'Ready', paused: 'Paused', done: 'Finished', error: 'Error', answer: 'Answering',
+    empty_response: 'Finished without an answer',
     waiting_reasoning: 'Waiting for server (reasoning)', reasoning: 'Thinking',
     waiting_native: 'Waiting for server (answer/tool call)',
     native_output: 'Generating answer/tool call (buffered)', parsing_native: 'Parsing answer/tool call',
@@ -137,7 +143,8 @@ function applyState(next) {
     if (!next || typeof next !== 'object') return;
     state = next;
     byId('mode').dataset.mode = state.mode;
-    byId('mode-text').textContent = (state.mode || 'Unknown') + (state.busy ? ' / applying request' : '');
+    byId('mode-text').textContent = (state.mode === 'incomplete' ? 'Incomplete' : state.mode || 'Unknown') +
+        (state.busy ? ' / applying request' : '');
     const legacy = state.telepathy === false;
     for (const option of byId('target').options) option.disabled = legacy && option.value !== 'both';
     if (legacy) byId('target').value = 'both';
@@ -153,11 +160,15 @@ function applyState(next) {
         byId('speed-' + peer.name).textContent = rate(peer.tokens_per_second);
         byId('tool-status-' + peer.name).textContent = number(peer.tool_calls || 0) + ' calls' +
             (peer.tool_status ? ' / ' + peer.tool_status : '');
+        const answer = outputs['answer-' + peer.name];
+        answer.element.dataset.empty = peer.phase === 'empty_response' ?
+            'This model finished without producing an answer. Inspect Native response below.' : answer.empty;
         const stats = byId('stats-' + peer.name);
         stats.replaceChildren();
         if (peer.phase) {
             const phase = document.createElement('span');
             phase.className = 'peer-phase';
+            phase.dataset.phase = peer.phase;
             phase.textContent = phaseLabels[peer.phase] || peer.phase;
             stats.append(phase);
         }
@@ -304,6 +315,17 @@ function handleEvent(event) {
             break;
         case 'thought_result':
             if (peer) appendOutput('thought-' + peer, record.text, true);
+            break;
+        case 'native_output':
+            if (peer) {
+                appendOutput('native-' + peer, record.text, true,
+                    record.text ? 'Native response' : 'Empty native response');
+            }
+            break;
+        case 'native_reasoning':
+            if (peer && record.text) {
+                appendOutput('thought-' + peer, record.text, true, 'Reasoning returned by native parser');
+            }
             break;
         case 'thought_message': showThought(record); break;
         // thought_capture is metadata; thought_result already has its verbatim

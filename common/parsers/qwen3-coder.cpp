@@ -175,8 +175,10 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
 
+            // An optional call may match nothing when a generated call is malformed or names an
+            // unknown tool. Do not silently discard the remaining output in a successful parse.
             return generation_prompt +
-                   (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
+                   (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls) + p.end();
         }
 
         // Content only parser

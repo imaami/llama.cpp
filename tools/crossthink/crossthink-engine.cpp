@@ -16,6 +16,10 @@ static const char * peer_name(size_t index) {
     return index ? "B" : "A";
 }
 
+const char * crossthink_session::completed_mode() const {
+    return peers[0].empty_response || peers[1].empty_response ? "incomplete" : "answered";
+}
+
 crossthink_session::crossthink_session(
         std::array<std::unique_ptr<crossthink_transport>, 2> transports,
         const crossthink_options & opts,
@@ -152,7 +156,8 @@ json crossthink_session::state_locked() const {
         total_thinking += peer.thinking_tokens;
         total_rate += rate;
         total_thinking_rate += thinking_rate;
-        const std::string phase = mode == "error" ? "error" : peer.answer_done ? "done" :
+        const std::string phase = mode == "error" ? "error" : peer.answer_done ?
+            (peer.empty_response ? "empty_response" : "done") :
             peer.active ? peer.phase : peer.tape.empty() ? "idle" : mode == "paused" ? "paused" : "ready";
         const auto elapsed = [&](std::chrono::steady_clock::time_point started) -> json {
             return started == std::chrono::steady_clock::time_point{} ? json(nullptr) :
@@ -165,6 +170,7 @@ json crossthink_session::state_locked() const {
             {"context_size", peer.context_size}, {"active", peer.active},
             {"waiting", peer.segment_done}, {"boundary", peer.boundary}, {"forced_splices", peer.forced_splices},
             {"tool_calls", peer.tool_calls}, {"tool_status", peer.tool_status}, {"answer_done", peer.answer_done},
+            {"empty_response", peer.empty_response},
             {"mailbox", peer.mailbox.size()}, {"thought_turn", peer.thought_turn},
             {"phase", phase}, {"request_generated", peer.request_generated},
             {"request_elapsed_seconds", elapsed(peer.request_started)}, {"last_token_age_seconds", elapsed(peer.last_token)},
@@ -426,11 +432,20 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
     const json parameters = {
         {"n_predict", budget}, {"temperature", options.temperature},
         {"seed", (uint64_t(options.seed) + index + 2 * (peer.sequence++ % UINT32_MAX)) % UINT32_MAX},
-        {"stream", true}, {"return_content", false}, {"cache_prompt", true},
+        {"stream", true}, {"return_content", true}, {"cache_prompt", true},
         {"reasoning_budget_tokens", -1}, {"logit_bias", bias}, {"stop", json::array()},
+        {"preserved_tokens", json::array({"<tool_call>", "</tool_call>"})},
     };
     const auto prompt = peer.tape;
     std::vector<llama_token> output{peer.close_token};
+    std::string raw_output;
+    bool raw_emitted = false;
+    const auto emit_raw_output = [&] {
+        if (!raw_emitted) {
+            emit({{"type", "native_output"}, {"peer", peer_name(index)}, {"text", raw_output}});
+            raw_emitted = true;
+        }
+    };
     peer.tool_status = "generating tool call or answer";
     begin_request(peer, "waiting_native");
     emit_state();
@@ -452,6 +467,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
             }
             output.insert(output.end(), packet.tokens.begin(), packet.tokens.end());
             peer.tape.insert(peer.tape.end(), packet.tokens.begin(), packet.tokens.end());
+            raw_output += json::parse(packet.metadata).value("content", std::string());
             peer.phase = "native_output";
             count_tokens(peer, packet.tokens.size(), 0);
             return true;
@@ -460,6 +476,9 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         if (stopping || generation_id(index) != generation_epoch || mode == "error") {
             return false;
         }
+        // Preserve the generated tail even if validation or native parsing fails.
+        // It is diagnostic output, never input to the reasoning-command scanner.
+        emit_raw_output();
         if (!result.is_object() || result.value("type", std::string()) != "done" ||
                 result.value("truncated", false) || result.value("stop_type", std::string()) != "eos" ||
                 output.size() < 2 || !contains(peer.eog, output.back())) {
@@ -467,8 +486,14 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         }
         peer.phase = "parsing_native";
         lock.unlock();
-        auto assistant = peer.transport->parse_tool_turn(output);
-        const auto calls = assistant.value("tool_calls", json::array());
+        json assistant;
+        std::string parse_error;
+        try {
+            assistant = peer.transport->parse_tool_turn(output);
+        } catch (const std::exception & exception) {
+            parse_error = exception.what();
+        }
+        const auto calls = parse_error.empty() ? assistant.value("tool_calls", json::array()) : json::array();
         if (!calls.is_array() || calls.size() > 32) {
             throw std::runtime_error("invalid number of tool calls in assistant turn");
         }
@@ -476,17 +501,29 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         if (stopping || generation_id(index) != generation_epoch || mode == "error") {
             return false;
         }
+        const auto reasoning = parse_error.empty() ? assistant.value("reasoning_content", std::string()) : std::string();
+        if (!reasoning.empty()) {
+            emit({{"type", "native_reasoning"}, {"peer", peer_name(index)}, {"text", reasoning}});
+        }
         if (calls.empty()) {
+            const auto content = parse_error.empty() ? assistant.value("content", std::string()) : std::string();
             peer.tape.pop_back(); // next_user() supplies the assistant terminator.
             peer.answer_done = true;
+            peer.empty_response = content.find_first_not_of(" \t\r\n\f\v") == std::string::npos;
             peer.segment_done = false;
             peer.tool_status.clear();
             peer.inbox.clear();
             if (!options.telepathy) { other.inbox.clear(); }
-            emit({{"type", "answer_start"}, {"peer", peer_name(index)}});
-            emit({{"type", "answer"}, {"peer", peer_name(index)}, {"text", assistant.value("content", std::string())}});
+            if (peer.empty_response) {
+                emit({{"type", "notice"}, {"message", std::string(peer_name(index)) + (parse_error.empty()
+                    ? ": generation ended without an answer or a native tool call; inspect its native output"
+                    : ": could not parse native output: " + parse_error + "; inspect its native output")}});
+            } else {
+                emit({{"type", "answer_start"}, {"peer", peer_name(index)}});
+                emit({{"type", "answer"}, {"peer", peer_name(index)}, {"text", content}});
+            }
             if (!blocked(index)) {
-                mode = (other.answer_done || other.tape.empty()) ? "answered" :
+                mode = (other.answer_done || other.tape.empty()) ? completed_mode() :
                     (options.telepathy && !other.force_answer ? "thinking" : "answering");
             }
             changed.notify_all();
@@ -575,6 +612,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         if (!lock.owns_lock()) { lock.lock(); }
         peer.tool_status.clear();
         if (stopping || generation_id(index) != generation_epoch || mode == "error") { return false; }
+        emit_raw_output();
         throw;
     }
 }
@@ -946,7 +984,7 @@ void crossthink_session::worker(size_t index) {
             } else if (answer) {
                 peer.answer_done = true;
                 if (other.answer_done && !busy) {
-                    mode = "answered";
+                    mode = completed_mode();
                 }
                 if (result.value("stop_type", std::string()) == "limit") {
                     emit({{"type", "notice"}, {"message", std::string(peer_name(index)) + ": answer reached its token budget"}});
@@ -1021,6 +1059,7 @@ void crossthink_session::apply(const pending_command & command) {
             peer.sequence = 0;
             peer.thinking_open = false;
             peer.answer_done = false;
+            peer.empty_response = false;
             peer.segment_done = false;
             peer.private_pending = false;
             peer.force_answer = false;
@@ -1065,6 +1104,7 @@ void crossthink_session::apply(const pending_command & command) {
             peer.tape.insert(peer.tape.end(), prepared[index].begin(), prepared[index].end());
             peer.thinking_open = true;
             peer.answer_done = false;
+            peer.empty_response = false;
             peer.segment_done = false;
             peer.tool_rounds = 0;
             peer.private_pending = false;
@@ -1090,12 +1130,12 @@ void crossthink_session::apply(const pending_command & command) {
             peer.thought_scanner = {};
             peer.segment_done = false;
         }
-        mode = (peers[0].answer_done || peers[0].tape.empty()) && (peers[1].answer_done || peers[1].tape.empty()) ? "answered" : "answering";
+        mode = (peers[0].answer_done || peers[0].tape.empty()) && (peers[1].answer_done || peers[1].tape.empty()) ? completed_mode() : "answering";
     } else if (command.action == "resume") {
         rendezvous();
         mode = (options.telepathy ? answer_requested : peers[0].answer_done || peers[1].answer_done) ? "answering" : "thinking";
     } else if (command.action == "pause" &&
             (peers[0].answer_done || peers[0].tape.empty()) && (peers[1].answer_done || peers[1].tape.empty())) {
-        mode = "answered";
+        mode = completed_mode();
     }
 }

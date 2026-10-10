@@ -823,6 +823,35 @@ static void test_tool_routes(const char * model, bool mtp) {
         const auto ended = fixture.call(routes.post_apply_template, body.dump());
         check(ended.first == 200 && json::parse(ended.second).at("message") == message, "parser did not trim final EOG");
     }
+    const auto native_tools = body["tools"];
+    for (const bool with_tools : {false, true}) {
+        body["tools"] = with_tools ? native_tools : json::array();
+        for (const std::string & content : {std::string("Answer **42**."),
+                std::string("<ct:send>My plan</ct:send>"), std::string("<ct:inbox/>")}) {
+            // Model output uses the byte tokens directly. Tokenizing this fixture's text instead
+            // escapes each space to literal SentencePiece U+2581 bytes, changing the test answer.
+            auto answer_tokens = close;
+            for (const unsigned char byte : "\n\n" + content) { answer_tokens.push_back(3 + byte); }
+            answer_tokens.push_back(eog.front());
+            body["parse_output"] = answer_tokens;
+            const auto answer = fixture.call(routes.post_apply_template, body.dump());
+            check(answer.first == 200, "native answer parser route failed");
+            const auto decoded = json::parse(answer.second).at("message");
+            check(decoded.at("content") == content && decoded.value("tool_calls", json::array()).empty(),
+                "native answer text was lost or treated as a thought/native tool command: expected " +
+                    json(content).dump() + ", got " + decoded.dump());
+        }
+    }
+    body["tools"] = native_tools;
+    for (const std::string & prefix : {std::string(), std::string("My plan is ready.\n")}) {
+        body["parse_output"] = tokenize("</think>\n\n" + prefix +
+            "<tool_call>\n<function=ct:send>\n<parameter=message>\nMy plan\n</parameter>\n</function>\n</tool_call>");
+        body["parse_output"].push_back(eog.front());
+        bool rejected = false;
+        try { rejected = fixture.call(routes.post_apply_template, body.dump()).first != 200; }
+        catch (const std::runtime_error &) { rejected = true; }
+        check(rejected, "native parser route silently discarded an unknown tool call");
+    }
     for (const json & invalid : std::vector<json>{
             "invalid", json::array({-1}), json::array({263}), json::array({1.5}),
             json::array({UINT64_MAX}), json::array({2, 3}), json(llama_tokens(513, 3))}) {

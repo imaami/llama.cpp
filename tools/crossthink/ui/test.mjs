@@ -76,7 +76,7 @@ try {
     assert.equal(await page.locator('#thread .from-A .bubble-state').textContent(), 'Received');
     emit({ type: 'tool_call', peer: 'A', name: 'compiler', call_id: 'test', arguments: '{"code":"int main() {}"}' });
     emit({ type: 'tool_result', peer: 'A', name: 'compiler', call_id: 'test', result: { content: [{ type: 'text', text: '**Success**: $a=b$\n\n~~~text\nexit 0\n~~~' }] } });
-    await page.locator('.peer-a details').evaluate(node => { node.open = true; });
+    await page.locator('.peer-a .tools-wrap:not(.native-wrap)').evaluate(node => { node.open = true; });
     await page.waitForSelector('#tools-A .katex');
     emit({ type: 'answer', peer: 'A', text: '**Answer:** $42$\n\n~~~js\nconsole.log(42);\n~~~' });
     emit({ type: 'answer', peer: 'B', text: '## Done\n\nThe result is **42**.' });
@@ -179,6 +179,47 @@ try {
     assert.equal(await page.locator('#thought-A .output-segment:last-child pre').count(), 0);
     assert.equal(await page.evaluate(() => window.otherTurn === document.querySelector('#thought-B .output-segment')), true);
     assert.equal(await page.locator('#thought-B .output-boundary').count(), 0);
+
+    // A completed native turn may contain reasoning but no user-facing answer.
+    const nativeReasoning = '**Parsed reasoning** mentions <ct:inbox/>.\n\n```cpp\nint unfinished =';
+    const nativeRaw = '<think>\n' + nativeReasoning + '\n</think>\n<ct:send>not executed</ct:send>';
+    const nativeRawNext = '```xml\n<ct:peek/>';
+    const postsBeforeNative = posts.length;
+    emit({ type: 'native_output', peer: 'A', text: nativeRaw });
+    emit({ type: 'native_reasoning', peer: 'A', text: nativeReasoning });
+    emit({ type: 'native_output', peer: 'A', text: nativeRawNext });
+    emit({ type: 'native_reasoning', peer: 'A', text: '**Separate native reasoning** with <ct:peek/>.' });
+    emit({ type: 'native_output', peer: 'B', text: '' });
+    emit({ type: 'answer', peer: 'B', text: '**Normal answer** remains visible.' });
+    state.mode = 'incomplete';
+    state.peers[0].phase = 'empty_response';
+    state.peers[1].phase = 'done';
+    emit({ type: 'state', state });
+    await page.waitForFunction(() => document.getElementById('mode-text').textContent === 'Incomplete');
+    assert.equal(await page.locator('#stats-A .peer-phase').textContent(), 'Finished without an answer');
+    assert.equal(await page.locator('#answer-A').getAttribute('data-empty'),
+        'This model finished without producing an answer. Inspect Native response below.');
+    assert.equal(await page.locator('#answer-A .output-segment').count(), 0);
+    assert.equal(await page.locator('#answer-B strong').textContent(), 'Normal answer');
+    assert.equal(await page.locator('#tool-status-A').textContent(), '0 calls');
+    assert.equal(await page.locator('#thread .bubble').count(), 0);
+    assert.equal(posts.length, postsBeforeNative, 'displaying native tags must never execute commands');
+    assert.equal(await page.locator('.peer-a .native-wrap').getAttribute('open'), null);
+    await page.locator('.peer-a .native-wrap').evaluate(node => { node.open = true; });
+    await page.waitForFunction(() => document.querySelectorAll('#native-A pre').length === 2);
+    assert.equal(await page.locator('#native-A .output-segment').count(), 2);
+    assert.equal(await page.locator('#native-A pre').first().textContent(), nativeRaw + '\n');
+    assert.equal(await page.locator('#native-A pre').last().textContent(), nativeRawNext + '\n');
+    await page.locator('[data-copy="native-A"]').click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), nativeRaw + nativeRawNext,
+        'Native Copy raw preserves tags and unfinished fences without synthesized delimiters');
+    await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child strong')?.textContent === 'Separate native reasoning');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child .output-boundary').textContent(),
+        'Reasoning returned by native parser');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child pre').count(), 0);
+    assert.equal(await page.locator('#thought-A .output-segment:last-child').textContent().then(text => text.includes('<ct:peek/>')), true);
+    assert.equal(await page.locator('#native-B .output-boundary').textContent(), 'Empty native response');
+
     await page.screenshot({ path: join(root, 'test-desktop.png'), fullPage: true });
     await page.setViewportSize({ width: 700, height: 950 });
     await page.screenshot({ path: join(root, 'test-mobile.png'), fullPage: true });
@@ -189,8 +230,19 @@ try {
     assert.equal(await page.locator('#thought-A .output-segment').count(), 1);
     await page.locator('[data-copy="thought-A"]').click();
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'x'.repeat(512 * 1024));
+    emit({ type: 'answer', peer: 'A', text: '**Recovered answer.**' });
+    state.mode = 'answered';
+    state.peers[0].phase = 'done';
+    emit({ type: 'state', state });
+    await page.waitForFunction(() => document.getElementById('mode-text').textContent === 'answered');
+    await page.waitForSelector('#answer-A strong');
+    assert.equal(await page.locator('#answer-A strong').textContent(), 'Recovered answer.');
+    assert.doesNotMatch(await page.locator('#answer-A').getAttribute('data-empty'), /without producing an answer/);
+    emit({ type: 'reset' });
+    await page.waitForFunction(() => !document.querySelector('#native-A .output-segment'));
+    assert.equal(await page.locator('#native-B .output-segment').count(), 0);
     assert.deepEqual(errors, []);
-    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics, turn/result isolation, verbatim copy, clipping.');
+    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics, turn/result isolation, native response diagnostics, verbatim copy, clipping.');
 } finally {
     await browser.close();
     for (const client of clients) client.end();
