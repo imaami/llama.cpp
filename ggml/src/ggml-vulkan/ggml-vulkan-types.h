@@ -552,6 +552,8 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 6, 0, 5 }, // top_k->src[0]   == add
 };
 
+static constexpr std::initializer_list<ggml_op> rms_norm_scale_pattern { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };

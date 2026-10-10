@@ -13964,7 +13964,7 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         const ggml_tensor * rms = cgraph->nodes[node_idx];
         const ggml_tensor * dst = cgraph->nodes[node_idx + 1];
         const ggml_tensor * src = rms->src[0];
-        return ctx->device->pipeline_rms_norm_scale_f32[2] && !ctx->do_add_rms_partials &&
+        return ctx->device->pipeline_rms_norm_scale_f32[2] &&
             src->type == GGML_TYPE_F32 && rms->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
             dst->src[0] == rms && ggml_get_op_params_f32(dst, 1) == 0.0f &&
             ggml_is_contiguous_rows(src) && ggml_is_contiguous(rms) && ggml_is_contiguous(dst);
@@ -14923,7 +14923,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_VIEW_SET_ROWS;
                 fusion_string = "RMS_NORM_VIEW_SET_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
+            } else if (!ctx->do_add_rms_partials && ggml_vk_can_fuse(ctx, cgraph, i, rms_norm_scale_pattern)) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_rms_norm_mode = RMS_NORM_SCALE;
                 fusion_string = "RMS_NORM_SCALE";
@@ -15355,6 +15355,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
+        if (match_pattern(rms_norm_scale_pattern, first_unused) && ggml_vk_can_fuse(ctx, graph, first_unused, rms_norm_scale_pattern)) {
+            add_pattern_alloc_deps(rms_norm_scale_pattern, first_unused + 1);
+            keep_pattern(rms_norm_scale_pattern);
+            continue;
+        }
         if (keep_pattern(rms_norm_mul_add_mul_pattern)) {
             continue;
         }
@@ -15412,6 +15417,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 (match_pattern(fwht_signed_pattern, j) && ggml_vk_can_fuse_fwht_signed(ctx, graph, j)) ||
                 (match_pattern(fwht_swiglu_pattern, j) && ggml_vk_can_fuse_fwht_swiglu(ctx, graph, j)) ||
                 in_qsa_pattern(j) ||
+                (match_pattern(rms_norm_scale_pattern, j) && ggml_vk_can_fuse(ctx, graph, j, rms_norm_scale_pattern)) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||
                 match_pattern(rms_norm_mul_add_pattern, j) ||
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
