@@ -11598,6 +11598,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q1_0, GGML_TYPE_F32, 64, 128, 256, {2, 3}, {2, 1}));
 
     // PTQ1_0 small batches, row tails and broadcast dimensions.
+    for (int n : {1, 2}) {
+        for (int m : {8, 9}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
     for (int n : {1, 2, 3, 4, 5, 6, 7, 8}) {
         for (int k : {128, 384, 5120}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 7, n, k, {2, 2}, {2, 1}));
