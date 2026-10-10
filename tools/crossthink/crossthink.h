@@ -49,7 +49,8 @@ struct crossthink_options {
     double temperature = 1.0;
     int32_t tool_tokens = 2048;
     int32_t max_tool_rounds = 8;
-    int32_t protocol_retries = 2;
+    int32_t protocol_retries = -1;
+    bool strict_thought_protocol = false;
     bool telepathy = true;
     int32_t link_quantum = 64;
     int32_t private_quantum = 256;
@@ -120,7 +121,8 @@ private:
         uint64_t forced_splices = 0;
         uint64_t tool_calls = 0;
         int32_t tool_rounds = 0;
-        int32_t protocol_retries = 0;
+        uint64_t protocol_retries = 0;
+        uint64_t protocol_repairs = 0;
         uint32_t generation_limit = 0;
         server_thought_scanner thought_scanner;
         uint64_t revision = 1;

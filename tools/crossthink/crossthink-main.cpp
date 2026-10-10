@@ -44,7 +44,7 @@ static bool parse(int argc, char ** argv, options & opts) {
         OPT_HOST = 256, OPT_PORT, OPT_CHUNK, OPT_SPLICE_MODE, OPT_SENTENCE_AFTER,
         OPT_ANSWER, OPT_SEED, OPT_TEMPERATURE, OPT_KEY, OPT_MCP_CONFIG, OPT_MCP_TIMEOUT,
         OPT_TOOL_TOKENS, OPT_TOOL_ROUNDS, OPT_LEGACY_SPLICE, OPT_LINK_QUANTUM, OPT_LINK_WAIT, OPT_PRIVATE_QUANTUM,
-        OPT_PROTOCOL_RETRIES,
+        OPT_PROTOCOL_RETRIES, OPT_STRICT_THOUGHT_PROTOCOL,
     };
     const struct option names[] = {
         {"socket-a", required_argument, nullptr, 'a'},
@@ -70,6 +70,7 @@ static bool parse(int argc, char ** argv, options & opts) {
         {"tool-turn-tokens", required_argument, nullptr, OPT_TOOL_TOKENS},
         {"max-tool-rounds", required_argument, nullptr, OPT_TOOL_ROUNDS},
         {"protocol-retries", required_argument, nullptr, OPT_PROTOCOL_RETRIES},
+        {"strict-thought-protocol", no_argument, nullptr, OPT_STRICT_THOUGHT_PROTOCOL},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
@@ -132,7 +133,11 @@ static bool parse(int argc, char ** argv, options & opts) {
             case OPT_MCP_TIMEOUT: opts.mcp_timeout = static_cast<int>(number(optarg, 600)); break;
             case OPT_TOOL_TOKENS: opts.session.tool_tokens = static_cast<int32_t>(number(optarg, 16384)); break;
             case OPT_TOOL_ROUNDS: opts.session.max_tool_rounds = static_cast<int32_t>(number(optarg, 64)); break;
-            case OPT_PROTOCOL_RETRIES: opts.session.protocol_retries = static_cast<int32_t>(number(optarg, 8)); break;
+            case OPT_PROTOCOL_RETRIES:
+                opts.session.protocol_retries = std::string(optarg) == "-1" ? -1 :
+                    static_cast<int32_t>(number(optarg, INT32_MAX));
+                break;
+            case OPT_STRICT_THOUGHT_PROTOCOL: opts.session.strict_thought_protocol = true; break;
             case OPT_TEMPERATURE: {
                 char * end = nullptr;
                 errno = 0;
@@ -168,7 +173,8 @@ static bool parse(int argc, char ** argv, options & opts) {
                     "      --tool-turn-tokens N  Private turn budget, 1..16384 (default: 2048)\n"
                     "                           Effective budget is max(N, --answer-tokens)\n"
                     "      --max-tool-rounds N   Consecutive tool round limit, 1..64 (default: 8)\n"
-                    "      --protocol-retries N  Protocol repair attempts per user message, 0..8 (default: 2)\n"
+                    "      --protocol-retries N  Feedback retries per user message (-1: unlimited, default; 0: disabled)\n"
+                    "      --strict-thought-protocol  Disable repair of wrapped/final thought commands\n"
                     "  -h, --help                Show help\n";
                 return false;
             default: throw std::invalid_argument("unknown option; use --help");

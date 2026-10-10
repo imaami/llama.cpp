@@ -30,7 +30,7 @@ crossthink_session::crossthink_session(
             options.answer_tokens < 1 || options.answer_tokens > 65536 ||
             options.tool_tokens < 1 || options.tool_tokens > 16384 ||
             options.max_tool_rounds < 1 || options.max_tool_rounds > 64 ||
-            options.protocol_retries < 0 || options.protocol_retries > 8 ||
+            options.protocol_retries < -1 ||
             options.link_quantum < 1 || options.link_quantum > 4096 ||
             options.private_quantum < 1 || options.private_quantum > 4096 ||
             options.link_wait_tokens < 1 || options.link_wait_tokens > 65536) {
@@ -174,6 +174,7 @@ json crossthink_session::state_locked() const {
             {"tool_calls", peer.tool_calls}, {"tool_status", peer.tool_status}, {"answer_done", peer.answer_done},
             {"empty_response", peer.empty_response},
             {"protocol_retries", peer.protocol_retries},
+            {"protocol_repairs", peer.protocol_repairs},
             {"mailbox", peer.mailbox.size()}, {"thought_turn", peer.thought_turn},
             {"phase", phase}, {"request_generated", peer.request_generated},
             {"request_elapsed_seconds", elapsed(peer.request_started)}, {"last_token_age_seconds", elapsed(peer.last_token)},
@@ -514,8 +515,12 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         }
         if (calls.empty()) {
             const auto content = parse_error.empty() ? assistant.value("content", std::string()) : std::string();
+            crossthink_repaired_command repaired;
+            const bool repairable = options.telepathy && !options.strict_thought_protocol &&
+                (parse_error.empty() || parse_rejected) &&
+                crossthink_repair_thought_command(parse_rejected ? raw_output : content, repaired);
             const bool protocol_error = options.telepathy && (parse_rejected ||
-                (parse_error.empty() && crossthink_misplaced_thought_commands(content)));
+                repairable || (parse_error.empty() && crossthink_misplaced_thought_commands(content)));
             std::string repair_failure;
             const auto forced_answer = [&] {
                 return peer.force_answer || (blocked(index) && pending.action == "answer");
@@ -523,20 +528,25 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
             if (protocol_error) {
                 if (forced_answer()) {
                     repair_failure = "protocol repair suppressed by Answer now";
-                } else if (peer.protocol_retries >= options.protocol_retries) {
+                } else if (!repairable && options.protocol_retries >= 0 &&
+                        peer.protocol_retries >= static_cast<uint64_t>(options.protocol_retries)) {
                     repair_failure = options.protocol_retries ? "protocol repair limit reached" : "protocol repair disabled";
                 } else {
-                    const std::string feedback = std::string("<ct:protocol_error source=\"coordinator\">\n") +
+                    const std::string feedback = repairable ?
+                        "<ct:protocol_repair source=\"coordinator\" command=\"" + repaired.command + "\">\n"
+                        "Your thought command was recognized despite its response channel or wrapper. "
+                        "It is pending once through the thought-command handler; its marked result follows. "
+                        "Continue the task after the result. Do not repeat this command or debug the protocol.\n"
+                        "</ct:protocol_repair>" : std::string("<ct:protocol_error source=\"coordinator\">\n") +
                         (parse_rejected
                             ? "Your previous response did not match the native output format and was rejected before any tool execution. "
                             : "Your previous final response contained only a thought command after reasoning had closed. ") +
-                        "No command from that response was executed and no message was queued. The user task remains pending. "
-                        "A new reasoning block is now open. If you still intend a thought command, emit it at column zero "
-                        "inside this reasoning block, outside code fences; do not close reasoning or use a native tool-call wrapper. "
-                        "Continue your work after its marked result. Native tool calls must use the separately listed tools and their format. "
-                        "Finish with an actual answer.\n</ct:protocol_error>";
-                    peer.phase = "recovering_protocol";
-                    peer.tool_status = "repairing response protocol";
+                        "Nothing from that response was executed. Continue the user task in this open reasoning block. "
+                        "If a thought command is needed, emit its complete literal syntax on its own line with real content, "
+                        "outside code fences. Do not analyze, demonstrate, or repeatedly test the protocol. "
+                        "An empty inbox is not a reason to stop.\n</ct:protocol_error>";
+                    peer.phase = repairable ? "repairing_protocol" : "recovering_protocol";
+                    peer.tool_status = repairable ? "preparing thought command" : "repairing response protocol";
                     emit_state();
                     lock.unlock();
                     std::vector<llama_token> suffix;
@@ -562,12 +572,21 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
                     }
                     if (repair_failure.empty()) {
                         peer.tape.insert(peer.tape.end(), suffix.begin(), suffix.end());
-                        ++peer.protocol_retries;
                         peer.thinking_open = true;
                         begin_thought(peer);
                         peer.tool_status.clear();
-                        emit({{"type", "protocol_feedback"}, {"peer", peer_name(index)}, {"text", feedback},
-                            {"attempt", peer.protocol_retries}, {"limit", options.protocol_retries}});
+                        if (repairable) {
+                            ++peer.protocol_repairs;
+                            // The worker applies it once before decoding; controls can defer or discard it.
+                            peer.thought_scanner.command = repaired.command;
+                            peer.thought_scanner.payload = repaired.payload;
+                            emit({{"type", "protocol_repair"}, {"peer", peer_name(index)},
+                                {"command", repaired.command}, {"text", feedback}});
+                        } else {
+                            ++peer.protocol_retries;
+                            emit({{"type", "protocol_feedback"}, {"peer", peer_name(index)}, {"text", feedback},
+                                {"attempt", peer.protocol_retries}, {"limit", options.protocol_retries}});
+                        }
                         changed.notify_all();
                         return true;
                     }
@@ -1137,6 +1156,7 @@ void crossthink_session::apply(const pending_command & command) {
             peer.tool_calls = 0;
             peer.tool_rounds = 0;
             peer.protocol_retries = 0;
+            peer.protocol_repairs = 0;
             peer.tool_status.clear();
             peer.thought_turn = 0;
             peer.thought_text.clear();

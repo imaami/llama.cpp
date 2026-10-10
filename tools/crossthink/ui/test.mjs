@@ -234,7 +234,7 @@ try {
     emit({ type: 'protocol_feedback', peer: 'A', text: feedback, attempt: 1, limit: 2 });
     await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child .output-boundary')?.textContent ===
         'Coordinator feedback (retry 1 of 2)');
-    assert.equal(await page.locator('#stats-A .peer-phase').textContent(), 'Repairing command format');
+    assert.equal(await page.locator('#stats-A .peer-phase').textContent(), 'Repairing response format');
     assert.match(await page.locator('#stats-A').textContent(), /Protocol retries 1/);
     await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child').textContent.includes('</ct:protocol_error>'));
     emit({ type: 'token', peer: 'A', text: '**Continue independently.**\n<ct:inbox/>\n' });
@@ -248,6 +248,32 @@ try {
     assert.equal(posts.length, postsBeforeNative, 'coordinator feedback must not execute displayed command tags');
     await page.locator('[data-copy="thought-A"]').click();
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()).then(text => text.endsWith(feedback + '**Continue independently.**\n<ct:inbox/>\n')), true);
+
+    const unlimitedFeedback = 'Retry with the expected response format.\n';
+    emit({ type: 'protocol_feedback', peer: 'A', text: unlimitedFeedback, attempt: 3, limit: -1 });
+    await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child .output-boundary')?.textContent ===
+        'Coordinator feedback (retry 3)');
+    state.peers[0].phase = 'repairing_protocol';
+    state.peers[0].protocol_retries = 3;
+    state.peers[0].protocol_repairs = 1;
+    emit({ type: 'state', state });
+    const repair = 'Recognized thought command inbox; wrapper removed; applying once before continuing.\n';
+    emit({ type: 'protocol_repair', peer: 'A', command: 'inbox', text: repair });
+    await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child').textContent.includes('wrapper removed'));
+    assert.equal(await page.locator('#thought-A .output-segment:last-child .output-boundary').textContent(), 'Protocol repair');
+    assert.equal(await page.locator('#stats-A .peer-phase').textContent(), 'Preparing thought command');
+    assert.match(await page.locator('#stats-A').textContent(), /Protocol retries 3Protocol repairs 1/);
+    assert.equal(await page.locator('#tools-A .output-segment').count(), toolsBeforeFeedback);
+    assert.equal(await page.locator('#thread .bubble').count(), 0);
+    assert.equal(await page.locator('#thought-B').textContent(), thoughtBeforeFeedback);
+    assert.equal(await page.evaluate(() => window.partnerBeforeFeedback === document.querySelector('#thought-B .output-segment')), true);
+    assert.equal(posts.length, postsBeforeNative, 'protocol repair display must not invoke commands or create phantom tool records');
+    emit({ type: 'token', peer: 'A', text: '**Thinking continues.**\n' });
+    await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child strong')?.textContent === 'Thinking continues.');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child .output-boundary').textContent(), 'After protocol repair');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child pre').count(), 0);
+    await page.locator('[data-copy="thought-A"]').click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()).then(text => text.endsWith(unlimitedFeedback + repair + '**Thinking continues.**\n')), true);
 
     await page.screenshot({ path: join(root, 'test-desktop.png'), fullPage: true });
     await page.setViewportSize({ width: 700, height: 950 });
@@ -271,7 +297,7 @@ try {
     await page.waitForFunction(() => !document.querySelector('#native-A .output-segment'));
     assert.equal(await page.locator('#native-B .output-segment').count(), 0);
     assert.deepEqual(errors, []);
-    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics, turn/result isolation, native response diagnostics, coordinator feedback isolation, verbatim copy, clipping.');
+    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics, turn/result isolation, native response diagnostics, coordinator feedback and repair isolation, unlimited retries, verbatim copy, clipping.');
 } finally {
     await browser.close();
     for (const client of clients) client.end();

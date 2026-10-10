@@ -397,7 +397,7 @@ struct fixture {
 
     fixture(int32_t chunk = 2, uint64_t context = 256, bool paragraph_splice = false,
             bool enable_tools = false, bool telepathy = false, int32_t max_tool_rounds = 8,
-            int32_t protocol_retries = 2) {
+            int32_t protocol_retries = 2, bool strict_thought_protocol = true) {
         std::array<std::unique_ptr<crossthink_transport>, 2> transports;
         std::array<std::unique_ptr<crossthink_tool_service>, 2> services;
         for (size_t i = 0; i < peers.size(); ++i) {
@@ -430,6 +430,7 @@ struct fixture {
         options.link_wait_tokens = 8;
         options.max_tool_rounds = max_tool_rounds;
         options.protocol_retries = protocol_retries;
+        options.strict_thought_protocol = strict_thought_protocol;
         session = std::make_unique<crossthink_session>(std::move(transports), options, std::move(services));
     }
 
@@ -1259,7 +1260,7 @@ static void test_thought_targeted_message_preserves_other_stream() {
 }
 
 static void test_thought_native_mcp_does_not_serialize_peer() {
-    fixture f(4, 32768, true, true, true);
+    fixture f(4, 32768, true, true, true, 8, 2, false);
     const std::string native_reasoning = "Use calculator.\n<ct:send>not a reasoning command here</ct:send>";
     {
         std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
@@ -1289,7 +1290,8 @@ static void test_thought_native_mcp_does_not_serialize_peer() {
     auto a2 = f.peers[0]->request(2);
     check(f.tools[0]->call_count() == 1 && f.tools[1]->call_count() == 0,
             "preserving native reasoning replayed or forwarded the MCP call");
-    check(events_of(f, "protocol_feedback").empty(), "a valid native tool call was replaced with protocol repair");
+    check(events_of(f, "protocol_feedback").empty() && events_of(f, "protocol_repair").empty(),
+            "a valid native tool call was replaced with protocol repair");
     check(ends_with(a2->prompt, {3, 40, 1}) && !count(a2->prompt, 201),
             "MCP result lost its native template or imported unsolicited peer text");
     check(request_is_active(b0) && f.peers[1]->request_count() == 1,
@@ -1438,8 +1440,8 @@ static void test_thought_native_output_survives_parse_failure() {
     check(events_of(f, "protocol_feedback").empty(), "ordinary parser/transport failure triggered protocol repair");
 }
 
-static void finish_misplaced_native(fixture & f, size_t index, size_t request_index) {
-    const std::string text = "<ct:send>Send this only after I issue it while reasoning.</ct:send>";
+static void finish_native_response(fixture & f, size_t index, size_t request_index,
+        const std::string & text, const std::string & raw = {}) {
     {
         std::lock_guard<std::mutex> lock(f.peers[index]->mutex);
         f.peers[index]->parsed_assistant = {{"role", "assistant"}, {"content", text}};
@@ -1448,8 +1450,13 @@ static void finish_misplaced_native(fixture & f, size_t index, size_t request_in
     reasoning->send({2}, "</think>");
     reasoning->finish("limit", "tool");
     auto native = f.peers[index]->request(request_index + 1);
-    native->send({static_cast<llama_token>(501 + index), 3}, text);
+    native->send({static_cast<llama_token>(501 + index), 3}, raw.empty() ? text : raw);
     native->finish("eos", "");
+}
+
+static void finish_misplaced_native(fixture & f, size_t index, size_t request_index) {
+    finish_native_response(f, index, request_index,
+        "<ct:send>Send this only after I issue it while reasoning.</ct:send>");
 }
 
 static void test_thought_protocol_repair_and_targeted_budget() {
@@ -1548,11 +1555,15 @@ static void test_thought_protocol_repair_limits() {
         check(reset.at("peers").at(0).at("protocol_retries") == 0,
                 "session reset retained an exhausted repair budget");
     }
-    for (int32_t invalid : {-1, 9}) {
+    for (int32_t invalid : {-2, INT32_MIN}) {
         bool rejected = false;
         try { fixture f(4, 32768, true, false, true, 8, invalid); }
         catch (const std::invalid_argument &) { rejected = true; }
         check(rejected, "protocol repair accepted an out-of-range retry limit");
+    }
+    for (int32_t valid : {-1, 9, INT32_MAX}) {
+        fixture f(4, 32768, true, false, true, 8, valid);
+        check(f.session->state().at("mode") == "idle", "valid protocol retry limit did not initialize");
     }
 }
 
@@ -1665,6 +1676,215 @@ static void test_thought_protocol_repair_control_boundaries() {
             check(f.peers[0]->request_count() == 2 && events_of(f, "protocol_feedback").empty(),
                     "Answer now resumed protocol repair instead of terminating the malformed response");
         }
+    }
+}
+
+static void test_thought_native_command_normalization() {
+    check(!crossthink_options{}.strict_thought_protocol && crossthink_options{}.protocol_retries == -1,
+            "default protocol behavior is not normalization with unlimited feedback");
+    for (bool wrapped : {false, true}) {
+        fixture f(4, 32768, true, false, true, 8, 0, false);
+        const std::string payload = "One normalized message, exactly once.";
+        const std::string command = "<ct:send>" + payload + "</ct:send>";
+        const std::string raw = wrapped
+            ? "<tool_call>\n<function=ct:send>" + payload + "</ct:send>\n</function>\n</tool_call>" : command;
+        if (wrapped) {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->parse_error = "native grammar rejected ct:send";
+            f.peers[0]->native_parse_error = true;
+        }
+        f.start();
+        auto b0 = f.peers[1]->request(0);
+        finish_native_response(f, 0, 0, wrapped ? "" : command, raw);
+        auto a2 = f.peers[0]->request(2);
+        const auto repairs = events_of(f, "protocol_repair", "A");
+        const auto messages = events_of(f, "thought_message");
+        const auto results = events_of(f, "thought_result", "A");
+        check(repairs.size() == 1 && repairs[0].at("command") == "send" &&
+                messages.size() == 1 && messages[0].at("text") == payload &&
+                results.size() == 1 && results[0].at("success") == true,
+                "unambiguous native thought command did not become exactly one requester operation");
+        const auto state = f.session->state();
+        check(state.at("peers").at(0).at("protocol_repairs") == 1 &&
+                state.at("peers").at(0).at("protocol_retries") == 0 && events_of(f, "protocol_feedback").empty(),
+                "normalization consumed a model retry or omitted its visible repair count");
+        check(state.at("peers").at(1).at("mailbox") == 1 && request_is_active(b0) &&
+                f.peers[0]->request_count() == 3 && f.peers[1]->request_count() == 1,
+                "normalization restarted the peer or generated an extra model turn before dispatch");
+        check(count(a2->prompt, 501) == 1 && count(a2->prompt, 3) == 1 && count(a2->prompt, 40) == 1 &&
+                state.at("peers").at(0).at("imported").get<uint64_t>() > 0,
+                "normalized command lost the retained native turn, bridge, or marked result");
+        check(events_of(f, "answer", "A").empty() && events_of(f, "tool_call").empty(),
+                "normalized command emitted a final answer or executed a native MCP call");
+        f.pause();
+        f.session->command("resume");
+        f.wait_mode("thinking");
+        f.peers[0]->request(3);
+        f.peers[1]->request(1);
+        check(events_of(f, "thought_message").size() == 1 && events_of(f, "thought_result", "A").size() == 1,
+                "resuming replayed a normalized command through the reasoning scanner");
+        f.pause();
+    }
+}
+
+static void test_thought_unlimited_protocol_feedback() {
+    fixture f(4, 32768, true, false, true, 8, -1, false);
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parse_error = "unrepairable native grammar rejection";
+        f.peers[0]->native_parse_error = true;
+    }
+    f.start();
+    auto b0 = f.peers[1]->request(0);
+    for (size_t attempt = 0; attempt < 4; ++attempt) {
+        finish_native_response(f, 0, 2 * attempt, "", "<tool_call><function=not_a_known_tool></tool_call>");
+        f.peers[0]->request(2 * attempt + 2);
+        const auto feedback = events_of(f, "protocol_feedback", "A");
+        check(feedback.size() == attempt + 1 && feedback.back().at("attempt") == attempt + 1 &&
+                feedback.back().at("limit") == -1,
+                "unlimited protocol feedback stopped at the former retry ceiling");
+    }
+    check(request_is_active(b0) && events_of(f, "protocol_repair").empty() && events_of(f, "thought_message").empty() &&
+            f.session->state().at("peers").at(0).at("protocol_retries") == 4,
+            "unrepairable output was normalized, executed, or stopped its peer");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parse_error.clear();
+    }
+    finish_thought_answer(f, 0, 8, "A eventually corrected its output");
+    finish_thought_answer(f, 1, 0, "B answer");
+    f.wait_mode("answered");
+}
+
+static void test_thought_ambiguous_native_commands_are_not_normalized() {
+    for (const std::string raw : {
+            "<ct:send>unfinished message",
+            "<ct:send>first</ct:send>\n<ct:inbox/>",
+            "<tool_call>\n<function=calculator>\n<parameter=expression>2+2</parameter>\n</function>\n</tool_call>\n"
+                "<tool_call>\n<function=ct:send>message</ct:send>\n</function>\n</tool_call>"}) {
+        fixture f(4, 32768, true, true, true, 8, 0, false);
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->parse_error = "incomplete or mixed native output";
+            f.peers[0]->native_parse_error = true;
+        }
+        f.start();
+        auto b0 = f.peers[1]->request(0);
+        finish_native_response(f, 0, 0, "", raw);
+        f.wait_state([](const crossthink_json & state) {
+            const auto & peer = state.at("peers").at(0);
+            return peer.at("phase") == "empty_response" && !peer.at("active").get<bool>();
+        }, "ambiguous native output declines normalization");
+        check(events_of(f, "protocol_repair").empty() && events_of(f, "protocol_feedback").empty() &&
+                events_of(f, "thought_message").empty() && f.tools[0]->call_count() == 0 &&
+                f.tools[1]->call_count() == 0 && request_is_active(b0),
+                "incomplete or mixed native output partially executed or stopped the peer");
+        f.pause();
+    }
+}
+
+static void test_thought_normalization_bridge_controls() {
+    for (const std::string action : {"pause", "answer", "reset", "message"}) {
+        fixture f(4, 32768, true, false, true, 8, 2, false);
+        auto gate = std::make_shared<fake_operation>();
+        gate->throw_on_cancel = true;
+        f.start();
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->results_gate = gate;
+        }
+        auto b0 = f.peers[1]->request(0);
+        finish_misplaced_native(f, 0, 0);
+        gate->wait_entered();
+        const bool replacing = action == "reset" || action == "message";
+        f.session->command(action, replacing ? "Replace pending normalization" : "", action == "message" ? "A" : "both");
+        if (replacing) {
+            f.wait_mode("thinking");
+            auto a2 = f.peers[0]->request(2);
+            check(!count(a2->prompt, 40) && events_of(f, "protocol_repair").empty() &&
+                    events_of(f, "thought_message").empty(), "replacement committed a stale normalization bridge");
+            if (action == "reset") { f.peers[1]->request(1); }
+            else {
+                check(ends_with(a2->prompt, {501, 3, 20, 21, 1}) && request_is_active(b0),
+                        "targeted replacement lost the native boundary or cancelled its partner");
+            }
+            f.pause();
+            continue;
+        }
+        gate->release();
+        if (action == "pause") {
+            f.wait_mode("paused");
+            check(events_of(f, "protocol_repair", "A").size() == 1 && events_of(f, "thought_message").empty() &&
+                    f.peers[0]->request_count() == 2, "pause executed or lost the bridged pending thought command");
+            f.session->command("resume");
+            f.wait_mode("thinking");
+            auto a2 = f.peers[0]->request(2);
+            f.peers[1]->request(1);
+            check(count(a2->prompt, 501) == 1 && count(a2->prompt, 3) == 1 && count(a2->prompt, 40) == 1 &&
+                    events_of(f, "thought_message").size() == 1 && events_of(f, "protocol_repair", "A").size() == 1,
+                    "resume lost or duplicated the normalized command after its bridge");
+            f.pause();
+        } else {
+            f.wait_mode("answering");
+            auto b1 = f.peers[1]->request(1);
+            {
+                std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+                f.peers[1]->parsed_assistant = {{"role", "assistant"}, {"content", "B answer"}};
+            }
+            b1->send({502, 3}, "B answer");
+            b1->finish("eos", "");
+            f.wait_mode("incomplete");
+            check(events_of(f, "protocol_repair").empty() && events_of(f, "thought_message").empty() &&
+                    f.peers[0]->request_count() == 2, "Answer now executed the normalization pending at its bridge");
+        }
+    }
+}
+
+static void test_thought_normalization_result_controls() {
+    for (const std::string action : {"pause", "message", "reset"}) {
+        fixture f(4, 32768, true, false, true, 8, 2, false);
+        auto gate = std::make_shared<fake_operation>();
+        gate->throw_on_cancel = true;
+        f.start();
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->literal_gate = gate;
+        }
+        auto b0 = f.peers[1]->request(0);
+        finish_misplaced_native(f, 0, 0);
+        gate->wait_entered();
+        check(events_of(f, "protocol_repair", "A").size() == 1 && events_of(f, "thought_message").empty(),
+                "normalization sent its message before result tokenization committed");
+        f.session->command(action, action == "pause" ? "" : "Replace pending thought result", action == "message" ? "A" : "both");
+        f.wait_mode(action == "pause" ? "paused" : "thinking");
+        check(events_of(f, "thought_message").empty() && events_of(f, "thought_result", "A").empty(),
+                "cancelled normalized result committed a stale message");
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->literal_gate.reset();
+        }
+        if (action == "pause") {
+            f.session->command("resume");
+            f.wait_mode("thinking");
+            auto a2 = f.peers[0]->request(2);
+            f.peers[1]->request(1);
+            check(count(a2->prompt, 501) == 1 && count(a2->prompt, 40) == 1 &&
+                    events_of(f, "thought_message").size() == 1 && events_of(f, "protocol_repair", "A").size() == 1 &&
+                    f.session->state().at("peers").at(0).at("protocol_repairs") == 1,
+                    "resuming tokenization replayed the bridge or delivered the normalized send twice");
+        } else {
+            f.peers[0]->request(2);
+            if (action == "reset") {
+                f.peers[1]->request(1);
+                check(f.session->state().at("peers").at(0).at("protocol_repairs") == 0,
+                        "reset retained its session normalization count");
+            } else {
+                check(request_is_active(b0) && f.session->state().at("peers").at(0).at("protocol_repairs") == 1,
+                        "targeted result cancellation interrupted the peer or reset its session repair count");
+            }
+            check(events_of(f, "thought_message").empty(), "replacing a normalized result replayed its pending command");
+        }
+        f.pause();
     }
 }
 
@@ -2158,6 +2378,16 @@ int main() {
         test_thought_protocol_repair_disabled_after_answer_now();
         current_test = "test_thought_protocol_repair_control_boundaries";
         test_thought_protocol_repair_control_boundaries();
+        current_test = "test_thought_native_command_normalization";
+        test_thought_native_command_normalization();
+        current_test = "test_thought_unlimited_protocol_feedback";
+        test_thought_unlimited_protocol_feedback();
+        current_test = "test_thought_ambiguous_native_commands_are_not_normalized";
+        test_thought_ambiguous_native_commands_are_not_normalized();
+        current_test = "test_thought_normalization_bridge_controls";
+        test_thought_normalization_bridge_controls();
+        current_test = "test_thought_normalization_result_controls";
+        test_thought_normalization_result_controls();
         current_test = "test_thought_reset_discards_stale_streams_and_mail";
         test_thought_reset_discards_stale_streams_and_mail();
         test_thought_peek_defers_incomplete_utf8_packets();
