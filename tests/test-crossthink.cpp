@@ -109,6 +109,7 @@ public:
     std::vector<std::shared_ptr<fake_request>> requests;
     std::vector<std::string> initial_texts;
     std::vector<std::string> user_texts;
+    std::string configured_peer;
     crossthink_json configured_tools;
     crossthink_json parsed_assistant;
     std::vector<std::vector<llama_token>> parsed_turns;
@@ -121,7 +122,7 @@ public:
         return {
             {"protocol", "LLMTOK01"}, {"fingerprint", fingerprint},
             {"n_vocab", 4096}, {"eog_ids", {3}}, {"context_size", context_size},
-            {"close_token", 2}, {"control_ids", {1, 2, 3}}, {"splice", true}, {"tool_parse", true},
+            {"close_token", 2}, {"control_ids", {1, 2, 3}}, {"splice", true}, {"splice_quantum", true}, {"tool_parse", true},
         };
     }
 
@@ -140,6 +141,19 @@ public:
     void configure_tools(const crossthink_json & tools) override {
         std::lock_guard<std::mutex> lock(mutex);
         configured_tools = tools;
+    }
+
+    void configure_peer(const std::string & name) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        configured_peer = name;
+    }
+
+    std::vector<llama_token> text_tokens(const std::string & text) override {
+        std::vector<llama_token> tokens;
+        for (unsigned char byte : text) {
+            tokens.push_back(1000 + byte);
+        }
+        return tokens;
     }
 
     crossthink_json parse_tool_turn(const std::vector<llama_token> & tokens) override {
@@ -330,7 +344,8 @@ struct fixture {
     std::unique_ptr<crossthink_session> session;
     uint64_t cursor = 0;
 
-    fixture(int32_t chunk = 2, uint64_t context = 256, bool paragraph_splice = false, bool enable_tools = false) {
+    fixture(int32_t chunk = 2, uint64_t context = 256, bool paragraph_splice = false,
+            bool enable_tools = false, bool telepathy = false, int32_t max_tool_rounds = 8) {
         std::array<std::unique_ptr<crossthink_transport>, 2> transports;
         std::array<std::unique_ptr<crossthink_tool_service>, 2> services;
         for (size_t i = 0; i < peers.size(); ++i) {
@@ -357,6 +372,10 @@ struct fixture {
         options.tool_tokens = 8;
         options.paragraph_splice = paragraph_splice;
         options.sentence_after = 2;
+        options.telepathy = telepathy;
+        options.link_quantum = 2;
+        options.link_wait_tokens = 8;
+        options.max_tool_rounds = max_tool_rounds;
         session = std::make_unique<crossthink_session>(std::move(transports), options, std::move(services));
     }
 
@@ -922,6 +941,417 @@ static void test_peer_error_survives_private_final_answer() {
             "a private final answer started another request after peer failure");
 }
 
+static void native_call(fake_transport & peer, const std::string & name, const crossthink_json & arguments) {
+    std::lock_guard<std::mutex> lock(peer.mutex);
+    peer.parsed_assistant = {
+        {"role", "assistant"}, {"content", ""}, {"tool_calls", crossthink_json::array({{
+            {"id", "call_test"}, {"type", "function"},
+            {"function", {{"name", name}, {"arguments", arguments.dump()}}},
+        }})},
+    };
+}
+
+static void finish_thought(const std::shared_ptr<fake_request> & request,
+        std::vector<llama_token> tokens, const std::string & boundary = "quantum") {
+    request->send(std::move(tokens));
+    request->finish("limit", boundary);
+}
+
+static void finish_private(const std::shared_ptr<fake_request> & request, llama_token body = 501) {
+    request->send({body, 3});
+    request->finish("eos", "");
+}
+
+static void enable_link(fixture & f, const std::string & yield_until = {}) {
+    crossthink_json arguments = {{"enabled", true}};
+    if (!yield_until.empty()) {
+        arguments["yield_until"] = yield_until;
+    }
+    native_call(*f.peers[0], "think_with_telepathic_link", arguments);
+    f.start();
+    auto a = f.peers[0]->request(0);
+    auto b = f.peers[1]->request(0);
+    finish_thought(a, {101, 2}, "tool");
+    a->wait_consumed(1);
+    check(f.peers[0]->request_count() == 1 && !f.session->state().at("link_enabled").get<bool>(),
+            "tool tail or link transition started while the peer's private quantum was still active");
+    finish_thought(b, {201});
+    auto call = f.peers[0]->request(1);
+    check(call->prompt.back() == 2 && !call->parameters.contains("splice"),
+            "telepathy control call was not generated as a private native turn");
+    finish_private(call);
+    f.wait_state([](const crossthink_json & state) { return state.at("link_enabled").get<bool>(); },
+            "enable telepathic link");
+}
+
+static std::vector<std::string> shared_labels(fixture & f) {
+    std::vector<std::string> labels;
+    for (const auto & event : f.session->events_after(0)) {
+        if (event.value("type", std::string()) == "shared" && event.value("label", false)) {
+            labels.push_back(event.at("text").get<std::string>());
+        }
+    }
+    return labels;
+}
+
+static std::vector<llama_token> shared_tail(fake_transport & peer, const std::vector<llama_token> & prompt,
+        const std::string & first_label) {
+    const auto label = peer.text_tokens(first_label);
+    const auto start = std::search(prompt.begin(), prompt.end(), label.begin(), label.end());
+    check(start != prompt.end(), "prompt omitted the shared transcript's first speaker label");
+    return {start, prompt.end()};
+}
+
+static void append_text(std::vector<llama_token> & tokens, fake_transport & peer, const std::string & text) {
+    const auto suffix = peer.text_tokens(text);
+    tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+}
+
+static void test_telepathy_catalogue_and_initial_privacy() {
+    check(crossthink_options{}.telepathy, "telepathy mode is not the default");
+    fixture f(4, 8192, true, false, true);
+    const auto initial = f.session->state();
+    check(initial.at("telepathy").get<bool>() && !initial.at("link_enabled").get<bool>(),
+            "the telepathic link started enabled");
+    for (size_t i = 0; i < f.peers.size(); ++i) {
+        std::lock_guard<std::mutex> lock(f.peers[i]->mutex);
+        const auto & tools = f.peers[i]->configured_tools;
+        check(tools.size() == 1 && tools.at(0).at("function").at("name") == "think_with_telepathic_link",
+                "native telepathy tool was not advertised without an MCP server");
+        check(f.peers[i]->configured_peer == (i ? "B" : "A"), "transport did not receive its agent identity");
+    }
+    f.start();
+    auto a = f.peers[0]->request(0);
+    auto b = f.peers[1]->request(0);
+    finish_thought(a, {101});
+    auto next_a = f.peers[0]->request(1);
+    b->send({201});
+    b->wait_consumed(1);
+    check(count(next_a->prompt, 101) == 1 && !count(next_a->prompt, 201) && !count(b->prompt, 101),
+            "reasoning was shared before either model enabled the link");
+    check(shared_labels(f).empty(), "private reasoning appeared in the shared transcript");
+    f.pause();
+}
+
+static void test_telepathy_shared_order_and_disable() {
+    fixture f(4, 8192, true, false, true);
+    enable_link(f);
+    auto a = f.peers[0]->request(2);
+    check(a->parameters.at("splice").at("token_after") == 2,
+            "shared reasoning did not request the small streaming quantum");
+    check(a->parameters.at("splice").at("sentence_after") == 1,
+            "short shared fragments did not recognize early sentence boundaries");
+    check(a->parameters.at("n_predict") == 10, "shared quantum omitted the bounded UTF-8 allowance");
+    check(count(a->prompt, 101) == 1 && !count(a->prompt, 201),
+            "enabling the link retroactively mixed private thoughts");
+    a->send({110, 111});
+    a->wait_consumed(1);
+    check(f.peers[1]->request_count() == 1, "both agents generated against divergent shared prefixes");
+    bool streamed = false;
+    for (const auto & event : f.session->events_after(0)) {
+        streamed = streamed || (event.value("type", std::string()) == "shared" &&
+                event.value("peer", std::string()) == "A" && !event.value("label", false));
+    }
+    check(streamed, "shared output was held until the entire fragment completed");
+    a->finish("limit", "quantum");
+    auto b = f.peers[1]->request(1);
+    auto labels = shared_labels(f);
+    check(labels.size() == 2 && labels.at(1).find("B interrupts A") != std::string::npos,
+            "mid-thought handoff did not identify the interrupting agent");
+    auto expected = f.peers[0]->text_tokens(labels.at(0));
+    expected.insert(expected.end(), {110, 111});
+    append_text(expected, *f.peers[0], labels.at(1));
+    check(shared_tail(*f.peers[1], b->prompt, labels.at(0)) == expected,
+            "B did not receive the canonical labeled shared prefix");
+    for (llama_token private_token : {101, 2, 501, 3, 40}) {
+        check(!count(b->prompt, private_token), "native control or tool-result tokens were broadcast to B");
+    }
+    finish_thought(b, {210}, "sentence");
+    auto next_a = f.peers[0]->request(3);
+    labels = shared_labels(f);
+    check(labels.size() == 3 && labels.back().find("interrupts") == std::string::npos,
+            "sentence-complete handoff was incorrectly labeled as an interruption");
+    expected.push_back(210);
+    append_text(expected, *f.peers[0], labels.back());
+    check(shared_tail(*f.peers[0], next_a->prompt, labels.at(0)) == expected,
+            "A's canonical shared transcript differed in order or duplicated its own output");
+
+    native_call(*f.peers[0], "think_with_telepathic_link", {{"enabled", false}});
+    finish_thought(next_a, {112, 2}, "tool");
+    finish_private(f.peers[0]->request(4), 502);
+    auto private_a = f.peers[0]->request(5);
+    auto private_b = f.peers[1]->request(2);
+    check(!f.session->state().at("link_enabled").get<bool>(), "native disable call left the link enabled");
+    expected.push_back(112);
+    auto completed = expected;
+    append_text(completed, *f.peers[0], "\n[Telepathic link OFF: continue privately.]\n");
+    check(shared_tail(*f.peers[1], private_b->prompt, labels.at(0)) == completed,
+            "disabling the link lost the last shared fragment or broadcast the closing control token");
+    const auto a_shared = shared_tail(*f.peers[0], private_a->prompt, labels.at(0));
+    check(a_shared.size() >= expected.size() && std::equal(expected.begin(), expected.end(), a_shared.begin()),
+            "the twins retained different copies of the completed shared transcript");
+    finish_thought(private_a, {120});
+    auto next_private_a = f.peers[0]->request(6);
+    check(count(next_private_a->prompt, 120) == 1 && !count(private_b->prompt, 120),
+            "disabled link continued importing private thoughts");
+    f.pause();
+    const auto paused = f.session->state();
+    check(!paused.at("link_enabled").get<bool>(), "pause re-enabled a disabled link");
+}
+
+static void test_telepathy_intentional_yield() {
+    for (const std::string pace : {"fragment", "sentence", "paragraph"}) {
+        fixture f(4, 8192, true, false, true);
+        enable_link(f, pace);
+        auto b = f.peers[1]->request(1);
+        check(f.peers[0]->request_count() == 2, "yielding agent continued before its peer's requested turn");
+        check(b->parameters.at("splice").at("token_after") == 2,
+                "intentional yielding abandoned immediate streaming quanta");
+        if (pace == "fragment") {
+            finish_thought(b, {210, 211});
+        } else {
+            finish_thought(b, {210, 211}, pace == "paragraph" ? "sentence" : "quantum");
+            auto continuation = f.peers[1]->request(2);
+            check(f.peers[0]->request_count() == 2, "yield ended before the requested natural boundary");
+            finish_thought(continuation, {212}, pace);
+        }
+        auto a = f.peers[0]->request(2);
+        check(count(a->prompt, 210) == 1 && count(a->prompt, 211) == 1 &&
+                count(a->prompt, 212) == (pace == "fragment" ? 0 : 1),
+                "intentional turn-taking lost or replayed shared output");
+        const auto labels = shared_labels(f);
+        check(labels.size() == 2, "continuing a granted turn inserted a false speaker change");
+        f.pause();
+    }
+
+    fixture f(4, 8192, true, false, true);
+    enable_link(f, "paragraph");
+    for (size_t i = 0; i < 4; ++i) {
+        auto b = f.peers[1]->request(1 + i);
+        check(f.peers[0]->request_count() == 2, "bounded paragraph wait released before its token allowance");
+        finish_thought(b, {static_cast<llama_token>(210 + 2 * i), static_cast<llama_token>(211 + 2 * i)});
+    }
+    auto a = f.peers[0]->request(2);
+    for (llama_token token = 210; token < 218; ++token) {
+        check(count(a->prompt, token) == 1, "bounded yield fallback lost shared output");
+    }
+    check(f.peers[1]->request_count() == 5, "missing paragraph boundary allowed an unbounded monologue");
+    f.pause();
+}
+
+static void test_telepathy_pause_and_reset() {
+    fixture f(4, 8192, true, false, true);
+    enable_link(f, "paragraph");
+    auto b = f.peers[1]->request(1);
+    b->send({210});
+    b->wait_consumed(1);
+    f.session->command("pause");
+    b->finish("limit", "quantum");
+    const auto paused = f.wait_mode("paused");
+    check(paused.at("link_enabled").get<bool>(), "pause discarded the link setting");
+    check(f.peers[0]->request_count() == 2 && f.peers[1]->request_count() == 2,
+            "a paused link continued generating");
+    f.session->command("reset", "replacement question");
+    const auto reset = f.wait_mode("thinking");
+    check(!reset.at("link_enabled").get<bool>() && reset.at("exchanges") == 0,
+            "reset retained the prior channel's enable or exchange state");
+    auto a_new = f.peers[0]->request(2);
+    auto b_new = f.peers[1]->request(2);
+    check(a_new->prompt == std::vector<llama_token>({1, 10, 11}) && a_new->prompt == b_new->prompt,
+            "reset retained a private tool turn or shared channel transcript");
+    a_new->stale_on_cancel({901});
+    b_new->stale_on_cancel({902});
+    f.session->command("reset");
+    f.wait_mode("idle");
+    for (const auto & request : {a_new, b_new}) {
+        std::lock_guard<std::mutex> lock(request->mutex);
+        check(request->returned && !request->stale_accepted, "reset accepted late telepathy-mode tokens");
+    }
+}
+
+static void test_telepathy_independent_final_answers() {
+    fixture f(4, 8192, true, false, true);
+    enable_link(f);
+    auto a = f.peers[0]->request(2);
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parsed_assistant = {{"role", "assistant"}, {"content", "A final answer"}};
+    }
+    finish_thought(a, {110, 2}, "tool");
+    finish_private(f.peers[0]->request(3), 601);
+    auto b = f.peers[1]->request(1);
+    const auto single_answer = f.session->state();
+    check(single_answer.at("mode") == "thinking" && !single_answer.at("link_enabled").get<bool>(),
+            "one twin's final answer forced its peer to answer or left the link enabled");
+    check(b->prompt.back() != 2 && !count(b->prompt, 601),
+            "peer's private continuation received an answer or a forced reasoning-close token");
+    bool rejected = false;
+    try {
+        f.session->command("link_on");
+    } catch (const std::logic_error &) {
+        rejected = true;
+    }
+    const auto after_manual_request = f.session->state();
+    check(rejected && after_manual_request.at("mode") == "thinking" &&
+            !after_manual_request.at("busy").get<bool>(),
+            "manual relink to a finished agent interrupted the remaining agent's private thinking");
+    finish_thought(b, {210});
+    auto b_next = f.peers[1]->request(2);
+    check(f.peers[0]->request_count() == 4, "answered agent continued generating while its peer thought privately");
+    check(count(b_next->prompt, 210) == 1, "remaining agent lost its private continuation");
+    native_call(*f.peers[1], "think_with_telepathic_link", {{"enabled", true}});
+    finish_thought(b_next, {211, 2}, "tool");
+    finish_private(f.peers[1]->request(3), 602);
+    auto after_refusal = f.peers[1]->request(4);
+    {
+        std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+        const auto & result = f.peers[1]->result_messages.back().at(0);
+        check(crossthink_json::parse(result.at("content").get<std::string>()).value("isError", false),
+                "the native tool allowed a link to an agent that had already answered");
+    }
+    check(!f.session->state().at("link_enabled").get<bool>(), "rejected link request enabled the channel");
+    native_call(*f.peers[1], "think_with_telepathic_link", {{"enabled", false}});
+    finish_thought(after_refusal, {212, 2}, "tool");
+    finish_private(f.peers[1]->request(5), 603);
+    auto after_disable = f.peers[1]->request(6);
+    {
+        std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+        const auto & result = f.peers[1]->result_messages.back().at(0);
+        check(!crossthink_json::parse(result.at("content").get<std::string>()).value("isError", false),
+                "idempotent native disable failed after the other twin had answered");
+        f.peers[1]->parsed_assistant = {{"role", "assistant"}, {"content", "B final answer"}};
+    }
+    finish_thought(after_disable, {213, 2}, "tool");
+    finish_private(f.peers[1]->request(7), 604);
+    f.wait_mode("answered");
+    std::array<bool, 2> answer_seen = {};
+    for (const auto & event : f.session->events_after(0)) {
+        if (event.value("type", std::string()) == "answer") {
+            const auto peer = event.value("peer", std::string());
+            const auto text = event.value("text", std::string());
+            answer_seen[0] = answer_seen[0] || (peer == "A" && text == "A final answer");
+            answer_seen[1] = answer_seen[1] || (peer == "B" && text == "B final answer");
+        }
+    }
+    check(answer_seen[0] && answer_seen[1], "independent final answers did not reach their separate output panes");
+}
+
+static void test_telepathy_mcp_call_is_private() {
+    fixture f(4, 8192, true, true, true);
+    enable_link(f);
+    for (size_t i = 0; i < f.peers.size(); ++i) {
+        std::lock_guard<std::mutex> lock(f.peers[i]->mutex);
+        check(f.peers[i]->configured_tools.size() == 2, "MCP catalogue replaced the native telepathy tool");
+        check(f.tools[i]->call_count() == 0, "built-in telepathy control was dispatched to an MCP server");
+    }
+    native_call(*f.peers[0], "calculator", {{"expression", "6*7"}});
+    finish_thought(f.peers[0]->request(2), {110, 2}, "tool");
+    finish_private(f.peers[0]->request(3), 503);
+    auto call = f.tools[0]->request(0);
+    check(call->name == "calculator" && call->arguments == crossthink_json{{"expression", "6*7"}},
+            "linked agent's native MCP call was not dispatched intact");
+    check(f.tools[1]->call_count() == 0 && f.peers[1]->request_count() == 1,
+            "peer replayed an MCP call or generated during a private tool transaction");
+    const crossthink_json result = {{"content", {{{"type", "text"}, {"text", "42"}}}}, {"isError", false}};
+    call->finish(result);
+    auto resumed = f.peers[0]->request(4);
+    check(count(resumed->prompt, 503) == 1 && count(resumed->prompt, 40) == 2,
+            "tool user lost its private call or response while resuming shared reasoning");
+    finish_thought(resumed, {111, 112});
+    auto b = f.peers[1]->request(1);
+    for (llama_token token : {110, 111, 112}) {
+        check(count(b->prompt, token) == 1, "tool transaction lost or duplicated surrounding shared reasoning");
+    }
+    for (llama_token token : {2, 3, 40, 501, 503}) {
+        check(!count(b->prompt, token), "private MCP call, result, or control was copied into the peer's context");
+    }
+    f.pause();
+}
+
+static void test_telepathy_command_during_last_final_answer() {
+    for (const std::string action : {"link_off", "answer"}) {
+        fixture f(4, 8192, true, false, true);
+        enable_link(f);
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->parsed_assistant = {{"role", "assistant"}, {"content", "A final answer"}};
+        }
+        finish_thought(f.peers[0]->request(2), {110, 2}, "tool");
+        finish_private(f.peers[0]->request(3), 601);
+        auto b = f.peers[1]->request(1);
+        {
+            std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+            f.peers[1]->parsed_assistant = {{"role", "assistant"}, {"content", "B final answer"}};
+        }
+        finish_thought(b, {210, 2}, "tool");
+        auto final_tail = f.peers[1]->request(2);
+        f.session->command(action);
+        const auto pending = f.session->state();
+        check(pending.at("busy").get<bool>() && pending.at("peers").at(0).at("answer_done").get<bool>(),
+                "test did not queue a control operation while only the last private answer remained");
+        finish_private(final_tail, 602);
+        const auto finished = f.wait_mode("answered");
+        check(finished.at("peers").at(0).at("answer_done").get<bool>() &&
+                finished.at("peers").at(1).at("answer_done").get<bool>(),
+                "pending control operation lost a completed private final answer");
+        check(f.peers[0]->request_count() == 4 && f.peers[1]->request_count() == 3,
+                "pending control operation generated another turn after both agents answered");
+    }
+}
+
+static void test_telepathy_tool_round_limit() {
+    fixture f(4, 8192, true, false, true, 2);
+    enable_link(f);
+    size_t a_request = 2;
+    size_t b_request = 1;
+    for (size_t i = 0; i < 5; ++i) {
+        native_call(*f.peers[0], "think_with_telepathic_link", {{"enabled", true}, {"yield_until", "fragment"}});
+        finish_thought(f.peers[0]->request(a_request++), {static_cast<llama_token>(110 + i), 2}, "tool");
+        finish_private(f.peers[0]->request(a_request++));
+        finish_thought(f.peers[1]->request(b_request++), {static_cast<llama_token>(210 + i)});
+    }
+    auto continuation = f.peers[0]->request(a_request);
+    check(f.session->state().at("peers").at(0).at("tool_calls") == 6,
+            "legitimate repeated yielding hit the consecutive-tool-call limit");
+    for (llama_token token = 110; token < 115; ++token) {
+        check(count(continuation->prompt, token) == 1, "repeated yielding lost the agent's spoken fragments");
+    }
+    f.pause();
+
+    fixture loop(4, 8192, true, false, true, 2);
+    enable_link(loop);
+    native_call(*loop.peers[0], "think_with_telepathic_link", {{"enabled", true}});
+    finish_thought(loop.peers[0]->request(2), {2}, "tool");
+    finish_private(loop.peers[0]->request(3));
+    finish_thought(loop.peers[0]->request(4), {2}, "tool");
+    finish_private(loop.peers[0]->request(5));
+    const auto failed = loop.wait_mode("error");
+    check(failed.at("peers").at(0).at("tool_calls") == 2,
+            "empty close-only tool loop bypassed the consecutive-call limit");
+}
+
+static void test_telepathy_rejects_tokens_after_close() {
+    fixture f(4, 8192, true, false, true);
+    enable_link(f);
+    auto a = f.peers[0]->request(2);
+    a->send({110, 2});
+    a->wait_consumed(1);
+    const auto before = f.session->state();
+    a->send({999});
+    const auto failed = f.wait_mode("error");
+    for (size_t i = 0; i < f.peers.size(); ++i) {
+        for (const auto * field : {"tokens", "generated", "imported"}) {
+            check(failed.at("peers").at(i).at(field) == before.at("peers").at(i).at(field),
+                    "a later packet after the reasoning terminator modified a private or shared tape");
+        }
+    }
+    check(f.peers[0]->request_count() == 3 && f.peers[1]->request_count() == 1,
+            "malformed post-terminator stream started a private turn or resumed the peer");
+    std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+    check(f.peers[0]->parsed_turns.size() == 1 && f.peers[0]->result_messages.size() == 1,
+            "malformed post-terminator stream reached native tool parsing or execution");
+}
+
 int main() {
     try {
         test_streaming_boundary_and_resume();
@@ -937,6 +1367,15 @@ int main() {
         test_natural_final_answer_with_tools();
         test_reset_during_tool_template_operation();
         test_peer_error_survives_private_final_answer();
+        test_telepathy_catalogue_and_initial_privacy();
+        test_telepathy_shared_order_and_disable();
+        test_telepathy_intentional_yield();
+        test_telepathy_pause_and_reset();
+        test_telepathy_independent_final_answers();
+        test_telepathy_mcp_call_is_private();
+        test_telepathy_command_during_last_final_answer();
+        test_telepathy_tool_round_limit();
+        test_telepathy_rejects_tokens_after_close();
         std::puts("crossthink tests: passed");
         return 0;
     } catch (const std::exception & error) {

@@ -43,7 +43,7 @@ static bool parse(int argc, char ** argv, options & opts) {
     enum {
         OPT_HOST = 256, OPT_PORT, OPT_CHUNK, OPT_SPLICE_MODE, OPT_SENTENCE_AFTER,
         OPT_ANSWER, OPT_SEED, OPT_TEMPERATURE, OPT_KEY, OPT_MCP_CONFIG, OPT_MCP_TIMEOUT,
-        OPT_TOOL_TOKENS, OPT_TOOL_ROUNDS,
+        OPT_TOOL_TOKENS, OPT_TOOL_ROUNDS, OPT_LEGACY_SPLICE, OPT_LINK_QUANTUM, OPT_LINK_WAIT,
     };
     const struct option names[] = {
         {"socket-a", required_argument, nullptr, 'a'},
@@ -52,6 +52,9 @@ static bool parse(int argc, char ** argv, options & opts) {
         {"file", required_argument, nullptr, 'f'},
         {"host", required_argument, nullptr, OPT_HOST},
         {"port", required_argument, nullptr, OPT_PORT},
+        {"legacy-splice", no_argument, nullptr, OPT_LEGACY_SPLICE},
+        {"link-quantum", required_argument, nullptr, OPT_LINK_QUANTUM},
+        {"link-wait-tokens", required_argument, nullptr, OPT_LINK_WAIT},
         {"splice-mode", required_argument, nullptr, OPT_SPLICE_MODE},
         {"max-segment-tokens", required_argument, nullptr, OPT_CHUNK},
         {"chunk-tokens", required_argument, nullptr, OPT_CHUNK},
@@ -100,6 +103,9 @@ static bool parse(int argc, char ** argv, options & opts) {
             }
             case OPT_HOST: opts.host = optarg; break;
             case OPT_PORT: opts.port = static_cast<int>(number(optarg, 65535)); break;
+            case OPT_LEGACY_SPLICE: opts.session.telepathy = false; break;
+            case OPT_LINK_QUANTUM: opts.session.link_quantum = static_cast<int32_t>(number(optarg, 4096)); break;
+            case OPT_LINK_WAIT: opts.session.link_wait_tokens = static_cast<int32_t>(number(optarg, 65536)); break;
             case OPT_CHUNK: opts.session.chunk_tokens = static_cast<int32_t>(number(optarg, 4096)); break;
             case OPT_SENTENCE_AFTER: opts.session.sentence_after = static_cast<int32_t>(number(optarg, 4096)); break;
             case OPT_SPLICE_MODE: {
@@ -133,17 +139,20 @@ static bool parse(int argc, char ** argv, options & opts) {
             }
             case 'h':
                 std::cout << "Usage: " << argv[0] << " -a SOCKET -b SOCKET [options]\n"
-                    "Continuous token exchange with an interactive browser console.\n\n"
+                    "Two agents with an optional shared reasoning channel and browser console.\n\n"
                     "  -a, --socket-a PATH       First llama-server socket\n"
                     "  -b, --socket-b PATH       Second llama-server socket\n"
                     "  -p, --prompt TEXT         Start thinking immediately (default: wait for browser)\n"
                     "  -f, --file PATH           Read initial prompt (- for stdin)\n"
                     "      --host HOST           Console address (default: 127.0.0.1)\n"
                     "      --port PORT           Console port (default: 8090)\n"
-                    "      --splice-mode MODE    paragraph rendezvous or fixed intervals (default: paragraph)\n"
-                    "      --max-segment-tokens N Hard segment ceiling, 1..4096 (default: 512)\n"
+                    "      --link-quantum N      Reasoning quantum, 1..4096 tokens (default: 8)\n"
+                    "      --link-wait-tokens N   Maximum voluntary yield, 1..65536 tokens (default: 512)\n"
+                    "      --legacy-splice       Restore covert reasoning exchange (default: explicit link)\n"
+                    "      --splice-mode MODE    Legacy paragraph rendezvous or fixed intervals (default: paragraph)\n"
+                    "      --max-segment-tokens N Legacy segment ceiling, 1..4096 (default: 512)\n"
                     "      --chunk-tokens N      Alias for --max-segment-tokens\n"
-                    "      --sentence-after N    Allow sentence boundaries after N tokens, 1..4096 (default: 256)\n"
+                    "      --sentence-after N    Legacy sentence threshold, 1..4096 tokens (default: 256)\n"
                     "      --answer-tokens N     Answer budget, 1..65536 (default: 1024)\n"
                     "      --seed N              Initial sampling seed (default: 42)\n"
                     "      --temperature N       Sampling temperature (default: 1.0)\n"
@@ -152,7 +161,7 @@ static bool parse(int argc, char ** argv, options & opts) {
                     "      --mcp-timeout N       MCP HTTP timeout, 1..600 seconds (default: 60)\n"
                     "      --tool-turn-tokens N  Private turn budget, 1..16384 (default: 2048)\n"
                     "                           Effective budget is max(N, --answer-tokens)\n"
-                    "      --max-tool-rounds N   Tool rounds between paragraphs, 1..64 (default: 8)\n"
+                    "      --max-tool-rounds N   Consecutive tool round limit, 1..64 (default: 8)\n"
                     "  -h, --help                Show help\n";
                 return false;
             default: throw std::invalid_argument("unknown option; use --help");
@@ -160,6 +169,9 @@ static bool parse(int argc, char ** argv, options & opts) {
     }
     if (!opts.session.chunk_tokens || !opts.session.sentence_after) {
         throw std::invalid_argument("segment ceiling and sentence threshold must be at least 1");
+    }
+    if (!opts.session.link_quantum || !opts.session.link_wait_tokens) {
+        throw std::invalid_argument("link quantum and yield token limit must be at least 1");
     }
     if (!opts.mcp_timeout || !opts.session.tool_tokens || !opts.session.max_tool_rounds) {
         throw std::invalid_argument("MCP timeout, tool turn budget and tool round limit must be at least 1");
@@ -201,7 +213,7 @@ static void routes(httplib::Server & http, crossthink_session & session) {
         response.set_header("Cache-Control", "no-store");
         response.set_content(session.state().dump(), "application/json");
     });
-    for (const std::string action : {"message", "pause", "resume", "answer", "reset"}) {
+    for (const std::string action : {"message", "pause", "resume", "answer", "reset", "link_on", "link_off"}) {
         http.Post("/" + action, [&, action](const httplib::Request & request, httplib::Response & response) {
             try {
                 const auto type = request.get_header_value("Content-Type");
@@ -277,7 +289,7 @@ int main(int argc, char ** argv) {
             const auto configs = load_mcp_config(opts.mcp_config);
             for (auto & service : tool_services) {
                 service = crossthink_mcp_service(configs, opts.mcp_timeout);
-                if (!opts.session.paragraph_splice && !service->tools().empty()) {
+                if (!opts.session.telepathy && !opts.session.paragraph_splice && !service->tools().empty()) {
                     throw std::invalid_argument("MCP tools require --splice-mode paragraph");
                 }
             }

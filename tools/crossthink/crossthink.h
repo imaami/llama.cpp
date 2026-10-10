@@ -28,6 +28,9 @@ struct crossthink_options {
     double temperature = 1.0;
     int32_t tool_tokens = 2048;
     int32_t max_tool_rounds = 8;
+    bool telepathy = true;
+    int32_t link_quantum = 8;
+    int32_t link_wait_tokens = 512;
 };
 
 class crossthink_transport {
@@ -37,6 +40,8 @@ public:
     virtual crossthink_json describe() = 0;
     virtual std::vector<llama_token> initial_prompt(const std::string & text) = 0;
     virtual std::vector<llama_token> next_user(const std::string & text) = 0;
+    virtual void configure_peer(const std::string &) { throw std::runtime_error("transport does not support peer identities"); }
+    virtual std::vector<llama_token> text_tokens(const std::string &) { throw std::runtime_error("transport does not support text tokenization"); }
     virtual void configure_tools(const crossthink_json &) { throw std::runtime_error("transport does not support tools"); }
     virtual crossthink_json parse_tool_turn(const std::vector<llama_token> &) { throw std::runtime_error("transport does not support tool parsing"); }
     virtual std::vector<llama_token> tool_results(const crossthink_json &, const crossthink_json &) {
@@ -81,6 +86,7 @@ private:
         uint64_t forced_splices = 0;
         uint64_t tool_calls = 0;
         int32_t tool_rounds = 0;
+        uint32_t generation_limit = 0;
         std::string tool_status;
         std::string boundary;
         llama_token close_token = -1;
@@ -88,11 +94,13 @@ private:
         bool thinking_open = false;
         bool answer_done = false;
         bool segment_done = false;
+        bool private_pending = false;
     };
 
     struct pending_command {
         std::string action;
         std::string text;
+        std::string resume_mode;
     };
 
     crossthink_options options;
@@ -113,6 +121,30 @@ private:
     bool stopping = false;
     bool busy = false;
     pending_command pending;
+    bool answer_requested = false;
+    bool link_enabled = false;
+    bool link_pending = false;
+    bool link_requested = false;
+    int link_requester = -1;
+    int link_speaker = -1;
+    size_t link_next = 0;
+    int private_owner = -1;
+    int link_yield_to = -1;
+    uint64_t link_yield_tokens = 0;
+    std::string link_wait;
+    std::string link_previous_boundary;
+    std::array<std::vector<llama_token>, 2> link_labels;
+    std::array<std::vector<llama_token>, 2> link_interrupt_labels;
+    std::array<std::vector<llama_token>, 2> link_markers;
+
+    bool native_tools(const peer_state & peer) const { return options.telepathy || bool(peer.tools); }
+    void clear_link_wait();
+    void request_link(bool enabled, int requester, const std::string & wait = {});
+    bool apply_link();
+    void append_shared(const std::vector<llama_token> & tokens);
+    void start_speaker(size_t index);
+    void finish_link(const std::string & reason);
+    void telepathy_worker(size_t index);
 
     crossthink_json state_locked() const;
     void emit(crossthink_json event);

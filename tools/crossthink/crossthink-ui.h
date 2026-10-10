@@ -42,6 +42,9 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
     .peer-header { padding: 13px 16px; border-bottom: 1px solid #343b48; }
     .peer-a h2 { color: #b7d5ff; }
     .peer-b h2 { color: #d4baff; }
+    .shared { margin-bottom: 16px; border-color: #586953; }
+    .shared h2 { color: #c3dfaa; }
+    .shared .thought { height: min(43vh, 480px); min-height: 160px; }
     .stats { display: flex; gap: 6px 14px; flex-wrap: wrap; margin-top: 7px; font: 11px/1.6 ui-monospace, monospace; color: #aeb8ca; }
     .panel-head { padding: 12px 16px 6px; }
     .follow { font-size: 12px; color: #aab4c5; user-select: none; white-space: nowrap; }
@@ -81,10 +84,12 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
     <h1>llama.cpp <span style="font-weight:400;color:#aeb9cd">/ crossthink</span></h1>
     <span id="connection" class="connection" role="status">Connecting...</span>
 </header>
-<p class="muted">Two live reasoning streams, exchanging their newly generated reasoning.</p>
+<p class="muted" id="description">Two agents that can choose to think together through a labeled telepathic link.</p>
 <div class="toolbar">
     <div id="mode" class="mode"><span class="status-dot"></span><span id="mode-text">Loading...</span></div>
     <div class="actions">
+        <button type="button" id="link_on" disabled hidden>Enable link</button>
+        <button type="button" id="link_off" disabled hidden>Disable link</button>
         <button type="button" id="pause" disabled>Pause</button>
         <button type="button" id="resume" disabled>Resume</button>
         <button type="button" id="answer" disabled>Answer now</button>
@@ -95,15 +100,25 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
 <p id="tools-status" class="muted" role="status"></p>
 <div id="error" class="notice error" role="alert" hidden></div>
 <div id="warning" class="notice" role="status" hidden></div>
+<section id="shared-panel" class="peer shared" aria-label="Shared telepathic reasoning" hidden>
+    <div class="peer-header panel-head">
+        <div><h2>Shared reasoning</h2><p id="link-status" class="muted" role="status">Link off / both agents think privately</p></div>
+        <label class="follow"><input id="follow-shared" type="checkbox" checked>Follow</label>
+    </div>
+    <div class="clipped" id="clipped-shared" hidden>Older displayed text was trimmed. Model context is unchanged.</div>
+    <pre id="shared" class="output thought empty" data-empty="Either agent can enable the telepathic link with its built-in tool. You can also enable it above."></pre>
+</section>
 <main class="peers">
     <section class="peer peer-a" aria-label="Model A">
         <div class="peer-header">
             <h2>Model A</h2>
             <div class="stats" id="stats-A"><span>Waiting for status</span></div>
         </div>
-        <div class="panel-head"><h3>Live reasoning</h3><label class="follow"><input id="follow-A" type="checkbox" checked>Follow</label></div>
+        <div id="private-A">
+        <div class="panel-head"><h3 id="reasoning-label-A">Private reasoning</h3><label class="follow"><input id="follow-A" type="checkbox" checked>Follow</label></div>
         <div class="clipped" id="clipped-A" hidden>Older displayed text was trimmed. Model context is unchanged.</div>
         <pre id="thought-A" class="output thought empty" data-empty="Send a message to begin."></pre>
+        </div>
         <div class="answer-wrap">
             <div class="panel-head"><h3>Answer</h3></div>
             <div id="answer-A" class="output answer empty" data-empty="Choose Answer now to finish reasoning and generate answers."></div>
@@ -119,9 +134,11 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
             <h2>Model B</h2>
             <div class="stats" id="stats-B"><span>Waiting for status</span></div>
         </div>
-        <div class="panel-head"><h3>Live reasoning</h3><label class="follow"><input id="follow-B" type="checkbox" checked>Follow</label></div>
+        <div id="private-B">
+        <div class="panel-head"><h3 id="reasoning-label-B">Private reasoning</h3><label class="follow"><input id="follow-B" type="checkbox" checked>Follow</label></div>
         <div class="clipped" id="clipped-B" hidden>Older displayed text was trimmed. Model context is unchanged.</div>
         <pre id="thought-B" class="output thought empty" data-empty="Send a message to begin."></pre>
+        </div>
         <div class="answer-wrap">
             <div class="panel-head"><h3>Answer</h3></div>
             <div id="answer-B" class="output answer empty" data-empty="Choose Answer now to finish reasoning and generate answers."></div>
@@ -138,11 +155,11 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
     <label for="message" class="muted">Message both models</label>
     <textarea id="message" name="message" placeholder="Ask a question, add a constraint, or redirect the discussion." required></textarea>
     <div class="send-row">
-        <span class="muted">Messages and pause requests take effect after the current segments finish. Ctrl+Enter or Cmd+Enter sends.</span>
+        <span class="muted">Controls take effect after current work finishes. Ctrl+Enter or Cmd+Enter sends.</span>
         <button id="send" class="primary" type="submit" disabled>Send to both</button>
     </div>
 </form>
-<footer>This page controls one shared crossthink session. The ordinary llama-server web interfaces remain separate conversations. Each reasoning pane shows only that model's own output; imported tokens are not repeated.</footer>
+<footer>This page controls one crossthink session. Shared reasoning appears once, with the same speaker labels seen by both agents. Private reasoning, tool calls, and final answers remain separate. The ordinary llama-server web interfaces are separate conversations.</footer>
 <script>
 (() => {
     'use strict';
@@ -167,8 +184,8 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         const output = outputs[key];
         output.node.data = '';
         output.element.classList.add('empty');
-        if (key.startsWith('thought-')) {
-            byId('clipped-' + key.slice(-1)).hidden = true;
+        if (output.clipped) {
+            output.clipped.hidden = true;
         }
     }
 
@@ -183,8 +200,8 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         output.element.classList.remove('empty');
         if (output.node.length > textLimit) {
             output.node.deleteData(0, output.node.length - textLimit);
-            if (output.follow) {
-                byId('clipped-' + key.slice(-1)).hidden = false;
+            if (output.clipped) {
+                output.clipped.hidden = false;
             }
         }
         if (follow) {
@@ -192,15 +209,14 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         }
     }
 
-    for (const peer of peers) {
-        for (const kind of ['thought', 'answer']) {
-            const key = kind + '-' + peer;
-            const element = byId(key);
-            const node = document.createTextNode('');
-            element.appendChild(node);
-            outputs[key] = { element, node, follow: kind === 'thought' ? byId('follow-' + peer) : null };
-        }
-        const output = outputs['thought-' + peer];
+    function initOutput(key, followId = null, clippedId = null) {
+        const element = byId(key);
+        const node = document.createTextNode('');
+        element.appendChild(node);
+        const output = { element, node, follow: followId ? byId(followId) : null,
+            clipped: clippedId ? byId(clippedId) : null };
+        outputs[key] = output;
+        if (!output.follow) { return; }
         output.follow.addEventListener('change', () => {
             if (output.follow.checked) {
                 output.element.scrollTop = output.element.scrollHeight;
@@ -212,6 +228,11 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
             }
         }, { passive: true });
     }
+    for (const peer of peers) {
+        initOutput('thought-' + peer, 'follow-' + peer, 'clipped-' + peer);
+        initOutput('answer-' + peer);
+    }
+    initOutput('shared', 'follow-shared', 'clipped-shared');
 
     function updateControls() {
         const available = !!state && connected && !pending && !state.busy;
@@ -221,6 +242,30 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         byId('answer').disabled = !available || !['thinking', 'paused'].includes(mode);
         byId('reset').disabled = !available;
         byId('send').disabled = !available || mode === 'answering' || !byId('message').value.trim();
+        const canLink = available && state.telepathy && ['thinking', 'paused'].includes(mode) && !state.error &&
+            !(state.peers || []).some(peer => peer.answer_done);
+        byId('link_on').disabled = !canLink || state.link_enabled;
+        byId('link_off').disabled = !canLink || !state.link_enabled;
+    }
+
+    function updateLink() {
+        const telepathy = !!(state && state.telepathy);
+        const enabled = telepathy && !!state.link_enabled;
+        byId('shared-panel').hidden = !telepathy;
+        byId('link_on').hidden = !telepathy || enabled;
+        byId('link_off').hidden = !enabled;
+        let text = enabled ? 'Link on / shared reasoning' : 'Link off / both agents think privately';
+        if (enabled && peers.includes(state.link_speaker)) {
+            text += ' / ' + state.link_speaker + ' speaking';
+        }
+        if (enabled && state.link_wait) {
+            text += ' / voluntary yield until ' + state.link_wait;
+        }
+        byId('link-status').textContent = text;
+        for (const peer of peers) {
+            byId('private-' + peer).hidden = enabled;
+            byId('reasoning-label-' + peer).textContent = telepathy ? 'Private reasoning' : 'Live reasoning';
+        }
     }
 
     function applyState(next) {
@@ -231,12 +276,17 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         byId('mode').dataset.mode = state.mode;
         byId('mode-text').textContent = (state.mode || 'Unknown') + (state.busy ? ' / applying request' : '');
         const number = value => Number.isFinite(value) ? value.toLocaleString() : '?';
-        const paragraph = state.splice_mode === 'paragraph';
-        byId('splice-status').textContent = paragraph ?
+        const paragraph = !state.telepathy && state.splice_mode === 'paragraph';
+        byId('description').textContent = state.telepathy ?
+            'Two agents that can choose to think together through a labeled telepathic link.' :
+            'Two live reasoning streams with covert peer imports.';
+        byId('splice-status').textContent = state.telepathy ?
+            'Explicit telepathy / ' + number(state.exchanges) + ' shared fragments' : paragraph ?
             'Paragraph rendezvous / ' + number(state.exchanges) + ' exchanges' : 'Fixed intervals';
         const hasTools = Number(state.tools) > 0;
         byId('tools-status').textContent = hasTools ?
-            'MCP / ' + number(state.tools) + ' tools available to each model' : 'MCP tools not configured';
+            number(state.tools) + ' tools available to each model' +
+                (state.telepathy ? ' / includes the built-in telepathic link' : ' / MCP') : 'MCP tools not configured';
         for (const peer of state.peers || []) {
             if (!peers.includes(peer.name)) {
                 continue;
@@ -269,6 +319,7 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         if (state.error) {
             notice('error', state.error);
         }
+        updateLink();
         updateControls();
     }
 
@@ -306,6 +357,9 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
             if (outputs['thought-' + peer].node.length) {
                 appendOutput('thought-' + peer, '\n\n--- New message ---\n\n');
             }
+        }
+        if (outputs.shared.node.length) {
+            appendOutput('shared', '\n\n--- New message ---\n\n');
         }
     }
 
@@ -350,6 +404,23 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         switch (record.type) {
             case 'token':
                 if (peer) { appendOutput('thought-' + peer, record.text); }
+                break;
+            case 'shared':
+                if (peer) {
+                    appendOutput('shared', record.text);
+                    if (state && record.label) {
+                        state.link_speaker = peer;
+                        updateLink();
+                    }
+                }
+                break;
+            case 'link':
+                if (state && typeof record.enabled === 'boolean') {
+                    state.link_enabled = record.enabled;
+                    if (!record.enabled) { state.link_speaker = null; state.link_wait = ''; }
+                    updateLink();
+                    updateControls();
+                }
                 break;
             case 'answer_start':
                 if (peer) { clearOutput('answer-' + peer); }
@@ -449,7 +520,7 @@ static constexpr char crossthink_ui[] = R"html(<!doctype html>
         }
     }
 
-    for (const action of ['pause', 'resume', 'answer']) {
+    for (const action of ['pause', 'resume', 'answer', 'link_on', 'link_off']) {
         byId(action).addEventListener('click', () => command('/' + action));
     }
     byId('reset').addEventListener('click', () => {

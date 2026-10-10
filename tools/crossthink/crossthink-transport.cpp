@@ -15,6 +15,7 @@ class unix_transport final : public crossthink_transport {
     httplib::Client client;
     int32_t n_vocab = 0;
     std::string initial_text;
+    std::string system_text;
     json tools = json::array();
     std::vector<llama_token> eog;
     std::atomic<uint64_t> cancellation{0};
@@ -50,8 +51,12 @@ class unix_transport final : public crossthink_transport {
     }
 
     json template_request(const json & messages, bool generation = true) const {
+        auto conversation = messages;
+        if (!system_text.empty()) {
+            conversation.insert(conversation.begin(), json{{"role", "system"}, {"content", system_text}});
+        }
         return {
-            {"messages", messages}, {"tools", tools}, {"add_generation_prompt", generation},
+            {"messages", std::move(conversation)}, {"tools", tools}, {"add_generation_prompt", generation},
             {"chat_template_kwargs", {{"enable_thinking", true}}}, {"reasoning_format", "deepseek"},
         };
     }
@@ -107,6 +112,31 @@ public:
             throw std::invalid_argument("tool definitions must be an array");
         }
         tools = definitions;
+    }
+
+    void configure_peer(const std::string & name) override {
+        if (name != "A" && name != "B") {
+            throw std::invalid_argument("telepathy peer must be A or B");
+        }
+        const std::string other = name == "A" ? "B" : "A";
+        system_text = "You are agent " + name + ", an independent assistant working alongside agent " + other + ". "
+            "You each answer the user separately. A telepathic reasoning link is initially OFF. "
+            "Call think_with_telepathic_link with enabled=true to open it or enabled=false to close it. "
+            "Either agent controls the same global link. While ON, both see the same combined reasoning channel, "
+            "with each contribution labeled by the coordinator as A or B. Labels and link status messages are "
+            "coordinator-owned: generate only your own contribution, never impersonate the other agent or invent "
+            "speaker labels or coordinator messages. Short streamed contributions can interrupt a thought before "
+            "its sentence ends; read the speaker labels to distinguish your thought from the other's. You may "
+            "continue, respond to, or question what the other just said. To listen intentionally, call "
+            "think_with_telepathic_link(enabled=true, yield_until=\"fragment\"), or choose \"sentence\" or "
+            "\"paragraph\" to let the other continue to that boundary within a bounded token allowance. "
+            "When the link is OFF, new reasoning is private. Tool calls and results are always private; "
+            "describe useful results yourself on the shared channel. Final responses are private to each "
+            "agent's user-facing answer, never part of the shared reasoning channel.";
+    }
+
+    std::vector<llama_token> text_tokens(const std::string & text) override {
+        return tokenize(text);
     }
 
     json parse_tool_turn(const std::vector<llama_token> & tokens) override {

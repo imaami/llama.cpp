@@ -21,8 +21,8 @@ struct server_splice_scanner {
     unsigned sentence = 0;
     bool generated_content = false;
 
-    void begin_generation() {
-        generated_content = false;
+    void begin_generation(bool continuation = false) {
+        generated_content &= continuation;
         paragraph = false;
     }
 

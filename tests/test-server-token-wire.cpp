@@ -181,7 +181,7 @@ struct route_fixture {
         return {json::parse(packet.metadata), packet.tokens};
     }
 
-    streamed_result binary_stream(json options, const llama_tokens & prompt) {
+    streamed_result binary_stream(json options, const llama_tokens & prompt, bool allow_error = false) {
         options["stream"] = true;
         const std::function<bool()> stop = [] { return false; };
         const server_http_req request = {{}, {}, {}, {}, server_token_wire::encode(options.dump(), prompt), {}, stop};
@@ -204,7 +204,8 @@ struct route_fixture {
                     result.tokens.insert(result.tokens.end(), p.tokens.begin(), p.tokens.end());
                     result.content += metadata.value("content", std::string());
                 } else {
-                    check(type == "done" && p.tokens.empty(), "invalid terminal frame: " + p.metadata);
+                    check((type == "done" || (allow_error && type == "error")) && p.tokens.empty(),
+                        "invalid terminal frame: " + p.metadata);
                     result.metadata = metadata;
                     done = true;
                 }
@@ -234,6 +235,7 @@ static void test_routes(const char * model, bool mtp) {
     check(info.at("protocol") == "LLMTOK01" && info.at("n_vocab") == 259, "wrong fixture vocabulary");
     check(info.at("stream") == true, "stream support not advertised");
     check(info.at("splice") == true, "splice support not advertised");
+    check(info.at("splice_quantum") == true, "quantum splice support not advertised");
     check(info.at("fingerprint") == json::parse(fixture.call(routes.get_tokens_info, "").second).at("fingerprint"), "unstable fingerprint");
 
     const llama_tokens prompt = {1, 100, 101, 102};
@@ -306,6 +308,59 @@ static void test_routes(const char * model, bool mtp) {
     utf8["n_predict"] = 1;
     check(fixture.binary_stream(utf8, prompt).tokens == llama_tokens{3 + 0xc3}, "stream lost incomplete UTF-8 at token limit");
 
+    json quantum = options;
+    quantum["n_predict"] = 11;
+    quantum["splice"] = {{"token_after", 3}};
+    quantum["grammar"] = "root ::= \"abcdef\"";
+    const auto short_plain = fixture.binary(quantum, prompt);
+    const auto short_stream = fixture.binary_stream(quantum, prompt);
+    check(short_plain.second == llama_tokens({3 + 'a', 3 + 'b', 3 + 'c'}) && short_stream.tokens == short_plain.second,
+        "quantum did not stop at the requested committed token count");
+    check(short_stream.content == "abc" && short_plain.first.at("splice_boundary") == "quantum" &&
+        short_stream.metadata.at("splice_boundary") == "quantum", "quantum boundary missing");
+
+    quantum["n_predict"] = 9;
+    quantum["ignore_eos"] = false;
+    quantum["splice"]["token_after"] = 1;
+    for (const std::string & text : {std::string("\xc3\xa9"), std::string("\xe2\x82\xac"), std::string("\xf0\x9f\x90\xba")}) {
+        quantum["grammar"] = "root ::= " + json(text + "x").dump();
+        const auto complete = fixture.binary_stream(quantum, prompt);
+        check(complete.content == text && complete.tokens.size() == text.size(), "quantum split a UTF-8 character");
+        check(complete.metadata.at("splice_boundary") == "quantum", "completed UTF-8 lacks quantum marker");
+        check(json::parse(complete.packets.front().metadata).at("content") == "", "quantum exposed a partial UTF-8 character");
+    }
+    quantum["n_predict"] = 1;
+    const auto incomplete = fixture.binary_stream(quantum, prompt, true);
+    check(incomplete.metadata.at("type") == "error", "quantum hard limit silently accepted incomplete UTF-8");
+    check(incomplete.content.empty(), "quantum hard limit exposed incomplete UTF-8 text");
+    check(fixture.call(routes.post_completions_tokens, server_token_wire::encode(quantum.dump(), prompt)).first == 500,
+        "nonstream quantum hard limit silently accepted incomplete UTF-8");
+
+    quantum["n_predict"] = 16;
+    quantum["splice"] = {{"sentence_after", 1}, {"token_after", 3}};
+    quantum["grammar"] = "root ::= \"A. Next\"";
+    const auto clean_sentence = fixture.binary_stream(quantum, prompt);
+    check(clean_sentence.content == "A. " && clean_sentence.metadata.at("splice_boundary") == "sentence",
+        "quantum took priority over a clean sentence");
+    quantum["splice"]["sentence_after"] = 4096;
+    quantum["grammar"] = "root ::= \"A\\n\\nNext\"";
+    const auto clean_paragraph = fixture.binary_stream(quantum, prompt);
+    check(clean_paragraph.content == "A\n\n" && clean_paragraph.metadata.at("splice_boundary") == "paragraph",
+        "quantum took priority over a clean paragraph");
+
+    quantum["splice"] = {{"sentence_after", 1}, {"token_after", 1}};
+    quantum["grammar"] = "root ::= \"\\nNext\"";
+    const auto continued_paragraph = fixture.binary_stream(quantum, {1, 3 + 'A', 3 + '\n'});
+    check(continued_paragraph.content == "\n" && continued_paragraph.metadata.at("splice_boundary") == "paragraph",
+        "quantum lost a paragraph separator across requests");
+    quantum["grammar"] = "root ::= \" Next\"";
+    const auto continued_sentence = fixture.binary_stream(quantum, {1, 3 + 'A', 3 + '.'});
+    check(continued_sentence.content == " " && continued_sentence.metadata.at("splice_boundary") == "sentence",
+        "quantum lost a sentence boundary across requests");
+    quantum["grammar"] = "root ::= \"\\nNext\"";
+    const auto empty_paragraph = fixture.binary_stream(quantum, {1, 3 + '\n'});
+    check(empty_paragraph.metadata.at("splice_boundary") == "quantum", "quantum treated an empty prefix as a paragraph");
+
     json splice = options;
     splice["n_predict"] = 96;
     splice["ignore_eos"] = false;
@@ -359,6 +414,10 @@ static void test_routes(const char * model, bool mtp) {
             {{"splice", true}}, {{"splice", json::object()}}, {{"splice", {{"sentence_after", 0}}}},
             {{"splice", {{"sentence_after", -1}}}}, {{"splice", {{"sentence_after", 4097}}}},
             {{"splice", {{"sentence_after", 1.5}}}}, {{"splice", {{"sentence_after", 1}, {"unknown", true}}}},
+            {{"splice", {{"token_after", 0}}}}, {{"splice", {{"token_after", -1}}}},
+            {{"splice", {{"token_after", 4097}}}}, {{"splice", {{"token_after", UINT64_MAX}}}},
+            {{"splice", {{"token_after", 1.5}}}}, {{"splice", {{"token_after", true}}}},
+            {{"splice", {{"token_after", "1"}}}}, {{"splice", {{"token_after", 1}, {"unknown", true}}}},
             {{"splice", {{"sentence_after", 1}}}, {"stop", json::array({"x"})}},
             {{"splice", {{"sentence_after", 1}}}, {"n_indent", 1}},
             {{"splice", {{"sentence_after", 1}}}, {"t_max_predict_ms", 1}}}) {
@@ -399,7 +458,7 @@ static void test_tool_routes(const char * model, bool mtp) {
         {"n_predict", 16}, {"seed", 42}, {"temperature", 0}, {"cache_prompt", false},
         {"preserved_tokens", json::array({"</think>"})}, {"grammar", "root ::= \"</think>\""},
         {"logit_bias", json::array({json::array({close.front(), 1000})})},
-        {"splice", {{"sentence_after", 4096}, {"stop_on_think_close", true}}},
+        {"splice", {{"sentence_after", 4096}, {"token_after", 1}, {"stop_on_think_close", true}}},
     };
     const llama_tokens prompt = {1, 259};
     const auto plain = fixture.binary(options, prompt);
@@ -410,6 +469,7 @@ static void test_tool_routes(const char * model, bool mtp) {
     check(streamed.metadata.at("stop_type") == "limit", "think closure has wrong stop type");
 
     options["splice"]["stop_on_think_close"] = false;
+    options["splice"].erase("token_after");
     options["n_predict"] = 2;
     options.erase("grammar");
     const auto disabled = fixture.binary_stream(options, prompt);
@@ -418,6 +478,17 @@ static void test_tool_routes(const char * model, bool mtp) {
     options["splice"]["stop_on_think_close"] = "yes";
     check(fixture.call(routes.post_completions_tokens, server_token_wire::encode(options.dump(), prompt)).first == 400,
         "invalid think-close option accepted");
+
+    const json clean = {
+        {"n_predict", 16}, {"seed", 42}, {"temperature", 0}, {"cache_prompt", false},
+        {"grammar", "root ::= \"First\\n\\nNext\""}, {"splice", {{"sentence_after", 4096}, {"token_after", 12}}},
+    };
+    for (const char * marker : {"<|im_start|>", "<think>", "</think>"}) {
+        const auto history = tokenize(std::string("```cpp\nold fenced text\n") + marker + "new thought\n");
+        const auto fresh = fixture.binary_stream(clean, history);
+        check(fresh.content == "First\n\n" && fresh.metadata.at("splice_boundary") == "paragraph",
+            "scanner prefix optimization retained a fence before the latest reset marker");
+    }
 
     const auto output = tokenize("</think>\n\n<tool_call>\n<function=calculator>\n<parameter=expression>\n1+1\n</parameter>\n</function>\n</tool_call>");
     json body = {
