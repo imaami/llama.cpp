@@ -2402,7 +2402,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        // A single-token draft never feeds its hidden state into another draft step.
+        llama_set_embeddings_nextn(ctx_dft, this->params.n_max != 1, /*masked*/ true);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -2812,7 +2813,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2858,6 +2858,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 if (chain_heads) {
                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448031546
                     chain_h[seq_id].insert(chain_h[seq_id].end(), h_row, h_row + n_embd);
