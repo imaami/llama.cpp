@@ -4588,9 +4588,9 @@ struct test_ssm_conv : public test_case {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
         if (strided) {
-            a = ggml_new_tensor_3d(ctx, type, ne_a[0] + 128, ne_a[1] + 1, ne_a[2]);
+            a = ggml_new_tensor_3d(ctx, type, ne_a[0], ne_a[1] + 128, ne_a[2]);
             a = ggml_view_3d(ctx, a, ne_a[0], ne_a[1], ne_a[2], a->nb[1], a->nb[2], 256);
-            b = ggml_new_tensor_2d(ctx, type, ne_b[0] + 128, ne_b[1]);
+            b = ggml_new_tensor_2d(ctx, type, ne_b[0], ne_b[1] + 128);
             b = ggml_view_2d(ctx, b, ne_b[0], ne_b[1], b->nb[1], 256);
         }
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
@@ -4625,9 +4625,9 @@ struct test_ssm_conv_bias_silu : public test_case {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
         if (strided) {
-            a = ggml_new_tensor_3d(ctx, type, ne_a[0] + 128, ne_a[1] + 1, ne_a[2]);
+            a = ggml_new_tensor_3d(ctx, type, ne_a[0], ne_a[1] + 128, ne_a[2]);
             a = ggml_view_3d(ctx, a, ne_a[0], ne_a[1], ne_a[2], a->nb[1], a->nb[2], 256);
-            b = ggml_new_tensor_2d(ctx, type, ne_b[0] + 128, ne_b[1]);
+            b = ggml_new_tensor_2d(ctx, type, ne_b[0], ne_b[1] + 128);
             b = ggml_view_2d(ctx, b, ne_b[0], ne_b[1], b->nb[1], 256);
         }
         ggml_set_name(a, "a");
