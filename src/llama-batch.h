@@ -133,7 +133,8 @@ struct llama_batch_ext {
             llama_seq_id n_seq_max,
             llama_memory_i * mem,
             llama_token n_vocab,
-            size_t n_pos_per_embd);
+            size_t n_pos_per_embd,
+            size_t n_embd_state = 0);
 
     void clear();
 

@@ -62,9 +62,10 @@ struct batch_builder {
             llama_seq_id n_seq_max = 4,
             uint32_t n_pos_per_embd = 1,
             llama_token n_vocab = 0,
-            uint32_t n_embd_inp_enc = 0)
+            uint32_t n_embd_inp_enc = 0,
+            uint32_t n_embd_state = 0)
         : n_embd(n_embd),
-          b(/*n_tokens_max*/ 64, n_embd, n_embd_inp_enc > 0 ? n_embd_inp_enc : n_embd, n_seq_max, mem, n_vocab, n_pos_per_embd) {}
+          b(/*n_tokens_max*/ 64, n_embd, n_embd_inp_enc > 0 ? n_embd_inp_enc : n_embd, n_seq_max, mem, n_vocab, n_pos_per_embd, n_embd_state) {}
 
     // one embedding row for batch index i, values 100*i + k so ubatch contents can be traced back
     std::vector<float> row(int32_t i, uint32_t width) const {
@@ -1131,6 +1132,65 @@ static void test_compat(testing & t) {
     });
 }
 
+static void test_state_embd(testing & t) {
+    llama_vocab vocab;
+
+    for (bool mixed : {false, true}) {
+        t.test(mixed ? "mixed_rows_out_of_order" : "token_rows_out_of_order", [&](testing & t) {
+            const uint32_t n_state = 3;
+            batch_builder bb(2, nullptr, 4, 1, 10, 0, n_state);
+            for (int32_t i = 0; i < 4; ++i) {
+                if (mixed && i % 2 != 0) {
+                    bb.add(i / 2, {i % 2}, true);
+                } else {
+                    bb.add_tok(i + 1, i / 2, i % 2, true);
+                }
+            }
+            for (int32_t i : {2, 0, 3, 1}) {
+                const auto row = bb.row(i, n_state);
+                t.assert_true(llama_batch_ext_set_embd_state(&bb.b, i, {row.data(), 1, n_state}));
+            }
+
+            llama_batch_allocr ba(1, true);
+            t.assert_true(ba.init(bb.b, vocab, false));
+
+            const auto check = [&](const llama_ubatch & ub, std::initializer_list<int32_t> indices) {
+                t.assert_equal((uint32_t) indices.size(), ub.n_tokens);
+                t.assert_true(ub.embd_state != nullptr);
+                if (ub.n_tokens != indices.size() || !ub.embd_state) {
+                    return;
+                }
+                uint32_t row = 0;
+                for (int32_t i : indices) {
+                    t.assert_equal(i / 2, ub.pos[row]);
+                    t.assert_equal(i % 2, ub.seq_id[row][0]);
+                    for (uint32_t k = 0; k < n_state; ++k) {
+                        t.assert_equal(100.0f*i + k, ub.embd_state[row*n_state + k]);
+                    }
+                    if (mixed && i % 2 != 0) {
+                        t.assert_true(ub.embd != nullptr);
+                        if (ub.embd) {
+                            for (uint32_t k = 0; k < bb.n_embd; ++k) {
+                                t.assert_equal(100.0f*i + k, ub.embd[row*bb.n_embd + k]);
+                            }
+                        }
+                    } else {
+                        t.assert_equal(i + 1, ub.token[row]);
+                    }
+                    ++row;
+                }
+            };
+
+            check(ba.split_simple(4), {0, 1, 2, 3});
+            ba.split_reset();
+            check(ba.split_simple(2), {0, 1});
+            check(ba.split_simple(2), {2, 3});
+            ba.split_reset();
+            check(ba.split_equal(4, false, 0), {0, 2, 1, 3});
+        });
+    }
+}
+
 static void test_mtp_embd_width(testing & t) {
     t.test("mtp_keeps_n_embd_inp_and_takes_state_at_n_embd_out", [&](testing & t) {
         llama_hparams hparams = {};
@@ -1198,6 +1258,7 @@ int main(int argc, char ** argv) {
     t.test("split",          test_split);
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
+    t.test("state_embd",     test_state_embd);
     t.test("mtp_embd_width", test_mtp_embd_width);
 
     return t.summary();
