@@ -2,6 +2,7 @@
 
 #include "server-token-wire.h"
 #include "crossthink-mcp.h"
+#include "crossthink-speech.h"
 
 #include <nlohmann/json.hpp>
 
@@ -29,7 +30,8 @@ struct crossthink_options {
     int32_t tool_tokens = 2048;
     int32_t max_tool_rounds = 8;
     bool telepathy = true;
-    int32_t link_quantum = 8;
+    int32_t link_quantum = 64;
+    int32_t private_quantum = 256;
     int32_t link_wait_tokens = 512;
 };
 
@@ -87,6 +89,9 @@ private:
         uint64_t tool_calls = 0;
         int32_t tool_rounds = 0;
         uint32_t generation_limit = 0;
+        uint64_t link_blank_tokens = 0;
+        bool link_turn_content = false;
+        crossthink_speech_guard speech_guard;
         std::string tool_status;
         std::string boundary;
         llama_token close_token = -1;
@@ -139,6 +144,7 @@ private:
 
     bool native_tools(const peer_state & peer) const { return options.telepathy || bool(peer.tools); }
     void clear_link_wait();
+    void clear_link_speech();
     void request_link(bool enabled, int requester, const std::string & wait = {});
     bool apply_link();
     void append_shared(const std::vector<llama_token> & tokens);

@@ -33,7 +33,7 @@ Once both servers are ready:
 build/bin/llama-crossthink \
     --socket-a /tmp/crossthink.XXXXXXXX/a.sock \
     --socket-b /tmp/crossthink.XXXXXXXX/b.sock \
-    --port 8090 --link-quantum 8 --link-wait-tokens 512 \
+    --port 8090 --link-quantum 64 --private-quantum 256 --link-wait-tokens 512 \
     --answer-tokens 1024
 ```
 
@@ -54,19 +54,22 @@ Both agents receive their own identity and the built-in tool schema through the 
 
 `enabled` is required and controls the link for both agents. Set it to `false` to return to private reasoning. `yield_until` is optional: `fragment`, `sentence`, or `paragraph` lets the other agent continue to that boundary before the caller takes another turn. Calling with `enabled: true` while already linked can therefore yield the floor without changing the link state. Without a voluntary yield, the coordinator alternates short speaking quanta. A yield has a token ceiling, so a model that never completes a paragraph cannot monopolize the channel indefinitely.
 
-Every linked contribution carries a coordinator-supplied speaker label in both models' contexts and in the shared console. A speaker change before a sentence or paragraph boundary is marked as an interruption. The other agent can then continue the same thought, challenge it, or introduce another one. Labels identify the actual source regardless of what names occur in generated prose.
+Every linked contribution carries a coordinator-supplied speaker label in both models' contexts and in the shared console. A speaker change before a sentence or paragraph boundary is marked as an interruption. The other agent can then continue the same thought, challenge it, or introduce another one. Labels identify the actual source regardless of what names occur in generated prose. During linked reasoning, an eager sampling grammar reserves line-leading `[A` and `[B` prefixes for the coordinator, so a model cannot autocomplete another speaker label. The constraint follows partial prefixes across requests from the same speaker. Inline brackets remain available for ordinary reasoning. Native tool turns, private reasoning, and final answers do not use this constraint.
 
 Sharing uses short, serialized completion requests. Only one agent contributes at a time, and its committed token IDs enter both histories before the other generates. This gives both agents the same causal order: concurrent requests would each sample from a stale view of what the other is saying. Their complete histories still differ because identities, private reasoning, and tools are private. The shared subsequence is identical; this is not a shared KV cache.
 
-The default quantum is eight tokens; a sentence or paragraph boundary can end it earlier. Tokens stream to the browser as the server commits them, and the next speaker gets them when that quantum ends. A quantum can extend to finish an incomplete UTF-8 character. It does not wait for a paragraph. Reducing the quantum makes interruptions more immediate but adds more completion requests, label tokens, and prompt/cache work; increasing it gives longer uninterrupted turns. Speech remains interleaved, not simultaneous, and there is no claim of improved throughput or accuracy.
+The default shared quantum is 64 tokens; a sentence or paragraph boundary with model-generated text can end the speaking turn earlier. Tokens stream to the browser as the server commits them, and the next speaker gets them when that quantum ends. A quantum can extend to finish an incomplete UTF-8 character. It does not wait for a paragraph. Fragments containing only whitespace, ASCII punctuation, or common Unicode dashes/bullets keep the same speaker instead of inserting another label and handing over an empty turn. After 64 generated tokens without substantive speech, the session pauses with an explicit error. No generated text or token IDs are silently removed. A voluntary yield still has its configured token ceiling. Reducing the quantum makes interruptions more immediate but adds more completion requests, label tokens, and prompt/cache work; increasing it gives longer uninterrupted turns. Speech remains interleaved, not simultaneous, and there is no claim of improved throughput or accuracy.
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `--link-quantum N` | `8` | Reasoning request quantum, `1..4096` generated tokens, while linked or private. A character may require a small extension. |
+| `--link-quantum N` | `64` | Shared reasoning request quantum, `1..4096` generated tokens. A character may require a small extension. |
+| `--private-quantum N` | `256` | Private reasoning request quantum, `1..4096` generated tokens; independent of shared handoffs. |
 | `--link-wait-tokens N` | `512` | Voluntary yield ceiling, `1..65536` generated tokens, with up to eight extra tokens allowed to finish a UTF-8 character. |
 | `--max-segment-tokens N` | `512` | Legacy exchange ceiling, `1..4096`; does not change explicit telepathy quanta. |
 | `--answer-tokens N` | `1024` | Final answer budget, `1..65536`. |
 | `--legacy-splice` | Off | Restore the earlier covert exchange and omit the built-in link tool. |
+
+With the link off, both agents use independent private requests of up to 256 tokens by default. Private requests do not stop at sentence boundaries; a paragraph or native reasoning closure can still end them earlier. This reduces repeated prompt evaluation and sampler setup. Output still streams token by token. Larger private quanta can delay manual controls or a pending link change until the current safe boundary.
 
 A model can close its reasoning naturally to call a tool or answer. When one gives its final answer, the shared link ends. Its partner continues reasoning privately until its own answer; it is not forced to answer prematurely. The console keeps the answers in separate panels. **Answer now** explicitly asks both to finish instead.
 
@@ -169,7 +172,7 @@ When native tools are enabled, `splice.stop_on_think_close` also stops at the si
 
 The `reasoning-swap` branch was rebased onto `imaami/llama.cpp`'s `bonsai` commit `5ada589b7811232c44d55dbf210329d98414fb4d`. All four preceding prototype commits replayed without conflicts or patch changes. Release CPU builds passed for `llama-server`, `llama-crossthink`, and the four test binaries below.
 
-Coordinator tests cover default-off private reasoning, built-in tool discovery without MCP, identical ordering of the shared transcript, speaker/interruption labels, enable/disable barriers, bounded fragment/sentence/paragraph yields, private MCP calls and results, and independent natural final answers. They also cover pause/reset cancellation, repeated deliberate yields, tool-loop limits, malformed completion records, and user controls racing with the last final answer. Earlier fixed/paragraph exchange tests remain enabled.
+Coordinator tests cover default-off private reasoning, built-in tool discovery without MCP, identical ordering of the shared transcript, speaker/interruption labels, enable/disable barriers, bounded fragment/sentence/paragraph yields, private MCP calls and results, and independent natural final answers. They also cover pause/reset cancellation, repeated deliberate yields, tool-loop limits, malformed completion records, and user controls racing with the last final answer. Whitespace, punctuation-only, and temporarily empty UTF-8 display fragments are tested separately from speech: empty turns do not alternate labels, and sustained output without speech pauses explicitly. The label constraint is tested across request boundaries, with ordinary inline brackets, Unicode text, and native reasoning closure. Earlier fixed/paragraph exchange tests remain enabled.
 
 The in-process binary endpoint tests passed with seeded tiny Qwen3.5 fixtures, both without speculation and with MTP enabled. They cover token framing, cached continuation, paragraph/sentence stops, UTF-8 completion across two-, three-, and four-byte characters, incomplete-character errors at the hard ceiling, boundary priority, cross-request separators, code fences and prefix resets, native reasoning closure, and tool output parsing. The random fixtures rejected every speculative draft, so these runs do not validate a splice inside an accepted multi-token batch.
 

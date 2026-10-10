@@ -23,6 +23,7 @@ struct fake_step {
     std::vector<llama_token> tokens;
     bool done = false;
     crossthink_json result;
+    std::string content = "piece";
 };
 
 struct fake_request {
@@ -37,9 +38,9 @@ struct fake_request {
     bool returned = false;
     bool stale_accepted = false;
 
-    void send(std::vector<llama_token> tokens) {
+    void send(std::vector<llama_token> tokens, const std::string & content = "piece") {
         std::lock_guard<std::mutex> lock(mutex);
-        steps.push_back({std::move(tokens), false, {}});
+        steps.push_back({std::move(tokens), false, {}, content});
         changed.notify_all();
     }
 
@@ -218,7 +219,7 @@ public:
                 return step.result;
             }
             lock.unlock();
-            const bool accepted = receive(packet(step.tokens));
+            const bool accepted = receive(packet(step.tokens, step.content));
             lock.lock();
             ++request->consumed;
             request->changed.notify_all();
@@ -259,8 +260,8 @@ public:
     }
 
 private:
-    static server_token_wire::packet packet(const std::vector<llama_token> & tokens) {
-        return {crossthink_json{{"type", "tokens"}, {"content", "piece"}}.dump(), tokens};
+    static server_token_wire::packet packet(const std::vector<llama_token> & tokens, const std::string & content = "piece") {
+        return {crossthink_json{{"type", "tokens"}, {"content", content}}.dump(), tokens};
     }
 };
 
@@ -374,6 +375,7 @@ struct fixture {
         options.sentence_after = 2;
         options.telepathy = telepathy;
         options.link_quantum = 2;
+        options.private_quantum = 4;
         options.link_wait_tokens = 8;
         options.max_tool_rounds = max_tool_rounds;
         session = std::make_unique<crossthink_session>(std::move(transports), options, std::move(services));
@@ -958,6 +960,7 @@ static void finish_thought(const std::shared_ptr<fake_request> & request,
 }
 
 static void finish_private(const std::shared_ptr<fake_request> & request, llama_token body = 501) {
+    check(!request->parameters.contains("grammar"), "private tool or answer turn inherited the linked speech grammar");
     request->send({body, 3});
     request->finish("eos", "");
 }
@@ -1009,6 +1012,8 @@ static void append_text(std::vector<llama_token> & tokens, fake_transport & peer
 
 static void test_telepathy_catalogue_and_initial_privacy() {
     check(crossthink_options{}.telepathy, "telepathy mode is not the default");
+    check(crossthink_options{}.link_quantum == 64, "the default telepathy quantum is not 64 tokens");
+    check(crossthink_options{}.private_quantum == 256, "the default private quantum is not 256 tokens");
     fixture f(4, 8192, true, false, true);
     const auto initial = f.session->state();
     check(initial.at("telepathy").get<bool>() && !initial.at("link_enabled").get<bool>(),
@@ -1023,6 +1028,15 @@ static void test_telepathy_catalogue_and_initial_privacy() {
     f.start();
     auto a = f.peers[0]->request(0);
     auto b = f.peers[1]->request(0);
+    check(!a->parameters.contains("grammar") && !b->parameters.contains("grammar"),
+            "private off-link reasoning inherited the linked speech grammar");
+    for (const auto & request : {a, b}) {
+        const auto & splice = request->parameters.at("splice");
+        check(splice.at("token_after") == 4 && request->parameters.at("n_predict") == 12,
+                "off-link reasoning used the shared quantum instead of its independent private budget");
+        check(!splice.contains("sentence_after") && splice.at("stop_on_think_close").get<bool>(),
+                "private reasoning retained short sentence stops or lost native tool stopping");
+    }
     finish_thought(a, {101});
     auto next_a = f.peers[0]->request(1);
     b->send({201});
@@ -1042,6 +1056,9 @@ static void test_telepathy_shared_order_and_disable() {
     check(a->parameters.at("splice").at("sentence_after") == 1,
             "short shared fragments did not recognize early sentence boundaries");
     check(a->parameters.at("n_predict") == 10, "shared quantum omitted the bounded UTF-8 allowance");
+    check(a->parameters.contains("grammar") && !a->parameters.at("grammar_lazy").get<bool>() &&
+            !a->parameters.at("backend_sampling").get<bool>(),
+            "linked speech grammar was absent, lazy, or bypassed by backend sampling");
     check(count(a->prompt, 101) == 1 && !count(a->prompt, 201),
             "enabling the link retroactively mixed private thoughts");
     a->send({110, 111});
@@ -1082,6 +1099,12 @@ static void test_telepathy_shared_order_and_disable() {
     auto private_a = f.peers[0]->request(5);
     auto private_b = f.peers[1]->request(2);
     check(!f.session->state().at("link_enabled").get<bool>(), "native disable call left the link enabled");
+    for (const auto & request : {private_a, private_b}) {
+        check(request->parameters.at("splice").at("token_after") == 4 &&
+                !request->parameters.at("splice").contains("sentence_after") &&
+                !request->parameters.contains("grammar"),
+                "disabling the link did not restore private generation pacing and sampling");
+    }
     expected.push_back(112);
     auto completed = expected;
     append_text(completed, *f.peers[0], "\n[Telepathic link OFF: continue privately.]\n");
@@ -1352,6 +1375,151 @@ static void test_telepathy_rejects_tokens_after_close() {
             "malformed post-terminator stream reached native tool parsing or execution");
 }
 
+static void test_telepathy_blank_fragment_retains_speaker() {
+    fixture f(4, 8192, true, false, true);
+    enable_link(f);
+    auto a = f.peers[0]->request(2);
+    a->send({110, 111}, "\n\n");
+    a->finish("limit", "paragraph");
+    auto same_a = f.peers[0]->request(3);
+    check(f.peers[1]->request_count() == 1 && shared_labels(f).size() == 1,
+            "blank paragraph switched speakers or inserted a new label");
+    same_a->send({112, 113}, " \t");
+    same_a->finish("limit", "quantum");
+    auto still_a = f.peers[0]->request(4);
+    check(f.peers[1]->request_count() == 1 && shared_labels(f).size() == 1,
+            "blank quantum switched speakers or repeated the current speaker label");
+    still_a->send({114}, "-\n");
+    still_a->finish("limit", "paragraph");
+    auto after_dash = f.peers[0]->request(5);
+    check(f.peers[1]->request_count() == 1 && shared_labels(f).size() == 1,
+            "punctuation-only output switched speakers or inserted a new label");
+    after_dash->send({115}, "\xe2\x80\x94\n");
+    after_dash->finish("limit", "paragraph");
+    auto after_unicode_dash = f.peers[0]->request(6);
+    check(f.peers[1]->request_count() == 1 && shared_labels(f).size() == 1,
+            "a standalone Unicode dash yielded the floor or inserted a speaker label");
+    after_unicode_dash->send({116}, "A meaningful thought.");
+    after_unicode_dash->finish("limit", "sentence");
+    auto b = f.peers[1]->request(1);
+    check(shared_labels(f).size() == 2, "meaningful speech did not release the floor to the twin");
+    for (llama_token token = 110; token <= 116; ++token) {
+        check(count(b->prompt, token) == 1, "blank-fragment continuation changed the canonical token stream");
+    }
+    f.pause();
+}
+
+static void test_telepathy_blank_loop_is_bounded() {
+    fixture f(4, 8192, true, false, true);
+    enable_link(f);
+    for (size_t i = 0; i < 32; ++i) {
+        auto a = f.peers[0]->request(2 + i);
+        check(f.peers[1]->request_count() == 1 && shared_labels(f).size() == 1,
+                "blank-only loop alternated speakers or emitted repeated labels");
+        a->send({static_cast<llama_token>(110 + 2 * i), static_cast<llama_token>(111 + 2 * i)},
+                i % 4 == 0 ? "\n \t\r" : i % 4 == 1 ? "" : i % 4 == 2 ? "-\n" : "\xe2\x80\x94\n");
+        a->finish("limit", i % 2 ? "quantum" : "paragraph");
+    }
+    const auto paused = f.wait_mode("paused");
+    check(paused.at("error").get<std::string>().find("no substantive speech") != std::string::npos,
+            "blank-only loop paused without explaining its lack of substantive speech");
+    check(f.peers[0]->request_count() == 34 && f.peers[1]->request_count() == 1 &&
+            shared_labels(f).size() == 1, "blank-only loop was not bounded at 64 whitespace or invisible tokens");
+}
+
+static void test_telepathy_speech_grammar_follows_speaker_state() {
+    fixture f(4, 8192, true, false, true);
+    enable_link(f);
+    auto a = f.peers[0]->request(2);
+    const auto lead_grammar = a->parameters.at("grammar").get<std::string>();
+    check(lead_grammar.find("root ::= lead\n") == 0, "shared speech did not begin with the line-leading grammar state");
+    a->send({110}, "[");
+    a->finish("limit", "quantum");
+    auto continuation = f.peers[0]->request(3);
+    check(continuation->parameters.at("grammar").get<std::string>().find("root ::= bracket\n") == 0,
+            "a bracket split across shared requests lost the speech grammar state");
+    check(shared_labels(f).size() == 1 && f.peers[1]->request_count() == 1,
+            "an isolated bracket yielded the floor or inserted a speaker label");
+    continuation->send({111}, "ordinary bracket contents] Actual words.");
+    continuation->finish("limit", "sentence");
+    auto b = f.peers[1]->request(1);
+    check(b->parameters.at("grammar").get<std::string>() == lead_grammar,
+            "a new speaker inherited the previous speaker's bracket or body grammar state");
+    check(!b->parameters.at("grammar_lazy").get<bool>() &&
+            !b->parameters.at("backend_sampling").get<bool>(),
+            "new-speaker grammar was not applied immediately by the CPU sampler");
+    f.pause();
+}
+
+static void test_telepathy_utf8_content_spanning_packets() {
+    fixture f(4, 8192, true, false, true);
+    enable_link(f);
+    auto a = f.peers[0]->request(2);
+    a->send({110}, "");
+    a->wait_consumed(1);
+    a->send({111}, "\xc3\xa4");
+    a->finish("limit", "quantum");
+    auto b = f.peers[1]->request(1);
+    check(count(b->prompt, 110) == 1 && count(b->prompt, 111) == 1 && shared_labels(f).size() == 2,
+            "UTF-8 text delayed until a later packet was classified as a blank fragment");
+    f.pause();
+}
+
+static void test_telepathy_blank_fragments_do_not_fulfill_yield() {
+    for (const std::string pace : {"fragment", "sentence", "paragraph"}) {
+        fixture f(4, 8192, true, false, true);
+        enable_link(f, pace);
+        const auto boundary = pace == "fragment" ? "quantum" : pace;
+        auto b = f.peers[1]->request(1);
+        b->send({210, 211}, "\n\n");
+        b->finish("limit", boundary);
+        auto continuation = f.peers[1]->request(2);
+        check(f.peers[0]->request_count() == 2 && shared_labels(f).size() == 1,
+                "whitespace alone fulfilled an intentionally granted speaking turn");
+        continuation->send({212}, "A meaningful thought.");
+        continuation->finish("limit", boundary);
+        auto a = f.peers[0]->request(2);
+        check(count(a->prompt, 210) == 1 && count(a->prompt, 211) == 1 && count(a->prompt, 212) == 1,
+                "delayed voluntary yield lost the canonical shared token stream");
+        f.pause();
+    }
+
+    fixture f(4, 8192, true, false, true);
+    enable_link(f, "paragraph");
+    for (size_t i = 0; i < 4; ++i) {
+        auto b = f.peers[1]->request(1 + i);
+        b->send({static_cast<llama_token>(210 + 2 * i), static_cast<llama_token>(211 + 2 * i)}, "");
+        b->finish("limit", "paragraph");
+    }
+    auto a = f.peers[0]->request(2);
+    check(f.peers[1]->request_count() == 5 && shared_labels(f).size() == 2,
+            "a blank voluntary turn bypassed its configured token ceiling");
+    for (llama_token token = 210; token < 218; ++token) {
+        check(count(a->prompt, token) == 1, "bounded blank yield dropped shared tokens");
+    }
+    f.pause();
+}
+
+static void test_telepathy_blank_tool_boundary_does_not_fulfill_yield() {
+    fixture f(4, 8192, true, true, true);
+    enable_link(f, "fragment");
+    native_call(*f.peers[1], "calculator", {{"expression", "6*7"}});
+    auto b = f.peers[1]->request(1);
+    b->send({210, 2}, "\n</think>");
+    b->finish("limit", "tool");
+    finish_private(f.peers[1]->request(2), 503);
+    f.tools[1]->request(0)->finish({{"content", {{{"type", "text"}, {"text", "42"}}}}});
+    auto continuation = f.peers[1]->request(3);
+    check(f.peers[0]->request_count() == 2,
+            "whitespace before a private tool call fulfilled the granted speaking turn");
+    continuation->send({211}, "A meaningful thought.");
+    continuation->finish("limit", "quantum");
+    auto a = f.peers[0]->request(2);
+    check(count(a->prompt, 210) == 1 && count(a->prompt, 211) == 1 && !count(a->prompt, 503),
+            "resuming a blank tool boundary lost shared tokens or copied the private tool call");
+    f.pause();
+}
+
 int main() {
     try {
         test_streaming_boundary_and_resume();
@@ -1376,6 +1544,12 @@ int main() {
         test_telepathy_command_during_last_final_answer();
         test_telepathy_tool_round_limit();
         test_telepathy_rejects_tokens_after_close();
+        test_telepathy_blank_fragment_retains_speaker();
+        test_telepathy_blank_loop_is_bounded();
+        test_telepathy_speech_grammar_follows_speaker_state();
+        test_telepathy_utf8_content_spanning_packets();
+        test_telepathy_blank_fragments_do_not_fulfill_yield();
+        test_telepathy_blank_tool_boundary_does_not_fulfill_yield();
         std::puts("crossthink tests: passed");
         return 0;
     } catch (const std::exception & error) {

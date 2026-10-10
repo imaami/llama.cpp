@@ -1,4 +1,4 @@
-add_library(crossthink-engine STATIC crossthink-engine.cpp crossthink.h)
+add_library(crossthink-engine STATIC crossthink-engine.cpp crossthink.h crossthink-speech.h)
 target_include_directories(crossthink-engine PUBLIC . ../server)
 target_link_libraries(crossthink-engine PUBLIC llama vendor::nlohmann Threads::Threads)
 target_compile_features(crossthink-engine PUBLIC cxx_std_17)

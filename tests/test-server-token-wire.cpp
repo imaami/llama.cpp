@@ -2,6 +2,7 @@
 #include "../tools/server/server-context.h"
 #include "../tools/server/server-token-wire.h"
 #include "../tools/server/server-splice.h"
+#include "../tools/crossthink/crossthink-speech.h"
 
 #include <cstdio>
 #include <fstream>
@@ -114,6 +115,18 @@ static void test_splice_scanner() {
     check(std::string(scanner.boundary(true)).empty(), "prompt fence state was lost");
     scanner.feed("\n```\n\n");
     check(std::string(scanner.boundary(true)) == "paragraph", "continued fence did not close");
+}
+
+static void test_speech_progress() {
+    for (const std::string & text : {std::string(), std::string(" \t\r\n- . [] :"),
+            std::string("\xe2\x80\x93\xe2\x80\x94\xe2\x80\xa2\xe2\x80\xa6"),
+            std::string("\xc2\xa0\xe2\x80\x89\xe3\x80\x80")}) {
+        check(!crossthink_speech_guard::substantive(text), "punctuation or whitespace counted as speech");
+    }
+    for (const std::string & text : {std::string("a"), std::string("7"), std::string("\xc3\xa9"),
+            std::string("\xe6\x80\x9d")}) {
+        check(crossthink_speech_guard::substantive(text), "ordinary speech did not count as progress");
+    }
 }
 
 struct streamed_result {
@@ -361,6 +374,89 @@ static void test_routes(const char * model, bool mtp) {
     const auto empty_paragraph = fixture.binary_stream(quantum, {1, 3 + '\n'});
     check(empty_paragraph.metadata.at("splice_boundary") == "quantum", "quantum treated an empty prefix as a paragraph");
 
+    llama_tokens labeled_prompt = {1};
+    for (unsigned char byte : std::string("\n[A]: ")) {
+        labeled_prompt.push_back(3 + byte);
+    }
+    const std::string labeled_text = "\n\nNow I have a point to explain.";
+    std::string displayed;
+    size_t fragments = 0;
+    while (displayed.size() < labeled_text.size()) {
+        const auto remaining = labeled_text.substr(displayed.size());
+        const size_t count = std::min<size_t>(8, remaining.size());
+        quantum["n_predict"] = count + 8;
+        quantum["splice"] = {{"sentence_after", 1}, {"token_after", count}};
+        quantum["grammar"] = "root ::= " + json(remaining).dump();
+        const auto fragment = fixture.binary_stream(quantum, labeled_prompt);
+        check(!fragment.content.empty() && remaining.compare(0, fragment.content.size(), fragment.content) == 0,
+            "labeled quantum omitted or changed streamed text");
+        llama_tokens expected;
+        for (unsigned char byte : fragment.content) {
+            expected.push_back(3 + byte);
+        }
+        check(fragment.tokens == expected, "labeled quantum text and raw token IDs diverged");
+        if (!fragments) {
+            // The scanner sees the coordinator's label as content. The coordinator must distinguish silent fragments.
+            check(fragment.content == "\n\n" && fragment.metadata.at("splice_boundary") == "paragraph",
+                "label-seeded whitespace no longer reproduces the early paragraph boundary");
+        }
+        displayed += fragment.content;
+        labeled_prompt.insert(labeled_prompt.end(), fragment.tokens.begin(), fragment.tokens.end());
+        ++fragments;
+    }
+    check(displayed == labeled_text && fragments >= 3, "labeled multi-quantum display lost content");
+
+    crossthink_speech_guard speech;
+    json guarded = options;
+    guarded["n_predict"] = 10;
+    guarded["splice"] = {{"token_after", 2}};
+    guarded["grammar_lazy"] = false;
+    guarded["backend_sampling"] = false;
+    guarded["repeat_last_n"] = 64;
+    guarded["presence_penalty"] = 10000;
+    guarded["logit_bias"] = json::array({json::array({3 + '[', 1000}), json::array({3 + 'A', 900}),
+        json::array({3 + 'B', 800}), json::array({3 + 'C', 700})});
+    check(fixture.binary_stream(guarded, {1}).content == "[A", "unconstrained label fixture did not reproduce an echo");
+    guarded["grammar"] = speech.grammar();
+    check(fixture.binary_stream(guarded, {1}).content == "[C", "speech grammar allowed a reserved label prefix");
+
+    guarded["presence_penalty"] = 0;
+    guarded["n_predict"] = 9;
+    guarded["splice"]["token_after"] = 1;
+    const auto opening = fixture.binary_stream(guarded, {1});
+    check(opening.content == "[", "speech grammar rejected an undecided bracket prefix");
+    speech.feed(opening.content);
+    guarded["grammar"] = speech.grammar();
+    guarded["logit_bias"] = json::array({json::array({3 + 'A', 1000}), json::array({3 + 'B', 900}),
+        json::array({3 + 'C', 800})});
+    check(fixture.binary_stream(guarded, {1, 3 + '['}).content == "C",
+        "speech grammar lost the reserved prefix across quantum requests");
+
+    speech.reset();
+    speech.feed("Inline math ");
+    guarded["grammar"] = speech.grammar();
+    guarded["n_predict"] = 11;
+    guarded["splice"]["token_after"] = 3;
+    guarded["presence_penalty"] = 10000;
+    guarded["logit_bias"] = json::array({json::array({3 + '[', 1000}), json::array({3 + 'A', 900}),
+        json::array({3 + ']', 800})});
+    check(fixture.binary_stream(guarded, {1}).content == "[A]", "speech grammar rejected inline mathematical brackets");
+
+    speech.feed("\n \t");
+    guarded["grammar"] = speech.grammar();
+    guarded["n_predict"] = 10;
+    guarded["splice"]["token_after"] = 2;
+    guarded["logit_bias"] = json::array({json::array({3 + '[', 1000}), json::array({3 + 'A', 900}),
+        json::array({3 + 'B', 800}), json::array({3 + 'C', 700})});
+    check(fixture.binary_stream(guarded, {1}).content == "[C", "newline did not restore the reserved-label guard");
+    speech.feed("ordinary text\r");
+    guarded["grammar"] = speech.grammar();
+    check(fixture.binary_stream(guarded, {1}).content == "[C", "bare carriage return did not restore the reserved-label guard");
+    guarded["n_predict"] = 9;
+    guarded["splice"]["token_after"] = 1;
+    guarded["logit_bias"] = json::array({json::array({3 + 0xc3, 1000}), json::array({3 + 0xa9, 900})});
+    check(fixture.binary_stream(guarded, {1}).content == "\xc3\xa9", "speech grammar rejected multibyte Unicode");
+
     json splice = options;
     splice["n_predict"] = 96;
     splice["ignore_eos"] = false;
@@ -468,6 +564,18 @@ static void test_tool_routes(const char * model, bool mtp) {
         "think closure did not report tool boundary");
     check(streamed.metadata.at("stop_type") == "limit", "think closure has wrong stop type");
 
+    for (const char * prefix : {"", "[", "ordinary text"}) {
+        crossthink_speech_guard speech;
+        speech.feed(prefix);
+        auto guarded = options;
+        guarded["grammar"] = speech.grammar();
+        guarded["grammar_lazy"] = false;
+        guarded["backend_sampling"] = false;
+        const auto ended = fixture.binary_stream(guarded, prompt);
+        check(ended.tokens == close && ended.metadata.at("splice_boundary") == "tool",
+            "speech grammar blocked native reasoning closure");
+    }
+
     options["splice"]["stop_on_think_close"] = false;
     options["splice"].erase("token_after");
     options["n_predict"] = 2;
@@ -534,6 +642,7 @@ int main(int argc, char ** argv) {
         check(argc <= 3, "usage: test-server-token-wire [tiny-qwen35-mtp.gguf [tiny-qwen35-tools.gguf]]");
         test_codec();
         test_splice_scanner();
+        test_speech_progress();
         if (argc >= 2) {
             llama_backend_init();
             test_routes(argv[1], false);

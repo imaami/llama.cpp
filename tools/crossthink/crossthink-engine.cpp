@@ -17,6 +17,7 @@ static const char * peer_name(size_t index) {
 }
 
 static constexpr const char * link_tool_name = "think_with_telepathic_link";
+static constexpr uint64_t link_blank_limit = 64;
 
 static json link_tool() {
     return {{"type", "function"}, {"function", {
@@ -42,6 +43,7 @@ crossthink_session::crossthink_session(
             options.tool_tokens < 1 || options.tool_tokens > 16384 ||
             options.max_tool_rounds < 1 || options.max_tool_rounds > 64 ||
             options.link_quantum < 1 || options.link_quantum > 4096 ||
+            options.private_quantum < 1 || options.private_quantum > 4096 ||
             options.link_wait_tokens < 1 || options.link_wait_tokens > 65536) {
         throw std::invalid_argument("chunk/answer token limits are outside supported bounds");
     }
@@ -400,6 +402,18 @@ bool crossthink_session::receive(size_t index, uint64_t generation_epoch, bool a
         const auto end = content.find("</think>");
         if (end != std::string::npos) { content.resize(end); }
     }
+    if (shared) {
+        // Only newly generated text is speech. Coordinator labels are already
+        // in the prompt and can make the server report a blank paragraph.
+        const size_t spoken_tokens = packet.tokens.size() - (closed ? 1 : 0);
+        if (spoken_tokens && crossthink_speech_guard::substantive(content)) {
+            peer.link_turn_content = true;
+            peer.link_blank_tokens = 0;
+        } else {
+            peer.link_blank_tokens += spoken_tokens;
+        }
+        peer.speech_guard.feed(content);
+    }
     if (!content.empty()) {
         emit({{"type", shared ? "shared" : answer ? "answer" : "token"}, {"peer", peer_name(index)}, {"text", content}});
     }
@@ -578,7 +592,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         if (stopping || epoch != generation_epoch || mode == "error") {
             return false;
         }
-        const uint64_t reserve = (options.telepathy ? options.link_quantum + 128 : 2 * options.chunk_tokens) +
+        const uint64_t reserve = (options.telepathy ? std::max(options.link_quantum, options.private_quantum) + 128 : 2 * options.chunk_tokens) +
             budget + options.answer_tokens + 2;
         if (suffix.empty() || peer.tape.size() + suffix.size() + reserve >= peer.context_size) {
             throw std::runtime_error("tool results do not fit the remaining context; reset or reduce token budgets");
@@ -599,6 +613,14 @@ void crossthink_session::clear_link_wait() {
     link_yield_to = -1;
     link_yield_tokens = 0;
     link_wait.clear();
+}
+
+void crossthink_session::clear_link_speech() {
+    for (auto & peer : peers) {
+        peer.link_blank_tokens = 0;
+        peer.link_turn_content = false;
+        peer.speech_guard.reset();
+    }
 }
 
 void crossthink_session::request_link(bool enabled, int requester, const std::string & wait) {
@@ -643,6 +665,7 @@ bool crossthink_session::apply_link() {
     if (link_enabled != link_requested) {
         append_shared(link_markers[link_requested ? 1 : 0]);
         link_enabled = link_requested;
+        clear_link_speech();
         link_speaker = -1;
         link_previous_boundary.clear();
         link_next = 0;
@@ -667,11 +690,15 @@ void crossthink_session::start_speaker(size_t index) {
     const std::string text = "\n[" + std::string(peer_name(index)) +
         (interrupted ? " interrupts " + std::string(peer_name(1 - index)) : "") + "]: ";
     link_speaker = static_cast<int>(index);
+    peers[index].link_turn_content = false;
+    peers[index].link_blank_tokens = 0;
+    peers[index].speech_guard.reset();
     emit({{"type", "shared"}, {"peer", peer_name(index)}, {"text", text}, {"label", true}});
 }
 
 void crossthink_session::finish_link(const std::string & reason) {
     const bool was_enabled = link_enabled;
+    clear_link_speech();
     link_enabled = false;
     link_pending = false;
     link_requested = false;
@@ -720,6 +747,9 @@ void crossthink_session::telepathy_worker(size_t index) {
                 if (other.active) { continue; }
                 private_owner = static_cast<int>(index);
                 peer.private_pending = false;
+                peer.link_turn_content = false;
+                peer.link_blank_tokens = 0;
+                peer.speech_guard.reset();
                 peer.active = true;
                 if (peer.thinking_open) {
                     peer.tape.push_back(peer.close_token);
@@ -736,9 +766,10 @@ void crossthink_session::telepathy_worker(size_t index) {
                 changed.notify_all();
                 continue;
             }
-            const uint64_t quantum = link_enabled && link_yield_to == static_cast<int>(index)
-                ? std::min<uint64_t>(options.link_quantum, options.link_wait_tokens - link_yield_tokens)
-                : options.link_quantum;
+            const uint64_t quantum = !link_enabled ? options.private_quantum :
+                link_yield_to == static_cast<int>(index)
+                    ? std::min<uint64_t>(options.link_quantum, options.link_wait_tokens - link_yield_tokens)
+                    : options.link_quantum;
             const uint64_t budget = quantum + 8;
             const uint64_t reserve = budget + std::max(options.tool_tokens, options.answer_tokens) +
                 options.answer_tokens + 2;
@@ -769,9 +800,14 @@ void crossthink_session::telepathy_worker(size_t index) {
                 {"cache_prompt", true}, {"stream", true}, {"return_content", true},
                 {"reasoning_budget_tokens", -1}, {"logit_bias", std::move(bias)}, {"stop", json::array()},
                 {"preserved_tokens", json::array({"</think>"})},
-                {"splice", {{"sentence_after", 1},
-                    {"token_after", quantum}, {"stop_on_think_close", true}}},
+                {"splice", {{"token_after", quantum}, {"stop_on_think_close", true}}},
             };
+            if (shared) {
+                parameters["splice"]["sentence_after"] = 1;
+                parameters["grammar"] = peer.speech_guard.grammar();
+                parameters["grammar_lazy"] = false;
+                parameters["backend_sampling"] = false;
+            }
             peer.generation_limit = static_cast<uint32_t>(budget);
             peer.active = true;
             lock.unlock();
@@ -806,7 +842,7 @@ void crossthink_session::telepathy_worker(size_t index) {
                     // A tool call does not let the current speaker evade a bounded
                     // yield. Count its preceding shared words, excluding </think>.
                     link_yield_tokens += received - 1;
-                    if ((link_wait == "fragment" && received > 1) ||
+                    if ((link_wait == "fragment" && received > 1 && peer.link_turn_content) ||
                             link_yield_tokens >= static_cast<uint64_t>(options.link_wait_tokens)) {
                         clear_link_wait();
                         link_next = 1 - index;
@@ -824,15 +860,27 @@ void crossthink_session::telepathy_worker(size_t index) {
                 if (boundary == "paragraph") { peer.tool_rounds = 0; }
                 if (boundary == "limit") { ++peer.forced_splices; }
                 if (shared) {
+                    if (peer.link_blank_tokens >= link_blank_limit) {
+                        error = std::string(peer_name(index)) +
+                            ": telepathic generation produced 64 consecutive tokens with no substantive speech; request answers or reset";
+                        mode = "paused";
+                        clear_link_wait();
+                        emit({{"type", "error"}, {"message", error}});
+                        emit_state();
+                        changed.notify_all();
+                        continue;
+                    }
                     ++exchanges;
                     link_previous_boundary = boundary;
-                    bool keep_floor = false;
+                    bool keep_floor = !peer.link_turn_content;
                     if (link_yield_to == static_cast<int>(index)) {
                         link_yield_tokens += received;
-                        const bool done = link_wait == "fragment" || boundary == "paragraph" ||
-                            (link_wait == "sentence" && boundary == "sentence") ||
+                        const bool natural = peer.link_turn_content &&
+                            (link_wait == "fragment" || boundary == "paragraph" ||
+                                (link_wait == "sentence" && boundary == "sentence"));
+                        const bool done = natural ||
                             link_yield_tokens >= static_cast<uint64_t>(options.link_wait_tokens);
-                        if (done) { clear_link_wait(); }
+                        if (done) { clear_link_wait(); keep_floor = false; }
                         else { keep_floor = true; }
                     }
                     link_next = keep_floor ? index : 1 - index;
@@ -1045,7 +1093,7 @@ void crossthink_session::apply(const pending_command & command) {
                 ? peer.transport->initial_prompt(command.text)
                 : peer.transport->next_user(command.text);
             const uint64_t retained = reset ? 0 : peer.tape.size() + peer.inbox.size() + (peer.thinking_open ? 1 : 0);
-            const uint64_t reserve = (options.telepathy ? options.link_quantum + 128 :
+            const uint64_t reserve = (options.telepathy ? std::max(options.link_quantum, options.private_quantum) + 128 :
                 (options.paragraph_splice ? 2 : 5) * options.chunk_tokens) + options.answer_tokens + 2 +
                 (native_tools(peer) ? std::max(options.tool_tokens, options.answer_tokens) : 0);
             if (prepared[index].empty() || retained + prepared[index].size() + reserve >= peer.context_size) {
@@ -1086,6 +1134,7 @@ void crossthink_session::apply(const pending_command & command) {
         link_next = 0;
         private_owner = -1;
         clear_link_wait();
+        clear_link_speech();
         mode = "idle";
         emit({{"type", "reset"}});
     }
@@ -1110,6 +1159,7 @@ void crossthink_session::apply(const pending_command & command) {
         mode = "thinking";
         if (options.telepathy) {
             clear_link_wait();
+            clear_link_speech();
             link_speaker = -1;
             link_next = 0;
             if (link_enabled) { append_shared(link_markers[1]); }

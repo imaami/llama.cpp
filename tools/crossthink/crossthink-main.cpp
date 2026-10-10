@@ -43,7 +43,7 @@ static bool parse(int argc, char ** argv, options & opts) {
     enum {
         OPT_HOST = 256, OPT_PORT, OPT_CHUNK, OPT_SPLICE_MODE, OPT_SENTENCE_AFTER,
         OPT_ANSWER, OPT_SEED, OPT_TEMPERATURE, OPT_KEY, OPT_MCP_CONFIG, OPT_MCP_TIMEOUT,
-        OPT_TOOL_TOKENS, OPT_TOOL_ROUNDS, OPT_LEGACY_SPLICE, OPT_LINK_QUANTUM, OPT_LINK_WAIT,
+        OPT_TOOL_TOKENS, OPT_TOOL_ROUNDS, OPT_LEGACY_SPLICE, OPT_LINK_QUANTUM, OPT_LINK_WAIT, OPT_PRIVATE_QUANTUM,
     };
     const struct option names[] = {
         {"socket-a", required_argument, nullptr, 'a'},
@@ -54,6 +54,7 @@ static bool parse(int argc, char ** argv, options & opts) {
         {"port", required_argument, nullptr, OPT_PORT},
         {"legacy-splice", no_argument, nullptr, OPT_LEGACY_SPLICE},
         {"link-quantum", required_argument, nullptr, OPT_LINK_QUANTUM},
+        {"private-quantum", required_argument, nullptr, OPT_PRIVATE_QUANTUM},
         {"link-wait-tokens", required_argument, nullptr, OPT_LINK_WAIT},
         {"splice-mode", required_argument, nullptr, OPT_SPLICE_MODE},
         {"max-segment-tokens", required_argument, nullptr, OPT_CHUNK},
@@ -105,6 +106,7 @@ static bool parse(int argc, char ** argv, options & opts) {
             case OPT_PORT: opts.port = static_cast<int>(number(optarg, 65535)); break;
             case OPT_LEGACY_SPLICE: opts.session.telepathy = false; break;
             case OPT_LINK_QUANTUM: opts.session.link_quantum = static_cast<int32_t>(number(optarg, 4096)); break;
+            case OPT_PRIVATE_QUANTUM: opts.session.private_quantum = static_cast<int32_t>(number(optarg, 4096)); break;
             case OPT_LINK_WAIT: opts.session.link_wait_tokens = static_cast<int32_t>(number(optarg, 65536)); break;
             case OPT_CHUNK: opts.session.chunk_tokens = static_cast<int32_t>(number(optarg, 4096)); break;
             case OPT_SENTENCE_AFTER: opts.session.sentence_after = static_cast<int32_t>(number(optarg, 4096)); break;
@@ -146,7 +148,8 @@ static bool parse(int argc, char ** argv, options & opts) {
                     "  -f, --file PATH           Read initial prompt (- for stdin)\n"
                     "      --host HOST           Console address (default: 127.0.0.1)\n"
                     "      --port PORT           Console port (default: 8090)\n"
-                    "      --link-quantum N      Reasoning quantum, 1..4096 tokens (default: 8)\n"
+                    "      --link-quantum N      Shared reasoning quantum, 1..4096 tokens (default: 64)\n"
+                    "      --private-quantum N   Private reasoning quantum, 1..4096 tokens (default: 256)\n"
                     "      --link-wait-tokens N   Maximum voluntary yield, 1..65536 tokens (default: 512)\n"
                     "      --legacy-splice       Restore covert reasoning exchange (default: explicit link)\n"
                     "      --splice-mode MODE    Legacy paragraph rendezvous or fixed intervals (default: paragraph)\n"
@@ -170,8 +173,8 @@ static bool parse(int argc, char ** argv, options & opts) {
     if (!opts.session.chunk_tokens || !opts.session.sentence_after) {
         throw std::invalid_argument("segment ceiling and sentence threshold must be at least 1");
     }
-    if (!opts.session.link_quantum || !opts.session.link_wait_tokens) {
-        throw std::invalid_argument("link quantum and yield token limit must be at least 1");
+    if (!opts.session.link_quantum || !opts.session.private_quantum || !opts.session.link_wait_tokens) {
+        throw std::invalid_argument("reasoning quanta and yield token limit must be at least 1");
     }
     if (!opts.mcp_timeout || !opts.session.tool_tokens || !opts.session.max_tool_rounds) {
         throw std::invalid_argument("MCP timeout, tool turn budget and tool round limit must be at least 1");
