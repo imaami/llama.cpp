@@ -54,8 +54,9 @@ crossthink_session::crossthink_session(
         if ((options.paragraph_splice || options.telepathy) && !peer.info.value("splice", false)) {
             throw std::runtime_error("paragraph splicing requires updated model servers with splice support");
         }
-        if (options.telepathy && !peer.info.value("thought_commands", false)) {
-            throw std::runtime_error("thought commands require updated model servers with reasoning-command support");
+        if (options.telepathy && (!peer.info.value("thought_commands", false) ||
+                !peer.info.value("thought_command_lines", false))) {
+            throw std::runtime_error("thought commands require updated model servers with line-anchored reasoning-command support");
         }
         const int64_t n_vocab = peer.info.at("n_vocab").get<int64_t>();
         const int64_t context = peer.info.at("context_size").get<int64_t>();
@@ -151,6 +152,12 @@ json crossthink_session::state_locked() const {
         total_thinking += peer.thinking_tokens;
         total_rate += rate;
         total_thinking_rate += thinking_rate;
+        const std::string phase = mode == "error" ? "error" : peer.answer_done ? "done" :
+            peer.active ? peer.phase : peer.tape.empty() ? "idle" : mode == "paused" ? "paused" : "ready";
+        const auto elapsed = [&](std::chrono::steady_clock::time_point started) -> json {
+            return started == std::chrono::steady_clock::time_point{} ? json(nullptr) :
+                json(std::chrono::duration<double>(now - started).count());
+        };
         result["peers"].push_back({
             {"name", peer_name(index)}, {"tokens", peer.tape.size()}, {"queued", peer.inbox.size()},
             {"generated", peer.generated}, {"imported", peer.imported}, {"thinking_tokens", peer.thinking_tokens},
@@ -159,6 +166,8 @@ json crossthink_session::state_locked() const {
             {"waiting", peer.segment_done}, {"boundary", peer.boundary}, {"forced_splices", peer.forced_splices},
             {"tool_calls", peer.tool_calls}, {"tool_status", peer.tool_status}, {"answer_done", peer.answer_done},
             {"mailbox", peer.mailbox.size()}, {"thought_turn", peer.thought_turn},
+            {"phase", phase}, {"request_generated", peer.request_generated},
+            {"request_elapsed_seconds", elapsed(peer.request_started)}, {"last_token_age_seconds", elapsed(peer.last_token)},
         });
     }
     result["thinking_tokens"] = total_thinking;
@@ -184,6 +193,13 @@ void crossthink_session::begin_thought(peer_state & peer) {
     peer.thought_scanner.thinking = true;
 }
 
+void crossthink_session::begin_request(peer_state & peer, const char * phase) {
+    peer.request_started = std::chrono::steady_clock::now();
+    peer.last_token = {};
+    peer.request_generated = 0;
+    peer.phase = phase;
+}
+
 void crossthink_session::count_tokens(peer_state & peer, uint64_t generated, uint64_t thinking) {
     peer.generated += generated;
     peer.thinking_tokens += thinking;
@@ -191,7 +207,11 @@ void crossthink_session::count_tokens(peer_state & peer, uint64_t generated, uin
     while (!peer.samples.empty() && now - peer.samples.front().time > std::chrono::seconds(5)) {
         peer.samples.pop_front();
     }
-    if (generated) { peer.samples.push_back({now, generated, thinking}); }
+    if (generated) {
+        peer.samples.push_back({now, generated, thinking});
+        peer.request_generated += generated;
+        peer.last_token = now;
+    }
 }
 
 json crossthink_session::state() {
@@ -366,6 +386,7 @@ bool crossthink_session::receive(size_t index, uint64_t generation_epoch, bool a
             }
         }
     }
+    peer.phase = answer ? "answer" : "reasoning";
     count_tokens(peer, generated, thinking);
     std::string content = metadata.value("content", std::string());
     if (options.telepathy && closed) {
@@ -411,6 +432,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
     const auto prompt = peer.tape;
     std::vector<llama_token> output{peer.close_token};
     peer.tool_status = "generating tool call or answer";
+    begin_request(peer, "waiting_native");
     emit_state();
     lock.unlock();
     try {
@@ -430,6 +452,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
             }
             output.insert(output.end(), packet.tokens.begin(), packet.tokens.end());
             peer.tape.insert(peer.tape.end(), packet.tokens.begin(), packet.tokens.end());
+            peer.phase = "native_output";
             count_tokens(peer, packet.tokens.size(), 0);
             return true;
         });
@@ -442,6 +465,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
                 output.size() < 2 || !contains(peer.eog, output.back())) {
             throw std::runtime_error("tool/answer turn did not finish; increase --tool-turn-tokens if it hit the limit");
         }
+        peer.phase = "parsing_native";
         lock.unlock();
         auto assistant = peer.transport->parse_tool_turn(output);
         const auto calls = assistant.value("tool_calls", json::array());
@@ -495,6 +519,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
             ++peer.tool_calls;
             const auto arguments = call.at("function").at("arguments");
             peer.tool_status = name;
+            peer.phase = "mcp";
             emit({{"type", "tool_call"}, {"peer", peer_name(index)}, {"name", name},
                 {"call_id", call_id}, {"arguments", arguments}});
             emit_state();
@@ -529,6 +554,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
             }
             results.push_back({{"role", "tool"}, {"tool_call_id", call_id}, {"name", name}, {"content", content}});
         }
+        peer.phase = "tool_result";
         lock.unlock();
         const auto suffix = peer.transport->tool_results(assistant, results);
         lock.lock();
@@ -557,6 +583,7 @@ bool crossthink_session::thought_command(size_t index, uint64_t generation_epoch
         std::unique_lock<std::mutex> & lock) {
     auto & peer = peers[index];
     auto & other = peers[1 - index];
+    peer.phase = "thought_result";
     const std::string command = result.value("thought_command", std::string());
     const std::string failure = result.value("thought_error", std::string());
     if (command != "peek" && command != "send" && command != "inbox") {
@@ -719,8 +746,10 @@ void crossthink_session::telepathy_worker(size_t index) {
                 {"preserved_tokens", json::array({"</think>"})},
                 {"splice", {{"thought_commands", true}, {"stop_on_think_close", true}}},
             };
+            parameters["splice"]["thought_state"] = peer.thought_scanner.continuation_state();
             const auto continuation = peer.thought_scanner.continuation();
             if (!continuation.empty()) { parameters["splice"]["thought_prefix"] = continuation; }
+            begin_request(peer, "waiting_reasoning");
             lock.unlock();
             size_t received = 0;
             json result;
@@ -856,6 +885,7 @@ void crossthink_session::worker(size_t index) {
                 }
             }
             peer.active = true;
+            begin_request(peer, answer ? "waiting_native" : "waiting_reasoning");
             if (answer) {
                 emit({{"type", "answer_start"}, {"peer", peer_name(index)}});
             }
@@ -1010,6 +1040,10 @@ void crossthink_session::apply(const pending_command & command) {
             peer.mailbox_bytes = 0;
             peer.samples.clear();
             peer.sampling_started = std::chrono::steady_clock::now();
+            peer.request_started = {};
+            peer.last_token = {};
+            peer.request_generated = 0;
+            peer.phase = "idle";
         }
         round = 0;
         exchanges = 0;

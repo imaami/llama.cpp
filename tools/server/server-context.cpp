@@ -98,6 +98,7 @@ static json server_token_wire_info(const llama_vocab * vocab, int32_t n_ctx) {
         {"splice", true},
         {"splice_quantum", true},
         {"thought_commands", true},
+        {"thought_command_lines", true},
         {"tool_parse", true},
         {"fingerprint", string_format("%016" PRIx64, hash)},
         {"n_vocab", n_vocab},
@@ -2414,6 +2415,9 @@ private:
                 res->thought_error = slot.thought.error;
             }
             res->thought_prefix = slot.thought.continuation();
+            if (slot.task->params.splice_thought_commands) {
+                res->thought_state = json::parse(slot.thought.continuation_state().dump());
+            }
         }
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
@@ -4996,6 +5000,9 @@ static std::string server_token_wire_result(server_task_result & result, bool st
                 metadata["thought_error"] = final->thought_error;
             }
         }
+        if (!final->thought_state.is_null()) {
+            metadata["thought_state"] = final->thought_state;
+        }
         if (!final->thought_prefix.empty()) {
             metadata["thought_prefix"] = final->thought_prefix;
         }
@@ -5122,6 +5129,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 task.params.splice_thought.thinking = token == open_id;
                                 break;
                             }
+                        }
+                        if (data.at("splice").contains("thought_state")) {
+                            task.params.splice_thought.restore_state(nlohmann::json::parse(data.at("splice").at("thought_state").dump()));
                         }
                         const auto prefix = json_value(data.at("splice"), "thought_prefix", std::string());
                         task.params.splice_thought.feed(prefix);
@@ -5851,6 +5861,11 @@ void server_routes::init_routes() {
                         }
                         continue;
                     }
+                    if (field.key() == "thought_state") {
+                        server_thought_scanner scanner;
+                        scanner.restore_state(nlohmann::json::parse(field.value().dump()));
+                        continue;
+                    }
                     if (field.key() == "thought_prefix") {
                         if (!field.value().is_string() || field.value().template get<std::string>().size() > server_thought_scanner::max_payload + 32) {
                             throw std::invalid_argument("thought_prefix must be a bounded string");
@@ -5858,11 +5873,12 @@ void server_routes::init_routes() {
                         continue;
                     }
                     if ((field.key() != "stop_on_think_close" && field.key() != "thought_commands") || !field.value().is_boolean()) {
-                        throw std::invalid_argument("splice accepts sentence_after, token_after and boolean stop_on_think_close or thought_commands");
+                        throw std::invalid_argument("unsupported splice field or invalid type: " + field.key());
                     }
                 }
-                if (splice.contains("thought_prefix") && !json_value(splice, "thought_commands", false)) {
-                    throw std::invalid_argument("thought_prefix requires thought_commands");
+                if ((splice.contains("thought_prefix") || splice.contains("thought_state")) &&
+                        !json_value(splice, "thought_commands", false)) {
+                    throw std::invalid_argument("thought_prefix and thought_state require thought_commands");
                 }
                 if (!splice.contains("sentence_after") && !splice.contains("token_after") &&
                         !json_value(splice, "stop_on_think_close", false) && !json_value(splice, "thought_commands", false)) {

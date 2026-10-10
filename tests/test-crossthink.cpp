@@ -126,7 +126,8 @@ public:
         return {
             {"protocol", "LLMTOK01"}, {"fingerprint", fingerprint},
             {"n_vocab", 4096}, {"eog_ids", {3}}, {"context_size", context_size},
-            {"close_token", 2}, {"control_ids", {1, 2, 3}}, {"splice", true}, {"splice_quantum", true}, {"tool_parse", true}, {"thought_commands", true},
+            {"close_token", 2}, {"control_ids", {1, 2, 3}}, {"splice", true}, {"splice_quantum", true}, {"tool_parse", true},
+            {"thought_commands", true}, {"thought_command_lines", true},
         };
     }
 
@@ -995,7 +996,7 @@ static bool request_is_active(const std::shared_ptr<fake_request> & request) {
 
 static void finish_thought_command(const std::shared_ptr<fake_request> & request,
         const std::string & command, llama_token token, const std::string & payload = {}) {
-    const std::string text = command == "send" ? "<ct:send>" + payload + "</ct:send>" : "<ct:" + command + "/>";
+    const std::string text = command == "send" ? "\n<ct:send>" + payload + "</ct:send>" : "\n<ct:" + command + "/>";
     request->send({token}, text);
     crossthink_json result = {{"type", "done"}, {"stop_type", "limit"}, {"truncated", false},
         {"splice_boundary", "thought_command"}, {"thought_command", command}};
@@ -1498,6 +1499,137 @@ static void test_thought_command_survives_pause_exactly_once() {
     }
 }
 
+static void test_thought_quoted_commands_do_not_dispatch_on_resume() {
+    const std::vector<std::string> quoted = {
+        "Actually, I could do both in a single reasoning block — I'll send a message with the proposal, "
+            "then check the inbox with <ct:inbox/>.",
+        "The literal command is `<ct:inbox/>`.",
+        "```text\n<ct:inbox/>\n<ct:send>quoted message</ct:send>\n```\n",
+        "~~~xml\n<ct:peek/>\n<ct:inbox/>\n~~~\n",
+        "    <ct:inbox/>\n",
+    };
+    for (const auto & text : quoted) {
+        fixture f(4, 32768, true, false, true);
+        f.start();
+        auto a0 = f.peers[0]->request(0);
+        f.peers[1]->request(0);
+        a0->send({101}, text);
+        a0->wait_consumed(1);
+        check(events_of(f, "thought_result").empty() && events_of(f, "thought_message").empty(),
+                "quoted command interrupted ordinary reasoning");
+        f.pause();
+        f.session->command("resume");
+        f.wait_mode("thinking");
+        auto a1 = f.peers[0]->request(1);
+        auto b1 = f.peers[1]->request(1);
+        check(events_of(f, "thought_result").empty() && events_of(f, "thought_message").empty(),
+                "resume dispatched a command mentioned in prose or a code block");
+        check(count(a1->prompt, 101) == 1, "resume discarded quoted command text from reasoning");
+        finish_thought_command(a1, "inbox", 102);
+        auto a2 = f.peers[0]->request(2);
+        const auto results = events_of(f, "thought_result", "A");
+        check(results.size() == 1 && results[0].at("command") == "inbox" &&
+                results[0].at("text").get<std::string>().find("Inbox empty.") != std::string::npos,
+                "a deliberate line-start command did not execute exactly once after quoted examples");
+        check(count(a2->prompt, 101) == 1 && count(a2->prompt, 102) == 1 && !count(a2->prompt, 2),
+                "inbox continuation lost reasoning or closed the thought block");
+        check(request_is_active(b1) && f.peers[1]->request_count() == 2,
+                "inbox continuation interrupted the independently reasoning partner");
+        f.pause();
+    }
+}
+
+static void test_thought_literal_context_survives_request_boundaries() {
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"I'll check the inbox with ", "."},
+        {"The literal command is `", "`."},
+        {"```text\n", "\n```"},
+        {"~~~xml\n", "\n~~~"},
+    };
+    for (const auto & item : cases) {
+        fixture f(4, 32768, true, false, true);
+        f.start();
+        auto a0 = f.peers[0]->request(0);
+        f.peers[1]->request(0);
+        a0->send({101}, item.first);
+        a0->wait_consumed(1);
+        f.pause();
+        f.session->command("resume");
+        f.wait_mode("thinking");
+        auto a1 = f.peers[0]->request(1);
+        f.peers[1]->request(1);
+        check(a1->parameters.at("splice").contains("thought_state"),
+                "continuation omitted the scanner's line and code-fence context");
+        a1->send({102}, "<ct:inbox/>" + item.second);
+        a1->wait_consumed(1);
+        f.pause();
+        f.session->command("resume");
+        f.wait_mode("thinking");
+        auto a2 = f.peers[0]->request(2);
+        auto b2 = f.peers[1]->request(2);
+        check(events_of(f, "thought_result").empty(),
+                "request boundary promoted quoted or inline command text to an executable command");
+        finish_thought_command(a2, "inbox", 103);
+        auto a3 = f.peers[0]->request(3);
+        check(events_of(f, "thought_result", "A").size() == 1 &&
+                count(a3->prompt, 101) == 1 && count(a3->prompt, 102) == 1 && count(a3->prompt, 103) == 1,
+                "intentional command after a resumed literal lost context or executed more than once");
+        check(request_is_active(b2), "resumed inbox interrupted its partner");
+        f.pause();
+    }
+}
+
+static void test_thought_empty_inbox_exposes_continuation_progress() {
+    fixture f(4, 32768, true, false, true);
+    f.start();
+    auto a0 = f.peers[0]->request(0);
+    auto b0 = f.peers[1]->request(0);
+    finish_thought_command(a0, "inbox", 101);
+    auto a1 = f.peers[0]->request(1);
+    auto peer = f.session->state().at("peers").at(0);
+    check(peer.at("phase") == "waiting_reasoning" && peer.at("request_generated") == 0 &&
+            peer.at("request_elapsed_seconds").is_number() && peer.at("last_token_age_seconds").is_null(),
+            "empty inbox did not start and expose a fresh reasoning request");
+    const auto results = events_of(f, "thought_result", "A");
+    check(results.size() == 1 && results[0].at("text").get<std::string>().find("Inbox empty.") != std::string::npos,
+            "empty inbox omitted its explicit immediate result");
+    check(request_is_active(b0) && !count(a1->prompt, 2),
+            "empty inbox interrupted its partner or closed the caller's reasoning");
+    a1->send({102, 103}, "The inbox is empty; continue the original task.");
+    a1->wait_consumed(1);
+    peer = f.session->state().at("peers").at(0);
+    check(peer.at("phase") == "reasoning" && peer.at("request_generated") == 2 &&
+            peer.at("last_token_age_seconds").is_number() &&
+            peer.at("last_token_age_seconds").get<double>() >= 0,
+            "resumed token packets did not replace the waiting state with reasoning progress");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parsed_assistant = {{"role", "assistant"}, {"content", "Completed answer"}};
+    }
+    a1->send({2}, "</think>");
+    a1->finish("limit", "tool");
+    auto a2 = f.peers[0]->request(2);
+    peer = f.session->state().at("peers").at(0);
+    check(peer.at("phase") == "waiting_native" && peer.at("request_generated") == 0 &&
+            peer.at("last_token_age_seconds").is_null(),
+            "native answer request inherited stale reasoning progress");
+    a2->send({501, 502}, "unparsed native output");
+    a2->wait_consumed(1);
+    peer = f.session->state().at("peers").at(0);
+    check(peer.at("phase") == "native_output" && peer.at("request_generated") == 2 &&
+            peer.at("last_token_age_seconds").is_number(),
+            "buffered native output looked like stalled reasoning despite incoming tokens");
+    check(events_of(f, "answer", "A").empty(), "partial native output escaped before parsing");
+    a2->send({3}, "");
+    a2->finish("eos", "");
+    f.wait_state([](const crossthink_json & state) {
+        return state.at("peers").at(0).at("phase") == "done";
+    }, "finish answer after empty inbox");
+    check(request_is_active(b0) && events_of(f, "thought_result", "A").size() == 1,
+            "answer completion replayed the inbox command or interrupted the partner");
+    f.pause();
+}
+
 static void test_thought_targeted_message_replaces_completed_native_terminator() {
     for (bool during_call : {false, true}) {
         fixture f(4, 32768, true, true, true);
@@ -1643,6 +1775,12 @@ int main() {
         test_thought_pause_drops_only_incomplete_utf8_suffix();
         current_test = "test_thought_command_survives_pause_exactly_once";
         test_thought_command_survives_pause_exactly_once();
+        current_test = "test_thought_quoted_commands_do_not_dispatch_on_resume";
+        test_thought_quoted_commands_do_not_dispatch_on_resume();
+        current_test = "test_thought_literal_context_survives_request_boundaries";
+        test_thought_literal_context_survives_request_boundaries();
+        current_test = "test_thought_empty_inbox_exposes_continuation_progress";
+        test_thought_empty_inbox_exposes_continuation_progress();
         current_test = "test_thought_targeted_message_replaces_completed_native_terminator";
         test_thought_targeted_message_replaces_completed_native_terminator();
         current_test = "test_thought_targeted_template_preserves_concurrent_peer_failure";

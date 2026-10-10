@@ -3,6 +3,7 @@ import { RichOutput, copyText } from './render.js';
 const byId = id => document.getElementById(id);
 const peers = ['A', 'B'];
 const textLimit = 512 * 1024;
+const segmentLimit = 512;
 const outputs = {};
 const bubbles = new Map();
 let state = null;
@@ -28,8 +29,8 @@ function follow(element, checkbox) {
 function initOutput(key, followId, clippedId = null) {
     const element = byId(key);
     const checkbox = byId(followId);
-    const output = { element, raw: '', follow: checkbox, clipped: clippedId ? byId(clippedId) : null };
-    output.renderer = new RichOutput(element, () => follow(element, checkbox));
+    const output = { element, raw: '', segments: [], current: null, nextLabel: null,
+        follow: checkbox, clipped: clippedId ? byId(clippedId) : null };
     outputs[key] = output;
     // Scroll/layout changes NEVER change this explicit preference.
     checkbox.addEventListener('change', () => follow(element, checkbox));
@@ -45,21 +46,71 @@ byId('follow-messages').addEventListener('change', () => follow(byId('thread'), 
 function clearOutput(key) {
     const output = outputs[key];
     output.raw = '';
-    output.renderer.clear();
+    for (const segment of output.segments) segment.renderer.clear();
+    output.segments = [];
+    output.current = null;
+    output.nextLabel = null;
+    output.element.replaceChildren();
     output.element.classList.add('empty');
     if (output.clipped) output.clipped.hidden = true;
 }
 
-function appendOutput(key, text) {
+function outputBoundary(key, label = null) {
+    const output = outputs[key];
+    output.current = null;
+    output.nextLabel = output.raw ? label : null;
+}
+
+function appendOutput(key, text, isolated = false) {
     const output = outputs[key];
     if (!output || typeof text !== 'string' || !text) return;
+    if (isolated) output.current = null;
+    if (!output.current) {
+        const element = document.createElement('section');
+        element.className = 'output-segment' + (isolated ? ' isolated-output' : '');
+        if (output.nextLabel) {
+            const label = document.createElement('div');
+            label.className = 'output-boundary';
+            label.textContent = output.nextLabel;
+            element.append(label);
+        }
+        const body = document.createElement('div');
+        body.className = 'segment-body';
+        element.append(body);
+        output.element.append(element);
+        output.current = { element, raw: '', renderer: new RichOutput(body,
+            () => follow(output.element, output.follow)) };
+        output.segments.push(output.current);
+        output.nextLabel = null;
+    }
+    output.current.raw += text;
     output.raw += text;
     output.element.classList.remove('empty');
-    if (output.raw.length > textLimit) {
-        output.raw = output.raw.slice(-textLimit);
+    let excess = Math.max(0, output.raw.length - textLimit);
+    let removed = 0;
+    while (excess || output.segments.length > segmentLimit) {
+        const first = output.segments[0];
+        if (first.raw.length <= excess || output.segments.length > segmentLimit) {
+            removed += first.raw.length;
+            excess = Math.max(0, excess - first.raw.length);
+            first.renderer.clear();
+            first.element.remove();
+            output.segments.shift();
+        } else {
+            first.raw = first.raw.slice(excess);
+            removed += excess;
+            excess = 0;
+            first.renderer.update(first.raw);
+        }
+    }
+    if (removed) {
+        output.raw = output.raw.slice(removed);
         if (output.clipped) output.clipped.hidden = false;
     }
-    output.renderer.update(output.raw);
+    output.current.renderer.update(output.current.raw);
+    // Each received result is a separate Markdown document. Neither side of
+    // an import may inherit an unfinished code fence from the other.
+    if (isolated) output.current = null;
 }
 
 function updateControls() {
@@ -75,6 +126,13 @@ function updateControls() {
 
 const number = value => Number.isFinite(value) ? value.toLocaleString() : '0';
 const rate = value => Number.isFinite(value) ? value.toFixed(1) : '0.0';
+const phaseLabels = {
+    idle: 'Idle', ready: 'Ready', paused: 'Paused', done: 'Finished', error: 'Error', answer: 'Answering',
+    waiting_reasoning: 'Waiting for server (reasoning)', reasoning: 'Thinking',
+    waiting_native: 'Waiting for server (answer/tool call)',
+    native_output: 'Generating answer/tool call (buffered)', parsing_native: 'Parsing answer/tool call',
+    thought_result: 'Applying thought result', mcp: 'Waiting for MCP tool', tool_result: 'Applying tool result'
+};
 function applyState(next) {
     if (!next || typeof next !== 'object') return;
     state = next;
@@ -97,7 +155,17 @@ function applyState(next) {
             (peer.tool_status ? ' / ' + peer.tool_status : '');
         const stats = byId('stats-' + peer.name);
         stats.replaceChildren();
+        if (peer.phase) {
+            const phase = document.createElement('span');
+            phase.className = 'peer-phase';
+            phase.textContent = phaseLabels[peer.phase] || peer.phase;
+            stats.append(phase);
+        }
         for (const text of [
+            ...(Number.isFinite(peer.request_elapsed_seconds) ? [
+                'Request ' + number(peer.request_generated) + ' tokens / ' + rate(peer.request_elapsed_seconds) + ' s',
+                ...(Number.isFinite(peer.last_token_age_seconds) ? ['Last token ' + rate(peer.last_token_age_seconds) + ' s ago'] : [])
+            ] : []),
             'Context ' + number(peer.tokens) + ' / ' + number(peer.context_size),
             'Thought ' + number(peer.thinking_tokens),
             'Imported ' + number(peer.imported),
@@ -141,7 +209,7 @@ function showUser(record) {
     messages.scrollTop = messages.scrollHeight;
     for (const peer of target === 'both' ? peers : [target]) {
         clearOutput('answer-' + peer);
-        if (outputs['thought-' + peer].raw) appendOutput('thought-' + peer, '\n\n---\n\n**New user message**\n\n');
+        outputBoundary('thought-' + peer, 'New user message');
     }
 }
 
@@ -212,7 +280,7 @@ function showTool(peer, record) {
         }
         text += fence(JSON.stringify(parsed, null, 2) || 'null', 'json');
     }
-    appendOutput('tools-' + peer, text + '\n---\n');
+    appendOutput('tools-' + peer, text + '\n---\n', true);
 }
 
 function handleEvent(event) {
@@ -232,8 +300,10 @@ function handleEvent(event) {
     const peer = peers.includes(record.peer) ? record.peer : null;
     switch (record.type) {
         case 'token':
-        case 'thought_result':
             if (peer) appendOutput('thought-' + peer, record.text);
+            break;
+        case 'thought_result':
+            if (peer) appendOutput('thought-' + peer, record.text, true);
             break;
         case 'thought_message': showThought(record); break;
         // thought_capture is metadata; thought_result already has its verbatim
@@ -241,7 +311,12 @@ function handleEvent(event) {
         case 'answer_start': if (peer) clearOutput('answer-' + peer); break;
         case 'answer': if (peer) appendOutput('answer-' + peer, record.text); break;
         case 'tool_call':
-        case 'tool_result': if (peer) showTool(peer, record); break;
+        case 'tool_result':
+            if (peer) {
+                showTool(peer, record);
+                if (record.type === 'tool_result') outputBoundary('thought-' + peer, 'After tool result');
+            }
+            break;
         case 'state':
             // Replayed historical states must not roll current meters backwards.
             if (!state || (record.state?.last_event_id ?? id) >= (state.last_event_id ?? 0)) {

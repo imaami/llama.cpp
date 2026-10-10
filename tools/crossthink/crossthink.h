@@ -115,6 +115,10 @@ private:
         size_t mailbox_bytes = 0;
         std::deque<token_sample> samples;
         std::chrono::steady_clock::time_point sampling_started = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point request_started;
+        std::chrono::steady_clock::time_point last_token;
+        uint64_t request_generated = 0;
+        std::string phase = "idle";
         std::string tool_status;
         std::string boundary;
         llama_token close_token = -1;
@@ -158,6 +162,7 @@ private:
     bool blocked(size_t index) const;
     uint64_t generation_id(size_t index) const;
     void begin_thought(peer_state & peer);
+    void begin_request(peer_state & peer, const char * phase);
     void count_tokens(peer_state & peer, uint64_t generated, uint64_t thinking);
     bool thought_command(size_t index, uint64_t generation_epoch, const crossthink_json & result,
             std::unique_lock<std::mutex> & lock);

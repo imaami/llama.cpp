@@ -8,7 +8,7 @@ The server's new `--socket PATH` adds a Unix HTTP listener while keeping `--host
 
 ## Build and launch
 
-Rebuild **both `llama-server` and `llama-crossthink`** from the `reasoning-swap` branch; the server needs the new `thought_commands` capability. Retain your working Vulkan build configuration:
+Rebuild **both `llama-server` and `llama-crossthink`** from the `reasoning-swap` branch; the server needs the `thought_commands` and `thought_command_lines` capabilities. Retain your working Vulkan build configuration:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
@@ -50,10 +50,11 @@ Both agents receive a default system prompt explaining their identity (A or B), 
 | `<ct:send>message</ct:send>` | Queue the enclosed text in the partner's inbox. |
 | `<ct:inbox/>` | Collect messages waiting in the caller's inbox. |
 
-These commands only execute during reasoning. They are ordinary text in a final answer, native tool call, or tool result. The exact lowercase syntax matters. Emit one command at a time, outside quotes or code fences, and wait for its marked result before continuing. A thought command does not close `</think>` or start a native assistant/tool turn. For example, an agent can reason as follows:
+These commands only execute during reasoning, with the opening tag at **column zero of a new line**, outside a fenced code block. The start of a reasoning turn also counts as a line start. Inline mentions, indented tags, bullet/quote-prefixed tags, and examples in backtick or tilde fences are inert. They are also ordinary text in a final answer, native tool call, or tool result. The exact lowercase syntax matters. Emit one command at a time and wait for its marked result before continuing. A thought command does not close `</think>` or start a native assistant/tool turn. For example, an agent can reason as follows:
 
 ```text
-I should check whether B already found the missing assumption. <ct:peek/>
+I should check whether B already found the missing assumption.
+<ct:peek/>
 ```
 
 The coordinator appends the requested result to that agent's open reasoning, inside explicit markers, then the agent continues thinking. Only complete generated commands trigger an action; input prompts and imported thought text do not execute commands.
@@ -78,7 +79,7 @@ The payload stays contiguous and unescaped. The byte count distinguishes payload
 
 `<ct:send>...</ct:send>` queues a deliberate message for the other agent. It does not interrupt the recipient or insert anything into its live reasoning. Keep each message below 16 KiB. The sender receives an acknowledgment and continues. The recipient uses `<ct:inbox/>` to receive the queued messages together, with source markers, inside its own reasoning. Each delivered message uses a `<ct:message id="..." from="B" bytes="...">...</ct:message>` wrapper inside the inbox result. Reading an empty inbox also returns immediately. A mailbox holds at most 256 messages and 1 MiB of message text. A full mailbox or a result that cannot fit in the caller's remaining context produces an explicit error. Only successfully delivered inbox messages are removed; arrivals after the collection snapshot remain queued. The messaging view shows sent messages and their collection status so you can distinguish queued communication from text the recipient has actually received.
 
-The system prompt explains that reasoning commands are part of this experiment, despite the usual separation between reasoning and native tool calls. It encourages concise messages and checking for new information when useful. The agents still decide when to peek, send, collect, call MCP tools, and answer.
+The system prompt explains that reasoning commands are part of this experiment, despite the usual separation between reasoning and native tool calls. It asks each agent to send a brief planning message at the start of a new user task, then keep working without waiting for a reply. It encourages concise updates and inbox/peek checks at useful milestones, and explicitly says to continue after an empty inbox result. These are instructions to the models; the coordinator does not manufacture commands or force communication. The agents still decide when to peek, send, collect, call MCP tools, and answer.
 
 ### Parallel execution
 
@@ -107,9 +108,13 @@ Open the coordinator's port, normally **http://127.0.0.1:8090/**. The composer t
 
 Model output uses the upstream web UI's Markdown pipeline: GitHub-flavored Markdown, fenced code with syntax highlighting and raw copy, KaTeX math, Mermaid diagrams, and sandboxed HTML previews. This rendering applies to reasoning, answers, thought messages, and native tool activity. Rendered HTML and SVG are sanitized. Rendering assets are bundled with the console for offline use; there is no required CDN connection. These are presentation features: the model receives the original text, not the rendered HTML.
 
+Reasoning turns and imported thought results render as separate Markdown documents. An interrupted turn ending in an unclosed code fence therefore cannot turn the next user turn or thought result into code. Reasoning resumed after a native tool result also starts a new document, and native tool records are separated in the same way. Copy raw preserves the original text without adding artificial closing fences or UI dividers.
+
 Normal C++ builds use the checked-in generated UI header and do not require Node.js. To modify the UI sources, run `npm ci` followed by `npm run build` in `tools/crossthink/ui`, then rebuild `llama-crossthink`.
 
 Each agent has a generated-token count and a tokens-per-second meter over a rolling five-second window. Those per-agent counts include its generated reasoning, answers, and native tool-call text. The messaging pane shows A + B **reasoning** token totals and the sum of their reasoning rates. Counts accumulate until **New session**. Imported context tokens are reported separately and are not counted as newly generated tokens. The rates measure observed stream delivery over wall-clock time, including idle periods, rather than the model server's decode-only benchmark rate.
+
+Per-agent status also shows the current phase, tokens received for the current request, time since that request started, and time since its last token. After reasoning closes, native answer/tool-call text is buffered until the native turn finishes and can be parsed; the reasoning pane can be quiet while the agent is still generating. The status distinguishes this from waiting for the server, generating reasoning, handling a thought result, or running an MCP call. Waiting for the first token includes queueing and prompt processing; the coordinator cannot distinguish those server-side phases.
 
 ## MCP tools over HTTP
 
@@ -171,6 +176,8 @@ The HTTP control API mirrors these controls: `POST /message` with `{"text":"..."
 
 In the default mode, state reports `splice_mode: "independent"` and `thought_tools: 3`; `tools` counts only external native tools. Per-peer fields include `generated`, `imported`, `thinking_tokens`, `tokens_per_second`, `thinking_tokens_per_second`, `mailbox`, and `thought_turn`. Top-level `thinking_tokens` and rate fields sum both agents.
 
+Per-peer `phase` reports `waiting_reasoning`, `reasoning`, `waiting_native`, `native_output`, `parsing_native`, `thought_result`, `mcp`, or `tool_result` while active, and `idle`, `ready`, `paused`, `done`, or `error` otherwise. Legacy answer streaming uses `answer`. `request_generated` resets for each completion request. `request_elapsed_seconds` is null before the first request, and `last_token_age_seconds` is null until the current request delivers tokens. These ages are wall-clock diagnostics, not server decode timings.
+
 A `thought_result` event contains the complete marked insertion for the named peer's reasoning display. A separate `thought_capture` event identifies the source and captured byte range; do not append it again or the display will duplicate the capture. A `thought_message` event has a stable `message_id`, `from`, `to`, `text`, and a status of `sent` or `received`. Update the matching message bubble when its status changes. Peeks never create message bubbles.
 
 Requests resubmit each agent's authoritative token sequence. Each resumed completion creates a fresh sampler with deterministic per-agent seeds, so results can differ from one uninterrupted sampling call. Keep server-wide reverse prompts and other output constraints disabled. Near context capacity, the affected agent uses its reserved space for a separate final answer while its partner continues. Legacy mode pauses the session at its context limit. Neither mode silently deletes older context. Larger answer and native tool budgets reserve more context.
@@ -205,15 +212,15 @@ Binary completion requests may also set `"splice": {"sentence_after": 256}`. `n_
 
 The earlier quantum extension remains available to binary API clients: `splice.token_after` in `1..4096` stops when that count is reached and the output ends on a complete UTF-8 character. A clean paragraph or permitted sentence boundary can stop earlier; otherwise the result reports `"splice_boundary": "quantum"`. `n_predict` remains the hard ceiling, and hitting it with an incomplete UTF-8 character produces an error. `/tokens/info` advertises `"splice_quantum": true`. The default parallel coordinator no longer uses quantum stops.
 
-Parallel thought commands require the new `"thought_commands": true` capability from `/tokens/info`. A request sets `"splice": {"thought_commands": true, "stop_on_think_close": true}` without a quantum or sentence threshold. Complete commands in newly generated reasoning end the caller's request with `"splice_boundary": "thought_command"`, `"thought_command": "peek"`, `"inbox"`, or `"send"`, and `"thought_payload"` for a send. `splice_reason` aliases the boundary. An oversized send body returns `thought_error`; the body limit is 16384 bytes, with a 32768-byte JSON-escaped limit to keep the binary response metadata bounded. In this mode, ordinary paragraph breaks do not stop generation.
+Parallel thought commands require `"thought_commands": true` and `"thought_command_lines": true` from `/tokens/info`. A request sets `"splice": {"thought_commands": true, "stop_on_think_close": true}` without a quantum or sentence threshold. Complete commands at column zero outside fenced blocks in newly generated reasoning end the caller's request with `"splice_boundary": "thought_command"`, `"thought_command": "peek"`, `"inbox"`, or `"send"`, and `"thought_payload"` for a send. `splice_reason` aliases the boundary. An oversized send body returns `thought_error`; the body limit is 16384 bytes, with a 32768-byte JSON-escaped limit to keep the binary response metadata bounded. In this mode, ordinary paragraph breaks do not stop generation.
 
-Stops occur at the token containing the command's closing marker. Tokens are indivisible: if that token also contains a suffix after the marker, the suffix stays in the raw history, before the inserted result. All committed token IDs remain intact. The optional bounded `thought_prefix` carries an incomplete, previously generated command across a pause or request limit; ordinary submitted prefixes and imported captures are not scanned for commands. Native reasoning closure remains `"splice_boundary": "tool"`. Rebuild both model servers and the coordinator when upgrading; an older server cannot support the new default mode.
+Stops occur at the token containing the command's closing marker. Tokens are indivisible: if that token also contains a suffix after the marker, the suffix stays in the raw history, before the inserted result. All committed token IDs remain intact. The optional bounded `thought_prefix` carries an incomplete, previously generated command across a pause or request limit; ordinary submitted prefixes and imported captures are not scanned for commands. The accompanying `thought_state` checkpoint carries line and fence state from before that prefix. A continuing client must pass both values back under `splice`, including `thought_state` when the prefix is empty, so a pause inside prose or a fence does not turn a later example into a command. The coordinator uses the same scanner locally to retain state when cancellation prevents a terminal response. Native reasoning closure remains `"splice_boundary": "tool"`. Rebuild both model servers and the coordinator when upgrading; an older server cannot support the new default mode.
 
 When native tools are enabled, `splice.stop_on_think_close` also stops at the single `</think>` token and reports `"splice_boundary": "tool"`. That token is retained in the calling model's raw tape. The coordinator then generates a private assistant tail through EOG. `/apply-template` accepts optional `parse_output` token IDs and returns a parsed `message` alongside its ordinary `prompt`, using the same native chat parser as chat completions. A terminal EOG is removed before parsing; tokens following EOG are rejected. `/tokens/info` advertises `"tool_parse": true` for this extension.
 
 ## Validation
 
-The `reasoning-swap` branch is based on `imaami/llama.cpp`'s `bonsai` commit `5ada589b7811232c44d55dbf210329d98414fb4d`. Release CPU builds passed for llama-server and llama-crossthink. The coordinator suite passed 17 new independent-mode regressions plus the retained legacy tests, covering concurrent reasoning and MCP, incremental raw-token captures, opt-in inbox delivery, targeted user messages, independent answers, metrics, and pause/reset races. Binary route tests passed with MTP off and on, including split and resumed commands, inert imports, literal delimiters, bounded payloads, and cached continuation. Native chat-template and HTTP MCP suites also passed.
+The `reasoning-swap` branch is based on `imaami/llama.cpp`'s `bonsai` commit `5ada589b7811232c44d55dbf210329d98414fb4d`. Release CPU builds passed for llama-server and llama-crossthink. The coordinator suite covers concurrent reasoning and MCP, incremental raw-token captures, opt-in inbox delivery, targeted user messages, independent answers, metrics, and pause/reset races. Additional regressions cover inert inline/fenced commands, line/fence state across requests, exactly-once deliberate commands after resuming, and empty-inbox continuation through reasoning and buffered native output. Binary route tests exercise MTP off and on, including split and resumed commands, inert imports and code examples, literal delimiters, bounded payloads, malformed checkpoints, and cached continuation. Native chat-template and HTTP MCP suites also passed.
 
 Run the binaries from the repository root for the template files:
 
@@ -228,6 +235,6 @@ python3 tests/gen-tiny-qwen35-mtp.py --tool-tokens /tmp/tiny-qwen35-tools.gguf
 build/bin/test-server-token-wire /tmp/tiny-qwen35-mtp.gguf /tmp/tiny-qwen35-tools.gguf
 ```
 
-Real Chromium tests passed against a mocked HTTP/SSE coordinator for formatting in every output pane, literal thought commands, sanitization, diagrams, stable streamed content, Follow behavior, targeted messages, inbox status, and rolling metrics. Desktop and mobile layouts were inspected. Run these checks with `npm test` in `tools/crossthink/ui` after installing its dependencies and Chromium.
+Real Chromium tests passed against a mocked HTTP/SSE coordinator for formatting in every output pane, literal thought commands, sanitization, diagrams, stable streamed content, Follow behavior, targeted messages, inbox status, and rolling metrics. Regressions also reproduce an interrupted C fence followed by a new user turn, thought import, or native tool continuation; verify faithful raw copying and bounded clipping; and check waiting/native-output status indicators. Desktop and mobile layouts were inspected. Run these checks with `npm test` in `tools/crossthink/ui` after installing its dependencies and Chromium.
 
 CPU fixtures do not establish Bonsai conversational behavior or dual-GPU throughput. The random MTP fixtures rejected their drafts, so accepted multi-token speculative batches remain unvalidated. Unix socket creation is denied in this test environment; live coordinator-to-model-server integration, real MCP services, TLS, and dual-GPU command latency still need verification on the intended setup.

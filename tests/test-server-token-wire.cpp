@@ -139,10 +139,11 @@ static void test_thought_scanner() {
         for (size_t split = 0; split < item.first.size(); ++split) {
             server_thought_scanner scanner;
             scanner.thinking = true;
-            scanner.feed("ordinary prose " + item.first.substr(0, split));
+            scanner.feed("ordinary prose\n" + item.first.substr(0, split));
             check(scanner.command.empty(), "partial thought command executed");
             server_thought_scanner resumed;
             resumed.thinking = true;
+            resumed.restore_state(scanner.continuation_state());
             resumed.feed(scanner.continuation());
             resumed.feed(item.first.substr(split) + "trailing text<ct:inbox/>");
             check(resumed.command == item.second, "thought command split or first-command recognition failed");
@@ -155,9 +156,47 @@ static void test_thought_scanner() {
         inactive.feed(item.first);
         check(inactive.command.empty() && inactive.continuation().empty(), "command outside reasoning executed");
     }
+    const std::vector<std::string> inert_commands = {
+        "Maybe check inbox with <ct:inbox/>.", " <ct:peek/>", "\t<ct:peek/>", "- <ct:inbox/>",
+        "`<ct:peek/>`", "<ct:nope><ct:peek/>",
+        "```text\n<ct:inbox/>\n```", "~~~text\r\n<ct:inbox/>\r\n~~~",
+        "  ```text\n<ct:send>example</ct:send>\n  ```",
+        "````text\n```\n<ct:inbox/>\n````",
+        "```text\n```oops\n<ct:inbox/>",
+    };
+    for (const auto & text : inert_commands) {
+        for (size_t split = 0; split <= text.size(); ++split) {
+            server_thought_scanner scanner;
+            scanner.thinking = true;
+            scanner.feed(text.substr(0, split));
+            server_thought_scanner resumed;
+            resumed.thinking = true;
+            resumed.restore_state(scanner.continuation_state());
+            resumed.feed(scanner.continuation());
+            resumed.feed(text.substr(split));
+            check(scanner.command.empty() && resumed.command.empty(), "quoted or inline thought command executed: " + text);
+        }
+    }
+    for (const std::string & prefix : {std::string(), std::string("words\n"), std::string("words\r\n"),
+            std::string("words\r"), std::string("```text\n<ct:inbox/>\n```\n"),
+            std::string("  ~~~~text\r\n<ct:inbox/>\r\n  ~~~~\r\n"), std::string("```no`fence\n")}) {
+        const auto text = prefix + "<ct:peek/>";
+        for (size_t split = 0; split < text.size(); ++split) {
+            server_thought_scanner scanner;
+            scanner.thinking = true;
+            scanner.feed(text.substr(0, split));
+            check(scanner.command.empty(), "thought command fired before closing tag");
+            server_thought_scanner resumed;
+            resumed.thinking = true;
+            resumed.restore_state(scanner.continuation_state());
+            resumed.feed(scanner.continuation());
+            resumed.feed(text.substr(split));
+            check(resumed.command == "peek", "line/fence continuation lost a valid command: " + text);
+        }
+    }
     server_thought_scanner scanner;
     scanner.thinking = true;
-    scanner.feed("malformed <ct:peek> <ct:send /> <ct:inbox / > <ct:pe");
+    scanner.feed("malformed <ct:peek> <ct:send /> <ct:inbox / >\n<ct:pe");
     check(scanner.command.empty() && scanner.continuation() == "<ct:pe", "malformed syntax confused command prefix");
     scanner = {};
     scanner.thinking = true;
@@ -586,7 +625,8 @@ static void test_tool_routes(const char * model, bool mtp) {
     auto & routes = fixture.routes;
     const auto info = json::parse(fixture.call(routes.get_tokens_info, "").second);
     check(info.at("n_vocab") == 263 && info.at("tool_parse") == true, "wrong tool fixture or missing tool capability");
-    check(info.at("thought_commands") == true, "thought command capability missing");
+    check(info.at("thought_commands") == true && info.at("thought_command_lines") == true,
+        "line-anchored thought command capability missing");
     auto tokenize = [&](const std::string & text) {
         const auto result = fixture.call(routes.post_tokenize,
             json{{"content", text}, {"add_special", false}, {"parse_special", true}}.dump());
@@ -644,6 +684,30 @@ static void test_tool_routes(const char * model, bool mtp) {
             "thought stop poisoned cached continuation after injection");
     }
 
+    for (const std::string & text : {std::string("Check inbox with <ct:inbox/>."), std::string("  <ct:peek/>"),
+            std::string("```text\n<ct:inbox/>\n```"), std::string("~~~text\r\n<ct:peek/>\r\n~~~")}) {
+        thoughts["grammar"] = "root ::= " + json(text).dump();
+        const auto quoted = fixture.binary_stream(thoughts, thinking_prompt);
+        check(quoted.content == text && quoted.metadata.at("splice_boundary") != "thought_command",
+            "inline or fenced thought example executed on the server");
+    }
+    for (const std::string & head : {std::string("Check inbox with "), std::string("```text\n"),
+            std::string("``")}) {
+        thoughts["grammar"] = "root ::= " + json(head).dump();
+        thoughts["n_predict"] = head.size();
+        const auto first = fixture.binary_stream(thoughts, thinking_prompt);
+        check(first.content == head && first.metadata.contains("thought_state"), "thought position checkpoint missing");
+        auto prompt = thinking_prompt;
+        prompt.insert(prompt.end(), first.tokens.begin(), first.tokens.end());
+        thoughts["splice"]["thought_state"] = first.metadata.at("thought_state");
+        const auto tail = (head == "``" ? std::string("`text\n") : std::string()) + "<ct:inbox/>";
+        thoughts["grammar"] = "root ::= " + json(tail).dump();
+        thoughts["n_predict"] = 128;
+        const auto continued = fixture.binary_stream(thoughts, prompt);
+        check(continued.content == tail && continued.metadata.at("splice_boundary") != "thought_command",
+            "request boundary armed an inline/fenced command");
+        thoughts["splice"].erase("thought_state");
+    }
     thoughts["grammar"] = "root ::= \"<ct:peek/>tail\"";
     const auto outside = fixture.binary_stream(thoughts, tokenize("<think>done</think>"));
     check(outside.content == "<ct:peek/>tail" && outside.metadata.at("splice_boundary") != "thought_command",
@@ -665,6 +729,7 @@ static void test_tool_routes(const char * model, bool mtp) {
     thoughts["n_predict"] = 32;
     thoughts["grammar"] = "root ::= \"ek/>tail\"";
     thoughts["splice"]["thought_prefix"] = partial.metadata.at("thought_prefix");
+    thoughts["splice"]["thought_state"] = partial.metadata.at("thought_state");
     const auto resumed_command = fixture.binary_stream(thoughts, resumed_prompt);
     check(resumed_command.content == "ek/>" && resumed_command.metadata.at("thought_command") == "peek",
         "partial command did not resume across requests");
@@ -673,6 +738,19 @@ static void test_tool_routes(const char * model, bool mtp) {
         check(fixture.call(routes.post_completions_tokens, server_token_wire::encode(thoughts.dump(), resumed_prompt)).first == 400,
             "invalid thought_prefix accepted");
     }
+    thoughts["splice"].erase("thought_prefix");
+    for (const json & bad_state : {json(false), json{{"unknown", true}}, json{{"line_start", 1}},
+            json{{"fence", "x"}}, json{{"fence", "`"}, {"fence_size", 2}}, json{{"line_indent", 4}},
+            json{{"fence_size", -1}}, json{{"line_marker_size", 1}},
+            json{{"line_start", true}, {"line_marker", "`"}, {"line_marker_size", 1}}}) {
+        thoughts["splice"]["thought_state"] = bad_state;
+        check(fixture.call(routes.post_completions_tokens, server_token_wire::encode(thoughts.dump(), resumed_prompt)).first == 400,
+            "invalid thought_state accepted");
+    }
+    thoughts["splice"]["thought_state"] = json::object();
+    thoughts["splice"]["thought_commands"] = false;
+    check(fixture.call(routes.post_completions_tokens, server_token_wire::encode(thoughts.dump(), resumed_prompt)).first == 400,
+        "thought_state accepted without thought_commands");
     json options = {
         {"n_predict", 16}, {"seed", 42}, {"temperature", 0}, {"cache_prompt", false},
         {"preserved_tokens", json::array({"</think>"})}, {"grammar", "root ::= \"</think>\""},

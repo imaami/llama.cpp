@@ -389,6 +389,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string thought_payload;
     std::string thought_error;
     std::string thought_prefix;
+    json thought_state;
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;

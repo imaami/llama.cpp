@@ -45,6 +45,7 @@ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
 try {
     const context = await browser.newContext({ viewport: { width: 1800, height: 1250 } });
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
     const page = await context.newPage();
     page.setDefaultTimeout(10000);
     const errors = [];
@@ -106,8 +107,20 @@ try {
     state.peers[0].thinking_tokens_per_second = 0;
     state.peers[1].tokens_per_second = 0;
     state.peers[1].thinking_tokens_per_second = 0;
+    state.peers[0].phase = 'native_output';
+    state.peers[0].request_generated = 81;
+    state.peers[0].request_elapsed_seconds = 4.5;
+    state.peers[0].last_token_age_seconds = 0.2;
+    state.peers[1].phase = 'waiting_reasoning';
+    state.peers[1].request_generated = 0;
+    state.peers[1].request_elapsed_seconds = 3;
+    state.peers[1].last_token_age_seconds = null;
     await page.waitForFunction(() => document.getElementById('count-A').textContent === '150');
     assert.equal(await page.locator('#speed-total').textContent(), '0.0');
+    assert.equal(await page.locator('#stats-A .peer-phase').textContent(), 'Generating answer/tool call (buffered)');
+    assert.match(await page.locator('#stats-A').textContent(), /Request 81 tokens \/ 4\.5 sLast token 0\.2 s ago/);
+    assert.equal(await page.locator('#stats-B .peer-phase').textContent(), 'Waiting for server (reasoning)');
+    assert.doesNotMatch(await page.locator('#stats-B').textContent(), /Last token/);
     assert.ok(polls > 1);
     emit({ type: 'user', target: 'A', text: 'Only you: double-check.' });
     await page.waitForFunction(() => document.getElementById('messages').textContent.includes('YOU → A'));
@@ -116,12 +129,68 @@ try {
     await page.locator('#message').fill('A private instruction');
     await page.locator('#send').click();
     assert.deepEqual(posts.at(-1), { path: '/message', text: 'A private instruction', target: 'B' });
+
+    // A new user turn must not inherit the previous turn's open C fence.
+    emit({ type: 'reset' });
+    const unfinished = 'Terminal size:\n\n```c\nstatic int get_size(int *cols, int *rows) {\n' +
+        '    struct winsize ws;\n    *cols = (env';
+    const otherThought = 'B keeps its **independent** turn.\n\n';
+    emit({ type: 'token', peer: 'A', text: unfinished });
+    emit({ type: 'token', peer: 'B', text: otherThought });
+    await page.waitForFunction(() => document.querySelector('#thought-A pre')?.textContent.includes('*cols = (env'));
+    await page.waitForSelector('#thought-B strong');
+    await page.evaluate(() => { window.otherTurn = document.querySelector('#thought-B .output-segment'); });
+    emit({ type: 'user', target: 'A', text: 'Send a thought message, then check your inbox.' });
+    const newThought = 'I will send a **thought**, then check the inbox with <ct:inbox/>.\n';
+    emit({ type: 'token', peer: 'A', text: newThought });
+    const inbox = '\n<ct:result command="inbox">\nInbox empty.\n</ct:result>\n';
+    emit({ type: 'thought_result', peer: 'A', command: 'inbox', text: inbox });
+    await page.waitForFunction(() => document.querySelector('#thought-A .isolated-output')?.textContent.includes('Inbox empty.'));
+    assert.equal(await page.locator('#thought-A .output-boundary').textContent(), 'New user message');
+    assert.equal(await page.locator('#thought-A strong').textContent(), 'thought');
+    assert.equal(await page.locator('#thought-A pre').count(), 1);
+    assert.equal(await page.locator('#thought-A pre').textContent().then(text => text.includes('<ct:inbox/>')), false);
+    assert.equal(await page.locator('#thought-A .isolated-output').textContent().then(text => text.includes('</ct:result>')), true);
+    assert.equal(await page.evaluate(() => window.otherTurn === document.querySelector('#thought-B .output-segment')), true);
+    assert.equal(await page.locator('#thought-B .output-boundary').count(), 0);
+
+    // Imports and native tool records are independently rendered documents.
+    const capture = '\n<ct:result command="peek">\n```cpp\nint unfinished =';
+    emit({ type: 'thought_result', peer: 'A', command: 'peek', text: capture });
+    const continuation = '\n## My own thoughts resume\n\n**Visible prose**, $x+1$, and <ct:inbox/>.\n';
+    emit({ type: 'token', peer: 'A', text: continuation });
+    await page.waitForSelector('#thought-A h2');
+    assert.equal(await page.locator('#thought-A h2').textContent(), 'My own thoughts resume');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child pre').count(), 0);
+    assert.equal(await page.locator('#thought-A .output-segment:last-child .katex').count(), 1);
+    await page.locator('[data-copy="thought-A"]').click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), unfinished + newThought + inbox + capture + continuation,
+        'Copy raw preserves received text exactly, without UI dividers or synthesized fence delimiters');
+    emit({ type: 'token', peer: 'A', text: '\n```c\nint before_tool =' });
+    emit({ type: 'tool_call', peer: 'A', name: 'compiler', arguments: '{"code":"int main() {}"}' });
+    emit({ type: 'tool_result', peer: 'A', name: 'compiler', result: '```text\nunclosed diagnostics' });
+    emit({ type: 'tool_result', peer: 'A', name: 'calculator', result: '**Separate result**: $42$' });
+    await page.waitForSelector('#tools-A strong');
+    assert.equal(await page.locator('#tools-A strong').textContent(), 'Separate result');
+    assert.equal(await page.locator('#tools-A .output-segment').count(), 3);
+    emit({ type: 'token', peer: 'A', text: '\n**Fresh thought** after native tools.\n' });
+    await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child strong')?.textContent === 'Fresh thought');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child .output-boundary').textContent(), 'After tool result');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child pre').count(), 0);
+    assert.equal(await page.evaluate(() => window.otherTurn === document.querySelector('#thought-B .output-segment')), true);
+    assert.equal(await page.locator('#thought-B .output-boundary').count(), 0);
     await page.screenshot({ path: join(root, 'test-desktop.png'), fullPage: true });
     await page.setViewportSize({ width: 700, height: 950 });
     await page.screenshot({ path: join(root, 'test-mobile.png'), fullPage: true });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+    // Clipping must bound both retained raw text and obsolete segment DOM.
+    emit({ type: 'token', peer: 'A', text: '\n\n' + 'x'.repeat(512 * 1024) });
+    await page.waitForFunction(() => !document.getElementById('clipped-A').hidden);
+    assert.equal(await page.locator('#thought-A .output-segment').count(), 1);
+    await page.locator('[data-copy="thought-A"]').click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'x'.repeat(512 * 1024));
     assert.deepEqual(errors, []);
-    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics.');
+    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics, turn/result isolation, verbatim copy, clipping.');
 } finally {
     await browser.close();
     for (const client of clients) client.end();
