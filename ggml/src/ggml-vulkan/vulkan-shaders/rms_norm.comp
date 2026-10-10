@@ -60,6 +60,13 @@ layout (constant_id = 2) const bool do_post_multiply = false;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
 
+#if RMS_NORM_SCALE_FUSION
+FLOAT_TYPE rms_scale(FLOAT_TYPE scale, FLOAT_TYPE value, FLOAT_TYPE post_scale, FLOAT_TYPE bias) {
+    precise FLOAT_TYPE normalized = scale * value;
+    return normalized * post_scale + bias;
+}
+#endif
+
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
     const uint nrows     = gl_NumWorkGroups.x;
@@ -170,7 +177,11 @@ void rms_norm(uint num_iters) {
                     if (col >= ncols) {
                         continue;
                     }
+#if RMS_NORM_SCALE_FUSION
+                    data_d[d_offset + col] = D_TYPE(rms_scale(scale, FLOAT_TYPE(data_a[a_offset + col]), FLOAT_TYPE(p.param2), FLOAT_TYPE(intBitsToFloat(p.param3))));
+#else
                     data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+#endif
                 }
             }
 #if RMS_NORM_ROPE_FUSION

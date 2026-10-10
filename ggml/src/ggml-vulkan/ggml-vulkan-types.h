@@ -642,6 +642,7 @@ enum topk_moe_mode {
 };
 
 enum rms_norm_mode {
+    RMS_NORM_SCALE,
     RMS_NORM_MUL,
     RMS_NORM_MUL_ADD,
     RMS_NORM_MUL_ADD_MUL,
@@ -886,6 +887,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_scale_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_mul_f32;

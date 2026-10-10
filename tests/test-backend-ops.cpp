@@ -3730,17 +3730,27 @@ struct test_norm_scale : public test_case {
     const float eps;
     const bool rms;
     const float scale;
+    const bool view;
+    const float bias;
+    const bool inplace;
+    const bool keep_norm;
+    const bool add;
 
     std::string vars() override {
-        return VARS_TO_STR5(type, ne, eps, rms, scale);
+        return VARS_TO_STR10(type, ne, eps, rms, scale, view, bias, inplace, keep_norm, add);
     }
 
     test_norm_scale(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 5, 4, 3},
             float eps = 1e-6f,
             bool rms = false,
-            float scale = 1.5f)
-        : type(type), ne(ne), eps(eps), rms(rms), scale(scale) {}
+            float scale = 1.5f,
+            bool view = false,
+            float bias = 0.0f,
+            bool inplace = false,
+            bool keep_norm = false,
+            bool add = false)
+        : type(type), ne(ne), eps(eps), rms(rms), scale(scale), view(view), bias(bias), inplace(inplace), keep_norm(keep_norm), add(add) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3750,11 +3760,27 @@ struct test_norm_scale : public test_case {
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        std::array<int64_t, 4> ne_alloc = ne;
+        if (view) {
+            ne_alloc[0] += 8;
+            ne_alloc[1] *= 2;
+        }
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_alloc.data());
         ggml_set_name(a, "a");
 
+        if (view) {
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 4);
+        }
+        if (add) {
+            ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(b, "b");
+            a = ggml_add(ctx, a, b);
+        }
         ggml_tensor * n = rms ? ggml_rms_norm(ctx, a, eps) : ggml_norm(ctx, a, eps);
-        ggml_tensor * out = ggml_scale(ctx, n, scale);
+        if (keep_norm) {
+            ggml_set_output(n);
+        }
+        ggml_tensor * out = inplace ? ggml_scale_bias_inplace(ctx, n, scale, bias) : ggml_scale_bias(ctx, n, scale, bias);
         ggml_set_name(out, "out");
 
         return out;
@@ -10995,6 +11021,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {100, 10, 10, 10}, 0.5f, 0.0f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
+
+    for (int64_t n : { 1, 64, 128, 256, 512, 1025 }) {
+        for (bool view : { false, true }) {
+            test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, {n, 32, 2, 1}, 1e-6f / n, true, 1.0f / sqrtf(n), view));
+        }
+    }
+    test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, {128, 32, 1, 1}, 1e-6f, true, -0.5f, true, 0.0f, true));
+    test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, {128, 32, 1, 1}, 1e-6f, true, 0.0f));
+    test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, {128, 32, 1, 1}, 1e-6f, true, 1.5f, false, 0.25f));
+    test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, {128, 32, 1, 1}, 1e-6f, true, 1.5f, false, 0.0f, false, true));
+    test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, {1536, 1, 1, 1}, 1e-6f, true, 1.5f, false, 0.0f, false, false, true));
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
         for (uint32_t n : { 64, 1025 }) {

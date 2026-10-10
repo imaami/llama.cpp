@@ -865,6 +865,7 @@ void process_shaders() {
         const std::string suffix = use_subgroups ? "_subgroup" : "";
         const auto rms_dict = merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", use_subgroups ? "1" : "0"}});
         string_to_spv("rms_norm_f32" + suffix, "rms_norm.comp", rms_dict);
+        string_to_spv("rms_norm_scale_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SCALE_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_add_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}}));
         string_to_spv("rms_norm_set_rows_f32_f16" + suffix, "rms_norm.comp", merge_maps({{"D_TYPE", "float16_t"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}, rms_dict));

@@ -3342,6 +3342,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
+    const char * rms_scale_env = getenv("GGML_VK_RMS_SCALE");
+    const bool rms_scale_enabled = rms_scale_env ? strcmp(rms_scale_env, "1") == 0 : device->architecture == AMD_RDNA4;
     const char * rms_subgroups_env = getenv("GGML_VK_RMS_SUBGROUPS");
     const bool rms_subgroups_requested = rms_subgroups_env ? strcmp(rms_subgroups_env, "1") == 0 : device->architecture == AMD_RDNA4;
     const bool rms_subgroups = rms_subgroups_requested && device->subgroup_basic && device->subgroup_arithmetic &&
@@ -3353,6 +3355,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t block_size = 128u << i;
         const std::string suffix = rms_subgroups ? "_" + std::to_string(block_size) : "";
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_f32[i], "rms_norm_f32" + suffix, RMS_SHADER(rms_norm_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, block_size}, 1, true, rms_subgroups);
+        if (rms_scale_enabled) {
+            ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_scale_f32[i], "rms_norm_scale_f32" + suffix, RMS_SHADER(rms_norm_scale_f32), "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, block_size}, 1, true, rms_subgroups);
+        }
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_f32[i], "rms_norm_mul_f32" + suffix, RMS_SHADER(rms_norm_f32), "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_add_f32[i], "rms_norm_mul_add_f32" + suffix, RMS_SHADER(rms_norm_mul_add_f32), "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0, block_size}, 1, true, rms_subgroups);
         ggml_vk_create_pipeline2(device, device->pipeline_rms_norm_mul_add_mul_f32[i], "rms_norm_mul_add_mul_f32" + suffix, RMS_SHADER(rms_norm_mul_add_f32), "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1, block_size}, 1, true, rms_subgroups);
@@ -11074,6 +11079,29 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
 
+    if (ctx->fused_rms_norm_mode == RMS_NORM_SCALE) {
+        GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+        ggml_tensor * dst = cgraph->nodes[node_idx + 1];
+        vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, src0, dst, op_params[0], 0);
+        pc.param2 = ggml_get_op_params_f32(dst, 0);
+        pc.param3 = ggml_get_op_params_i32(dst, 1);
+        init_pushconst_tensor_offsets(ctx, pc, src0, src0, nullptr, nullptr, dst);
+        vk_pipeline pipeline = ggml_vk_rms_norm_pipeline(ctx->device->pipeline_rms_norm_scale_f32, src0->ne[0]);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {
+                ggml_vk_tensor_subbuffer(ctx, src0, true),
+                ggml_vk_tensor_subbuffer(ctx, src0, true),
+                ggml_vk_tensor_subbuffer(ctx, dst, true),
+            }, pc, {
+                (uint32_t)src0->ne[1],
+                std::min((uint32_t)src0->ne[2], ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+                std::min((uint32_t)src0->ne[3], ctx->device->properties.limits.maxComputeWorkGroupCount[2]),
+            });
+        ggml_vk_rms_norm_finish(ctx, src0);
+        return;
+    }
+
     if (ctx->fused_rms_norm_mode == RMS_NORM_VIEW_SET_ROWS) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 2);
         ggml_tensor * set_rows = cgraph->nodes[node_idx + 2];
@@ -13928,6 +13956,16 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         return false;
     }
 
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor * rms = cgraph->nodes[node_idx];
+        const ggml_tensor * dst = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * src = rms->src[0];
+        return ctx->device->pipeline_rms_norm_scale_f32[2] && !ctx->do_add_rms_partials &&
+            src->type == GGML_TYPE_F32 && rms->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            dst->src[0] == rms && ggml_get_op_params_f32(dst, 1) == 0.0f &&
+            ggml_is_contiguous_rows(src) && ggml_is_contiguous(rms) && ggml_is_contiguous(dst);
+    }
+
     if ((ops.size() == 2 || ops.size() == 3 || ops.size() == 4) &&
         ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         // additional constraints specific to this fusion
@@ -14881,6 +14919,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_VIEW_SET_ROWS;
                 fusion_string = "RMS_NORM_VIEW_SET_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_rms_norm_mode = RMS_NORM_SCALE;
+                fusion_string = "RMS_NORM_SCALE";
+                std::fill_n(op_srcs_fused_elementwise, 2, true);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL;
