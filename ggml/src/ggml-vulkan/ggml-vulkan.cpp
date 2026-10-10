@@ -3283,6 +3283,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     const char * ptq1_packed_dot_env = getenv("GGML_VK_PTQ1_PACKED_DOT");
     const uint32_t ptq1_packed_dot = ptq1_packed_dot_env != nullptr && strcmp(ptq1_packed_dot_env, "1") == 0;
+    const char * ptq1_rows_env = getenv("GGML_VK_PTQ1_ROWS");
+    const bool ptq1_rows8 = device->architecture == vk_device_architecture::AMD_RDNA4 &&
+                           ptq1_rows_env != nullptr && strcmp(ptq1_rows_env, "8") == 0;
 #endif
 
     // the number of rows computed per shader depends on GPU model and quant
@@ -3424,6 +3427,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (device->integer_dot_product) {
                 const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
                 const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
+                const uint32_t ptq1_rows = ptq1_rows8 && i < 2 ? 8u : 4*rm_kq_int;
 
                 const struct {
                     ggml_type type;
