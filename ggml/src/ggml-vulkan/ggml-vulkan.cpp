@@ -3865,9 +3865,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    const char * ssm_conv_small_env = getenv("GGML_VK_SSM_CONV_SMALL");
+    const bool ssm_conv_small = ssm_conv_small_env ? strcmp(ssm_conv_small_env, "1") == 0 : device->architecture == AMD_RDNA4;
+    for (uint32_t i = 0; i < (ssm_conv_small ? 3u : 1u); ++i) {
+        // The general tile launches unused token rows during decode. Fill waves with channels instead.
+        const uint32_t channels = i == 0 ? 32 : 64;
+        const uint32_t tokens = i == 0 ? 16 : i;
+        const std::string suffix = i == 0 ? "" : "_n" + std::to_string(i);
+        ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32[i],           "ssm_conv_f32" + suffix,           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 0}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32[i],      "ssm_conv_silu_f32" + suffix,      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 1}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32[i], "ssm_conv_bias_silu_f32" + suffix, ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 1, 1}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -9459,10 +9467,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_SSM_CONV:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            const int64_t n_t = dst->ne[1];
+            const uint32_t tile = n_t >= 1 && n_t <= 2 && ctx->device->pipeline_ssm_conv_f32[n_t] ? uint32_t(n_t) : 0;
             switch (ctx->num_additional_fused_ops) {
-                case 0:  return ctx->device->pipeline_ssm_conv_f32;
-                case 1:  return ctx->device->pipeline_ssm_conv_silu_f32;
-                case 2:  return ctx->device->pipeline_ssm_conv_bias_silu_f32;
+                case 0:  return ctx->device->pipeline_ssm_conv_f32[tile];
+                case 1:  return ctx->device->pipeline_ssm_conv_silu_f32[tile];
+                case 2:  return ctx->device->pipeline_ssm_conv_bias_silu_f32[tile];
                 default: return nullptr;
             }
         }

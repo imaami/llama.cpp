@@ -4573,19 +4573,26 @@ struct test_ssm_conv : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
+    const bool strided;
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne_a, ne_b);
+        return VARS_TO_STR4(type, ne_a, ne_b, strided);
     }
 
     test_ssm_conv(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {10, 10, 10, 1},
-            std::array<int64_t, 4> ne_b = {3, 3, 1, 1})
-        : type(type), ne_a(ne_a), ne_b(ne_b) {}
+            std::array<int64_t, 4> ne_b = {3, 3, 1, 1}, bool strided = false)
+        : type(type), ne_a(ne_a), ne_b(ne_b), strided(strided) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        if (strided) {
+            a = ggml_new_tensor_3d(ctx, type, ne_a[0] + 128, ne_a[1] + 1, ne_a[2]);
+            a = ggml_view_3d(ctx, a, ne_a[0], ne_a[1], ne_a[2], a->nb[1], a->nb[2], 256);
+            b = ggml_new_tensor_2d(ctx, type, ne_b[0] + 128, ne_b[1]);
+            b = ggml_view_2d(ctx, b, ne_b[0], ne_b[1], b->nb[1], 256);
+        }
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         return out;
     }
@@ -4596,6 +4603,7 @@ struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
+    const bool strided;
     const bool fuse_bias;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4606,16 +4614,22 @@ struct test_ssm_conv_bias_silu : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne_a, ne_b, fuse_bias);
+        return VARS_TO_STR5(type, ne_a, ne_b, fuse_bias, strided);
     }
 
     test_ssm_conv_bias_silu(ggml_type type, std::array<int64_t, 4> ne_a, std::array<int64_t, 4> ne_b,
-            bool fuse_bias)
-        : type(type), ne_a(ne_a), ne_b(ne_b), fuse_bias(fuse_bias) {}
+            bool fuse_bias, bool strided = false)
+        : type(type), ne_a(ne_a), ne_b(ne_b), strided(strided), fuse_bias(fuse_bias) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        if (strided) {
+            a = ggml_new_tensor_3d(ctx, type, ne_a[0] + 128, ne_a[1] + 1, ne_a[2]);
+            a = ggml_view_3d(ctx, a, ne_a[0], ne_a[1], ne_a[2], a->nb[1], a->nb[2], 256);
+            b = ggml_new_tensor_2d(ctx, type, ne_b[0] + 128, ne_b[1]);
+            b = ggml_view_2d(ctx, b, ne_b[0], ne_b[1], b->nb[1], 256);
+        }
         ggml_set_name(a, "a");
         ggml_set_name(b, "b");
 
@@ -11122,6 +11136,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
             }
         }
+    }
+
+    // Short convolution tiles: channel tails, two-token verification, and general-path boundary.
+    for (int64_t d_inner : {63, 65, 10240}) {
+        for (int64_t n_tokens : {1, 2, 3}) {
+            const std::array<int64_t, 4> a = {3 + n_tokens, d_inner, 2, 1};
+            const std::array<int64_t, 4> b = {4, d_inner, 1, 1};
+            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, a, b));
+            test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, a, b, false));
+            test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, a, b, true));
+        }
+    }
+    for (int64_t n_tokens : {1, 2}) {
+        const std::array<int64_t, 4> a = {3 + n_tokens, 65, 3, 1};
+        const std::array<int64_t, 4> b = {4, 65, 1, 1};
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, a, b, true));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, a, b, false, true));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, a, b, true, true));
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
