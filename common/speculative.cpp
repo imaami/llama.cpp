@@ -1044,7 +1044,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             if (t.id != LLAMA_TOKEN_NULL) {
                 const int32_t idx = batch.add(t.id, t.pos[0], t.seq_id, output);
                 if (t.embd.data) {
-                    batch.set_embd_state(idx, t.embd);
+                    batch.set_embd(idx, t.embd);
                 }
             } else {
                 // mtmd input is projected by the target encoder, a draft with a different width cannot read it
@@ -1494,13 +1494,13 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 const llama_pos dft_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
                 if (pending_pos > dft_pos_max) {
                     const int32_t idx = batch.add(batch_in.tokens[beg].id, pending_pos, seq_id, /*output=*/ false);
-                    batch.set_embd_state(idx, { pending_g_last[seq_id].data(), 1, (size_t) n_embd_dec });
+                    batch.set_embd(idx, { pending_g_last[seq_id].data(), 1, (size_t) n_embd_dec });
                 }
             }
 
             for (int32_t k = beg; k < end; ++k) {
                 const int32_t idx = batch.add(batch_in.tokens[k + 1].id, batch_in.tokens[k].pos[0], seq_id, /*output=*/ false);
-                batch.set_embd_state(idx, { g_embd + (size_t) k * n_embd_dec, 1, (size_t) n_embd_dec });
+                batch.set_embd(idx, { g_embd + (size_t) k * n_embd_dec, 1, (size_t) n_embd_dec });
             }
 
             // refresh deferred state
@@ -1555,7 +1555,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pending_pos_last[seq_id], -1);
 
             const int32_t idx = batch.add(dp.id_last, pending_pos_last[seq_id], seq_id, true);
-            batch.set_embd_state(idx, { pending_g_last[seq_id].data(), 1, (size_t) n_embd_dec });
+            batch.set_embd(idx, { pending_g_last[seq_id].data(), 1, (size_t) n_embd_dec });
         }
 
         if (batch.size() == 0) {
@@ -1620,7 +1620,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 }
 
                 const int32_t idx = batch.add(id, pending_pos_last[seq_id] + (i + 1), seq_id, true);
-                batch.set_embd_state(idx, { prenorm, 1, (size_t) n_embd_dec });
+                batch.set_embd(idx, { prenorm, 1, (size_t) n_embd_dec });
             }
 
             if (batch.size() == 0) {
