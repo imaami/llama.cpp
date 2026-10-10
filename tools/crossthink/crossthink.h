@@ -21,6 +21,25 @@
 
 using crossthink_json = nlohmann::ordered_json;
 
+class crossthink_native_parse_error final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+
+    static bool is_response(int status, const crossthink_json & response) {
+        if (status != 500 || !response.is_object()) {
+            return false;
+        }
+        const auto error = response.find("error");
+        if (error == response.end() || !error->is_object()) {
+            return false;
+        }
+        return error->contains("code") && error->at("code").is_number_integer() && error->at("code") == 500 &&
+            error->contains("type") && error->at("type") == "server_error" &&
+            error->contains("message") && error->at("message") ==
+                "The model produced output that does not match the expected peg-native format";
+    }
+};
+
 struct crossthink_options {
     int32_t chunk_tokens = 512;
     int32_t sentence_after = 256;
@@ -30,6 +49,7 @@ struct crossthink_options {
     double temperature = 1.0;
     int32_t tool_tokens = 2048;
     int32_t max_tool_rounds = 8;
+    int32_t protocol_retries = 2;
     bool telepathy = true;
     int32_t link_quantum = 64;
     int32_t private_quantum = 256;
@@ -100,6 +120,7 @@ private:
         uint64_t forced_splices = 0;
         uint64_t tool_calls = 0;
         int32_t tool_rounds = 0;
+        int32_t protocol_retries = 0;
         uint32_t generation_limit = 0;
         server_thought_scanner thought_scanner;
         uint64_t revision = 1;

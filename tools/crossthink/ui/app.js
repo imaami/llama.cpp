@@ -137,7 +137,8 @@ const phaseLabels = {
     waiting_reasoning: 'Waiting for server (reasoning)', reasoning: 'Thinking',
     waiting_native: 'Waiting for server (answer/tool call)',
     native_output: 'Generating answer/tool call (buffered)', parsing_native: 'Parsing answer/tool call',
-    thought_result: 'Applying thought result', mcp: 'Waiting for MCP tool', tool_result: 'Applying tool result'
+    thought_result: 'Applying thought result', mcp: 'Waiting for MCP tool', tool_result: 'Applying tool result',
+    recovering_protocol: 'Repairing command format'
 };
 function applyState(next) {
     if (!next || typeof next !== 'object') return;
@@ -180,6 +181,7 @@ function applyState(next) {
             'Context ' + number(peer.tokens) + ' / ' + number(peer.context_size),
             'Thought ' + number(peer.thinking_tokens),
             'Imported ' + number(peer.imported),
+            ...(peer.protocol_retries ? ['Protocol retries ' + number(peer.protocol_retries)] : []),
             ...(peer.queued ? ['Queued ' + number(peer.queued)] : [])
         ]) {
             const item = document.createElement('span');
@@ -315,6 +317,14 @@ function handleEvent(event) {
             break;
         case 'thought_result':
             if (peer) appendOutput('thought-' + peer, record.text, true);
+            break;
+        case 'protocol_feedback':
+            if (peer) {
+                const attempt = Number.isInteger(record.attempt) && Number.isInteger(record.limit) ?
+                    ' (retry ' + record.attempt + ' of ' + record.limit + ')' : '';
+                appendOutput('thought-' + peer, record.text, true, 'Coordinator feedback' + attempt);
+                outputBoundary('thought-' + peer, 'After coordinator feedback');
+            }
             break;
         case 'native_output':
             if (peer) {

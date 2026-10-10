@@ -1,4 +1,5 @@
 #include "crossthink.h"
+#include "crossthink-protocol.h"
 
 #include <algorithm>
 #include <chrono>
@@ -29,6 +30,7 @@ crossthink_session::crossthink_session(
             options.answer_tokens < 1 || options.answer_tokens > 65536 ||
             options.tool_tokens < 1 || options.tool_tokens > 16384 ||
             options.max_tool_rounds < 1 || options.max_tool_rounds > 64 ||
+            options.protocol_retries < 0 || options.protocol_retries > 8 ||
             options.link_quantum < 1 || options.link_quantum > 4096 ||
             options.private_quantum < 1 || options.private_quantum > 4096 ||
             options.link_wait_tokens < 1 || options.link_wait_tokens > 65536) {
@@ -171,6 +173,7 @@ json crossthink_session::state_locked() const {
             {"waiting", peer.segment_done}, {"boundary", peer.boundary}, {"forced_splices", peer.forced_splices},
             {"tool_calls", peer.tool_calls}, {"tool_status", peer.tool_status}, {"answer_done", peer.answer_done},
             {"empty_response", peer.empty_response},
+            {"protocol_retries", peer.protocol_retries},
             {"mailbox", peer.mailbox.size()}, {"thought_turn", peer.thought_turn},
             {"phase", phase}, {"request_generated", peer.request_generated},
             {"request_elapsed_seconds", elapsed(peer.request_started)}, {"last_token_age_seconds", elapsed(peer.last_token)},
@@ -488,8 +491,12 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         lock.unlock();
         json assistant;
         std::string parse_error;
+        bool parse_rejected = false;
         try {
             assistant = peer.transport->parse_tool_turn(output);
+        } catch (const crossthink_native_parse_error & exception) {
+            parse_error = exception.what();
+            parse_rejected = true;
         } catch (const std::exception & exception) {
             parse_error = exception.what();
         }
@@ -507,15 +514,76 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         }
         if (calls.empty()) {
             const auto content = parse_error.empty() ? assistant.value("content", std::string()) : std::string();
+            const bool protocol_error = options.telepathy && (parse_rejected ||
+                (parse_error.empty() && crossthink_misplaced_thought_commands(content)));
+            std::string repair_failure;
+            const auto forced_answer = [&] {
+                return peer.force_answer || (blocked(index) && pending.action == "answer");
+            };
+            if (protocol_error) {
+                if (forced_answer()) {
+                    repair_failure = "protocol repair suppressed by Answer now";
+                } else if (peer.protocol_retries >= options.protocol_retries) {
+                    repair_failure = options.protocol_retries ? "protocol repair limit reached" : "protocol repair disabled";
+                } else {
+                    const std::string feedback = std::string("<ct:protocol_error source=\"coordinator\">\n") +
+                        (parse_rejected
+                            ? "Your previous response did not match the native output format and was rejected before any tool execution. "
+                            : "Your previous final response contained only a thought command after reasoning had closed. ") +
+                        "No command from that response was executed and no message was queued. The user task remains pending. "
+                        "A new reasoning block is now open. If you still intend a thought command, emit it at column zero "
+                        "inside this reasoning block, outside code fences; do not close reasoning or use a native tool-call wrapper. "
+                        "Continue your work after its marked result. Native tool calls must use the separately listed tools and their format. "
+                        "Finish with an actual answer.\n</ct:protocol_error>";
+                    peer.phase = "recovering_protocol";
+                    peer.tool_status = "repairing response protocol";
+                    emit_state();
+                    lock.unlock();
+                    std::vector<llama_token> suffix;
+                    try {
+                        // Use only a template skeleton for rejected output; the raw tape stays intact.
+                        const json previous = parse_rejected ? json{{"role", "assistant"}, {"content", ""}} : assistant;
+                        suffix = peer.transport->tool_results(previous, json::array({{
+                            {"role", "tool"}, {"content", feedback},
+                        }}));
+                    } catch (const std::exception & exception) {
+                        repair_failure = std::string("could not prepare protocol feedback: ") + exception.what();
+                    }
+                    lock.lock();
+                    if (stopping || generation_id(index) != generation_epoch || mode == "error") {
+                        return false;
+                    }
+                    const uint64_t reserve = 256 + budget + options.answer_tokens + 2;
+                    if (forced_answer()) {
+                        repair_failure = "protocol repair suppressed by Answer now";
+                    } else if (repair_failure.empty() && (suffix.empty() ||
+                            peer.tape.size() + suffix.size() + reserve >= peer.context_size)) {
+                        repair_failure = "protocol feedback does not fit the remaining context";
+                    }
+                    if (repair_failure.empty()) {
+                        peer.tape.insert(peer.tape.end(), suffix.begin(), suffix.end());
+                        ++peer.protocol_retries;
+                        peer.thinking_open = true;
+                        begin_thought(peer);
+                        peer.tool_status.clear();
+                        emit({{"type", "protocol_feedback"}, {"peer", peer_name(index)}, {"text", feedback},
+                            {"attempt", peer.protocol_retries}, {"limit", options.protocol_retries}});
+                        changed.notify_all();
+                        return true;
+                    }
+                }
+            }
             peer.tape.pop_back(); // next_user() supplies the assistant terminator.
             peer.answer_done = true;
-            peer.empty_response = content.find_first_not_of(" \t\r\n\f\v") == std::string::npos;
+            peer.empty_response = protocol_error || content.find_first_not_of(" \t\r\n\f\v") == std::string::npos;
             peer.segment_done = false;
             peer.tool_status.clear();
             peer.inbox.clear();
             if (!options.telepathy) { other.inbox.clear(); }
             if (peer.empty_response) {
-                emit({{"type", "notice"}, {"message", std::string(peer_name(index)) + (parse_error.empty()
+                emit({{"type", "notice"}, {"message", std::string(peer_name(index)) + (protocol_error
+                    ? ": " + repair_failure + "; no command executed; inspect its native output"
+                    : parse_error.empty()
                     ? ": generation ended without an answer or a native tool call; inspect its native output"
                     : ": could not parse native output: " + parse_error + "; inspect its native output")}});
             } else {
@@ -1068,6 +1136,7 @@ void crossthink_session::apply(const pending_command & command) {
             peer.forced_splices = 0;
             peer.tool_calls = 0;
             peer.tool_rounds = 0;
+            peer.protocol_retries = 0;
             peer.tool_status.clear();
             peer.thought_turn = 0;
             peer.thought_text.clear();
@@ -1107,6 +1176,7 @@ void crossthink_session::apply(const pending_command & command) {
             peer.empty_response = false;
             peer.segment_done = false;
             peer.tool_rounds = 0;
+            peer.protocol_retries = 0;
             peer.private_pending = false;
             peer.force_answer = false;
             peer.tool_status.clear();

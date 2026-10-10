@@ -130,7 +130,13 @@ public:
     json parse_tool_turn(const std::vector<llama_token> & tokens) override {
         auto request = template_request(json::array({{{"role", "user"}, {"content", initial_text}}}));
         request["parse_output"] = tokens;
-        return post("/apply-template", request).at("message");
+        const auto result = client.Post("/apply-template", request.dump(), "application/json");
+        // Only this validation endpoint can produce a retryable native parse rejection.
+        if (result && result->status == 500 && crossthink_native_parse_error::is_response(
+                result->status, json::parse(result->body, nullptr, false))) {
+            throw crossthink_native_parse_error("server HTTP 500: " + result->body.substr(0, 4096));
+        }
+        return json::parse(response(result)).at("message");
     }
 
     std::vector<llama_token> tool_results(const json & assistant, const json & results) override {

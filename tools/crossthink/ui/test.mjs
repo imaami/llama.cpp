@@ -220,6 +220,35 @@ try {
     assert.equal(await page.locator('#thought-A .output-segment:last-child').textContent().then(text => text.includes('<ct:peek/>')), true);
     assert.equal(await page.locator('#native-B .output-boundary').textContent(), 'Empty native response');
 
+    // Protocol feedback is a coordinator document, never a model/tool result.
+    const feedback = '<ct:protocol_error source="coordinator">\nNo command executed. Retry inside reasoning.\n</ct:protocol_error>\n\n```text\nunfinished';
+    const toolsBeforeFeedback = await page.locator('#tools-A .output-segment').count();
+    const thoughtBeforeFeedback = await page.evaluate(() => {
+        window.partnerBeforeFeedback = document.querySelector('#thought-B .output-segment');
+        return document.getElementById('thought-B').textContent;
+    });
+    state.mode = 'thinking';
+    state.peers[0].phase = 'recovering_protocol';
+    state.peers[0].protocol_retries = 1;
+    emit({ type: 'state', state });
+    emit({ type: 'protocol_feedback', peer: 'A', text: feedback, attempt: 1, limit: 2 });
+    await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child .output-boundary')?.textContent ===
+        'Coordinator feedback (retry 1 of 2)');
+    assert.equal(await page.locator('#stats-A .peer-phase').textContent(), 'Repairing command format');
+    assert.match(await page.locator('#stats-A').textContent(), /Protocol retries 1/);
+    await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child').textContent.includes('</ct:protocol_error>'));
+    emit({ type: 'token', peer: 'A', text: '**Continue independently.**\n<ct:inbox/>\n' });
+    await page.waitForFunction(() => document.querySelector('#thought-A .output-segment:last-child strong')?.textContent === 'Continue independently.');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child .output-boundary').textContent(), 'After coordinator feedback');
+    assert.equal(await page.locator('#thought-A .output-segment:last-child pre').count(), 0);
+    assert.equal(await page.locator('#tools-A .output-segment').count(), toolsBeforeFeedback);
+    assert.equal(await page.locator('#thread .bubble').count(), 0);
+    assert.equal(await page.locator('#thought-B').textContent(), thoughtBeforeFeedback);
+    assert.equal(await page.evaluate(() => window.partnerBeforeFeedback === document.querySelector('#thought-B .output-segment')), true);
+    assert.equal(posts.length, postsBeforeNative, 'coordinator feedback must not execute displayed command tags');
+    await page.locator('[data-copy="thought-A"]').click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()).then(text => text.endsWith(feedback + '**Continue independently.**\n<ct:inbox/>\n')), true);
+
     await page.screenshot({ path: join(root, 'test-desktop.png'), fullPage: true });
     await page.setViewportSize({ width: 700, height: 950 });
     await page.screenshot({ path: join(root, 'test-mobile.png'), fullPage: true });
@@ -242,7 +271,7 @@ try {
     await page.waitForFunction(() => !document.querySelector('#native-A .output-segment'));
     assert.equal(await page.locator('#native-B .output-segment').count(), 0);
     assert.deepEqual(errors, []);
-    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics, turn/result isolation, native response diagnostics, verbatim copy, clipping.');
+    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics, turn/result isolation, native response diagnostics, coordinator feedback isolation, verbatim copy, clipping.');
 } finally {
     await browser.close();
     for (const client of clients) client.end();

@@ -38,6 +38,8 @@ build/bin/llama-crossthink \
 
 Open **http://127.0.0.1:8090/** and send a message to start. Alternatively supply `--prompt 'Your question'` or `--file prompt.txt` (`--file -` reads stdin). `--seed` defaults to 42 and `--temperature` to 1.0. If the model servers require the same bearer key, pass `--api-key KEY` to the coordinator. The console defaults to loopback and has no authentication of its own.
 
+After an update, restart the rebuilt coordinator and reload any open console tab. The bundled UI is served with caching disabled, but an already-open page keeps its previous JavaScript until reloaded.
+
 The ordinary model web UIs remain at **http://127.0.0.1:8080/** and **http://127.0.0.1:8081/**. Those chats are separate from the coordinated conversation; use port 8090 to address the pair. Other requests can displace a server's prompt cache or delay crossthink. Each continuation resubmits the authoritative token sequence, so cache displacement does not silently change the conversation.
 
 ## Commands inside reasoning
@@ -94,6 +96,7 @@ A model can close its reasoning naturally to call an MCP tool or answer. Its par
 | Option | Default | Behavior |
 | --- | --- | --- |
 | `--answer-tokens N` | `1024` | Final answer budget, `1..65536`. |
+| `--protocol-retries N` | `2` | Protocol repair attempts per agent per user message, `0..8`; `0` disables repair. |
 | `--link-quantum N` | Compatibility only | Accepted but ignored; thought commands have no shared generation quantum. |
 | `--private-quantum N` | Compatibility only | Accepted but ignored; independent reasoning no longer restarts periodically. |
 | `--link-wait-tokens N` | Compatibility only | Accepted but ignored; no shared floor or voluntary yield exists. |
@@ -118,7 +121,11 @@ Each agent has a generated-token count and a tokens-per-second meter over a roll
 
 Per-agent status also shows the current phase, tokens received for the current request, time since that request started, and time since its last token. After reasoning closes, native answer/tool-call text is buffered until the native turn finishes and can be parsed; the reasoning pane can be quiet while the agent is still generating. The status distinguishes this from waiting for the server, generating reasoning, handling a thought result, or running an MCP call. Waiting for the first token includes queueing and prompt processing; the coordinator cannot distinguish those server-side phases.
 
-Expand **Native response** to inspect or copy the text generated after reasoning closed, before native parsing. This includes malformed calls that cannot be parsed. Parsed `reasoning_content` is displayed separately in the individual reasoning pane, but commands found there are not executed retroactively. A native turn with no non-whitespace answer and no tool calls, or one rejected by the native parser, is reported as **Finished without an answer**. That agent stops while its partner continues. Once both finish, the session is **Incomplete** if either failed to produce an answer. Send a follow-up message to the affected agent to continue; the coordinator does not retry calls or reinterpret native output as thought commands.
+Expand **Native response** to inspect or copy the text generated after reasoning closed, before native parsing. This includes malformed calls that cannot be parsed. Parsed `reasoning_content` is displayed separately in the individual reasoning pane, but commands found there are not executed retroactively. A native turn with no non-whitespace answer and no tool calls is reported as **Finished without an answer**. That agent stops while its partner continues. Once both finish, the session is **Incomplete** if either failed to produce an answer. Send a follow-up message to the affected agent to continue.
+
+In independent mode, a native parser format rejection or a final answer consisting entirely of complete, line-anchored thought commands receives bounded protocol repair. The raw response stays in history, followed by marked **Coordinator feedback** and a new open reasoning block. No command from the rejected response is executed, copied into reasoning, or delivered to the partner. The model must generate its intended command again inside reasoning. Normal answers, fenced/quoted examples, and prose containing a tag are unaffected. A bare command-only answer could also be an intentional syntax example; this conservative heuristic can be disabled with `--protocol-retries 0`.
+
+The default limit is two repairs per agent per real user message. Native tool turns and successful thought commands do not replenish it; a targeted user message resets only its recipient's budget. **Answer now** suppresses repair. Exhaustion, unsupported template continuations, or insufficient context stop only the affected agent as **Finished without an answer**. Generic HTTP/transport failures and already-executed MCP calls are never automatically retried. The partner keeps generating throughout repair.
 
 The Qwen3-coder parser used by Qwen3.5 now requires complete consumption of a native response. Previously its optional tool-call branch could accept zero calls and silently discard an unknown or malformed `<tool_call>`, even one following valid prose or a valid call. Crossthink then incorrectly treated the resulting empty message as an answer. Rejected responses now retain their generated text for inspection, and no calls from a rejected response are executed.
 
@@ -182,9 +189,11 @@ The HTTP control API mirrors these controls: `POST /message` with `{"text":"..."
 
 In the default mode, state reports `splice_mode: "independent"` and `thought_tools: 3`; `tools` counts only external native tools. Per-peer fields include `generated`, `imported`, `thinking_tokens`, `tokens_per_second`, `thinking_tokens_per_second`, `mailbox`, and `thought_turn`. Top-level `thinking_tokens` and rate fields sum both agents.
 
-Per-peer `phase` reports `waiting_reasoning`, `reasoning`, `waiting_native`, `native_output`, `parsing_native`, `thought_result`, `mcp`, or `tool_result` while active, and `idle`, `ready`, `paused`, `done`, or `error` otherwise. Legacy answer streaming uses `answer`. `request_generated` resets for each completion request. `request_elapsed_seconds` is null before the first request, and `last_token_age_seconds` is null until the current request delivers tokens. These ages are wall-clock diagnostics, not server decode timings.
+Per-peer `phase` reports `waiting_reasoning`, `reasoning`, `waiting_native`, `native_output`, `parsing_native`, `recovering_protocol`, `thought_result`, `mcp`, or `tool_result` while active, and `idle`, `ready`, `paused`, `done`, or `error` otherwise. Legacy answer streaming uses `answer`. `request_generated` resets for each completion request. `request_elapsed_seconds` is null before the first request, and `last_token_age_seconds` is null until the current request delivers tokens. These ages are wall-clock diagnostics, not server decode timings.
 
 `empty_response: true` and `phase: "empty_response"` identify a stopped native turn that did not produce a usable answer or tool call. `answer_done` means that peer's generation has ended; use `empty_response` to distinguish failure from a completed answer. The aggregate terminal mode is `incomplete` rather than `answered` when any participating peer has this condition. A `native_output` event carries the raw tail in `text`; `native_reasoning` carries reasoning returned by the native parser. Neither event is a thought-command input or a delivered thought message.
+
+`protocol_retries` counts committed repairs for that peer's current user message. A `protocol_feedback` event carries `peer`, `text`, `attempt`, and `limit`; it is coordinator feedback, not a tool execution or thought message.
 
 A `thought_result` event contains the complete marked insertion for the named peer's reasoning display. A separate `thought_capture` event identifies the source and captured byte range; do not append it again or the display will duplicate the capture. A `thought_message` event has a stable `message_id`, `from`, `to`, `text`, and a status of `sent` or `received`. Update the matching message bubble when its status changes. Peeks never create message bubbles.
 
@@ -231,6 +240,8 @@ When native tools are enabled, `splice.stop_on_think_close` also stops at the si
 The `reasoning-swap` branch is based on `imaami/llama.cpp`'s `bonsai` commit `5ada589b7811232c44d55dbf210329d98414fb4d`. Release CPU builds passed for llama-server and llama-crossthink. The coordinator suite covers concurrent reasoning and MCP, incremental raw-token captures, opt-in inbox delivery, targeted user messages, independent answers, metrics, and pause/reset races. Additional regressions cover inert inline/fenced commands, line/fence state across requests, exactly-once deliberate commands after resuming, and empty-inbox continuation through reasoning and buffered native output. Binary route tests exercise MTP off and on, including split and resumed commands, inert imports and code examples, literal delimiters, bounded payloads, malformed checkpoints, and cached continuation. Native chat-template and HTTP MCP suites also passed.
 
 Native completion regressions cover ordinary answers and literal thought-tag text with and without external tools, malformed and unknown calls, valid bytewise streaming calls, empty/reasoning-only responses, raw diagnostics, independent partner progress after parse failure, and targeted recovery. The broader `test-chat` and `test-chat-peg-parser` suites validate the full-consumption parser change.
+
+Protocol repair regressions cover command-only recognition, strict classification of native parser rejections, retry limits, explicit reissue inside reasoning, template suffixes, context exhaustion, independent partner progress, and pause/answer/reset/targeted-message races. Browser tests cover isolated coordinator feedback, retry status, literal output copying, and preservation of the other agent's view.
 
 Run the binaries from the repository root for the template files:
 

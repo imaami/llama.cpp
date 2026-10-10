@@ -115,6 +115,9 @@ public:
     crossthink_json configured_tools;
     crossthink_json parsed_assistant;
     std::string parse_error;
+    bool native_parse_error = false;
+    std::string results_error;
+    std::vector<llama_token> results_tokens = {40, 1};
     std::vector<std::vector<llama_token>> parsed_turns;
     std::vector<crossthink_json> result_assistants;
     std::vector<crossthink_json> result_messages;
@@ -184,18 +187,21 @@ public:
     crossthink_json parse_tool_turn(const std::vector<llama_token> & tokens) override {
         crossthink_json result;
         std::string error;
+        bool native_error;
         std::shared_ptr<fake_operation> gate;
         {
             std::lock_guard<std::mutex> lock(mutex);
             parsed_turns.push_back(tokens);
             result = parsed_assistant;
             error = parse_error;
+            native_error = native_parse_error;
             gate = parse_gate;
         }
         if (gate) {
             gate->run();
         }
         if (!error.empty()) {
+            if (native_error) { throw crossthink_native_parse_error(error); }
             throw std::runtime_error(error);
         }
         return result;
@@ -204,16 +210,21 @@ public:
     std::vector<llama_token> tool_results(const crossthink_json & assistant,
             const crossthink_json & results) override {
         std::shared_ptr<fake_operation> gate;
+        std::string error;
+        std::vector<llama_token> tokens;
         {
             std::lock_guard<std::mutex> lock(mutex);
             result_assistants.push_back(assistant);
             result_messages.push_back(results);
             gate = results_gate;
+            error = results_error;
+            tokens = results_tokens;
         }
         if (gate) {
             gate->run();
         }
-        return {40, 1};
+        if (!error.empty()) { throw std::runtime_error(error); }
+        return tokens;
     }
 
     crossthink_json generate(const std::vector<llama_token> & prompt,
@@ -385,7 +396,8 @@ struct fixture {
     uint64_t cursor = 0;
 
     fixture(int32_t chunk = 2, uint64_t context = 256, bool paragraph_splice = false,
-            bool enable_tools = false, bool telepathy = false, int32_t max_tool_rounds = 8) {
+            bool enable_tools = false, bool telepathy = false, int32_t max_tool_rounds = 8,
+            int32_t protocol_retries = 2) {
         std::array<std::unique_ptr<crossthink_transport>, 2> transports;
         std::array<std::unique_ptr<crossthink_tool_service>, 2> services;
         for (size_t i = 0; i < peers.size(); ++i) {
@@ -417,6 +429,7 @@ struct fixture {
         options.private_quantum = 4;
         options.link_wait_tokens = 8;
         options.max_tool_rounds = max_tool_rounds;
+        options.protocol_retries = protocol_retries;
         session = std::make_unique<crossthink_session>(std::move(transports), options, std::move(services));
     }
 
@@ -1251,6 +1264,7 @@ static void test_thought_native_mcp_does_not_serialize_peer() {
     {
         std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
         f.peers[0]->parsed_assistant["reasoning_content"] = native_reasoning;
+        f.peers[0]->parsed_assistant["content"] = "<ct:inbox/>";
     }
     f.start();
     auto b0 = f.peers[1]->request(0);
@@ -1275,6 +1289,7 @@ static void test_thought_native_mcp_does_not_serialize_peer() {
     auto a2 = f.peers[0]->request(2);
     check(f.tools[0]->call_count() == 1 && f.tools[1]->call_count() == 0,
             "preserving native reasoning replayed or forwarded the MCP call");
+    check(events_of(f, "protocol_feedback").empty(), "a valid native tool call was replaced with protocol repair");
     check(ends_with(a2->prompt, {3, 40, 1}) && !count(a2->prompt, 201),
             "MCP result lost its native template or imported unsolicited peer text");
     check(request_is_active(b0) && f.peers[1]->request_count() == 1,
@@ -1374,12 +1389,12 @@ static void test_thought_empty_native_answer_is_incomplete() {
 static void test_thought_native_output_survives_parse_failure() {
     fixture f(4, 32768, true, false, true);
     auto gate = std::make_shared<fake_operation>();
+    f.start();
     {
         std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
         f.peers[0]->parse_gate = gate;
         f.peers[0]->parse_error = "deliberate native parser failure";
     }
-    f.start();
     auto b0 = f.peers[1]->request(0);
     auto a1 = start_private_turn(f, 0);
     a1->send({501}, "unparsed ");
@@ -1420,6 +1435,237 @@ static void test_thought_native_output_survives_parse_failure() {
     finish_thought_answer(f, 0, 2, "A corrected answer");
     f.wait_mode("answered");
     check(f.peers[1]->request_count() == 2, "parse-failure follow-up restarted the successful partner");
+    check(events_of(f, "protocol_feedback").empty(), "ordinary parser/transport failure triggered protocol repair");
+}
+
+static void finish_misplaced_native(fixture & f, size_t index, size_t request_index) {
+    const std::string text = "<ct:send>Send this only after I issue it while reasoning.</ct:send>";
+    {
+        std::lock_guard<std::mutex> lock(f.peers[index]->mutex);
+        f.peers[index]->parsed_assistant = {{"role", "assistant"}, {"content", text}};
+    }
+    auto reasoning = f.peers[index]->request(request_index);
+    reasoning->send({2}, "</think>");
+    reasoning->finish("limit", "tool");
+    auto native = f.peers[index]->request(request_index + 1);
+    native->send({static_cast<llama_token>(501 + index), 3}, text);
+    native->finish("eos", "");
+}
+
+static void test_thought_protocol_repair_and_targeted_budget() {
+    fixture f(4, 32768, true, false, true);
+    f.start();
+    auto b0 = f.peers[1]->request(0);
+    finish_misplaced_native(f, 0, 0);
+    auto a2 = f.peers[0]->request(2);
+    check(ends_with(a2->prompt, {501, 3, 40, 1}) && count(a2->prompt, 501) == 1 && count(a2->prompt, 3) == 1,
+            "protocol repair replaced or duplicated the completed native turn");
+    check(request_is_active(b0) && f.peers[1]->request_count() == 1,
+            "repairing a misplaced command interrupted its partner");
+    auto feedback = events_of(f, "protocol_feedback", "A");
+    check(feedback.size() == 1 && feedback[0].at("attempt") == 1 && feedback[0].at("limit") == 2 &&
+            !feedback[0].at("text").get<std::string>().empty(), "first protocol repair lacked its bounded feedback event");
+    check(f.session->state().at("peers").at(0).at("protocol_retries") == 1,
+            "protocol retry count did not survive reopening reasoning");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        check(f.peers[0]->result_messages.size() == 1 && f.peers[0]->result_messages[0].size() == 1,
+                "protocol repair rendered more than one coordinator message");
+        const auto & message = f.peers[0]->result_messages[0][0];
+        check(message.at("role") == "tool" && !message.contains("tool_call_id") &&
+                message.at("content").get<std::string>().find("<ct:protocol_error source=\"coordinator\">") != std::string::npos,
+                "protocol repair fabricated a tool call or lost its coordinator marker");
+        const auto & assistant = f.peers[0]->result_assistants[0];
+        check(!assistant.contains("tool_calls") || assistant.at("tool_calls").empty(),
+                "protocol repair invented an assistant tool call");
+    }
+    check(events_of(f, "thought_message").empty() && events_of(f, "thought_result").empty(),
+            "misplaced native command executed before being reissued in reasoning");
+    finish_thought_command(a2, "send", 103, "This is the explicit reasoning-time send.");
+    f.peers[0]->request(3);
+    check(events_of(f, "thought_message").size() == 1 && f.session->state().at("peers").at(1).at("mailbox") == 1,
+            "reissued reasoning command failed or duplicated the previous native command");
+
+    // A model-format parse failure is also repairable; ordinary runtime failures are not.
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parse_error = "model output did not match the native grammar";
+        f.peers[0]->native_parse_error = true;
+    }
+    finish_misplaced_native(f, 0, 3);
+    f.peers[0]->request(5);
+    feedback = events_of(f, "protocol_feedback", "A");
+    check(feedback.size() == 2 && feedback[1].at("attempt") == 2 &&
+            f.session->state().at("peers").at(0).at("protocol_retries") == 2,
+            "model-format failure did not consume the same per-user-message repair budget");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parse_error.clear();
+    }
+    finish_thought_answer(f, 0, 5, "A valid final answer");
+    finish_misplaced_native(f, 1, 0);
+    f.peers[1]->request(2);
+    finish_thought_answer(f, 1, 2, "B valid final answer");
+    f.wait_mode("answered");
+    f.session->command("message", "A has a new task", "A");
+    f.wait_mode("thinking");
+    f.peers[0]->request(7);
+    const auto state = f.session->state();
+    check(state.at("peers").at(0).at("protocol_retries") == 0 &&
+            state.at("peers").at(1).at("protocol_retries") == 1 && f.peers[1]->request_count() == 4,
+            "targeted user message failed to reset only its own protocol repair budget");
+    finish_misplaced_native(f, 0, 7);
+    f.peers[0]->request(9);
+    feedback = events_of(f, "protocol_feedback", "A");
+    check(feedback.size() == 3 && feedback.back().at("attempt") == 1,
+            "a new user message could not use its fresh protocol repair budget");
+    check(events_of(f, "thought_message").size() == 1,
+            "automatic protocol repairs executed or resent thought messages");
+    f.pause();
+}
+
+static void test_thought_protocol_repair_limits() {
+    for (int32_t budget : {0, 1}) {
+        fixture f(4, 32768, true, false, true, 8, budget);
+        f.start();
+        auto b0 = f.peers[1]->request(0);
+        finish_misplaced_native(f, 0, 0);
+        if (budget) {
+            f.peers[0]->request(2);
+            finish_misplaced_native(f, 0, 2);
+        }
+        f.wait_state([](const crossthink_json & state) {
+            const auto & peer = state.at("peers").at(0);
+            return peer.at("phase") == "empty_response" && !peer.at("active").get<bool>();
+        }, "exhausted or disabled protocol repair");
+        check(events_of(f, "protocol_feedback", "A").size() == static_cast<size_t>(budget) &&
+                f.peers[0]->request_count() == static_cast<size_t>(2 + 2 * budget),
+                "protocol repair exceeded its configured retry limit");
+        check(request_is_active(b0) && events_of(f, "answer", "A").empty() && events_of(f, "thought_message").empty(),
+                "exhausted repair stopped its peer, answered with a command, or executed a command");
+        f.session->command("reset");
+        const auto reset = f.wait_mode("idle");
+        check(reset.at("peers").at(0).at("protocol_retries") == 0,
+                "session reset retained an exhausted repair budget");
+    }
+    for (int32_t invalid : {-1, 9}) {
+        bool rejected = false;
+        try { fixture f(4, 32768, true, false, true, 8, invalid); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        check(rejected, "protocol repair accepted an out-of-range retry limit");
+    }
+}
+
+static void test_thought_protocol_repair_unusable_suffix() {
+    for (int failure : {0, 1, 2}) {
+        fixture f(4, 32768, true, false, true);
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            if (!failure) { f.peers[0]->results_error = "template cannot append coordinator feedback"; }
+            else if (failure == 1) { f.peers[0]->results_tokens.clear(); }
+            else { f.peers[0]->results_tokens.assign(32768, 40); }
+        }
+        f.start();
+        auto b0 = f.peers[1]->request(0);
+        finish_misplaced_native(f, 0, 0);
+        f.wait_state([](const crossthink_json & state) {
+            const auto & peer = state.at("peers").at(0);
+            return peer.at("phase") == "empty_response" && !peer.at("active").get<bool>();
+        }, "unusable protocol feedback suffix stops only the caller");
+        check(request_is_active(b0) && f.peers[0]->request_count() == 2 &&
+                events_of(f, "protocol_feedback").empty() && events_of(f, "thought_message").empty(),
+                "unsupported or oversized protocol feedback retried, executed, or stopped the peer");
+        f.pause();
+    }
+}
+
+static void test_thought_protocol_repair_disabled_after_answer_now() {
+    fixture f(4, 32768, true, false, true);
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        f.peers[0]->parsed_assistant = {{"role", "assistant"}, {"content", "<ct:inbox/>"}};
+    }
+    {
+        std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+        f.peers[1]->parsed_assistant = {{"role", "assistant"}, {"content", "B answer"}};
+    }
+    f.start();
+    f.peers[0]->request(0);
+    f.peers[1]->request(0);
+    f.session->command("answer");
+    f.wait_mode("answering");
+    for (size_t i = 0; i < f.peers.size(); ++i) {
+        auto native = f.peers[i]->request(1);
+        native->send({static_cast<llama_token>(501 + i), 3}, i ? "B answer" : "<ct:inbox/>");
+        native->finish("eos", "");
+    }
+    f.wait_mode("incomplete");
+    check(events_of(f, "protocol_feedback").empty() && events_of(f, "thought_result").empty() &&
+            f.peers[0]->request_count() == 2 && f.peers[1]->request_count() == 2,
+            "forced final answer ran or repaired an out-of-reasoning thought command");
+}
+
+static void test_thought_protocol_repair_control_boundaries() {
+    for (const std::string action : {"pause", "answer", "reset", "message"}) {
+        fixture f(4, 32768, true, false, true);
+        auto gate = std::make_shared<fake_operation>();
+        gate->throw_on_cancel = true;
+        f.start();
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->results_gate = gate;
+        }
+        auto b0 = f.peers[1]->request(0);
+        finish_misplaced_native(f, 0, 0);
+        gate->wait_entered();
+        check(f.session->state().at("peers").at(0).at("phase") == "recovering_protocol",
+                "protocol repair did not expose its pending template operation");
+        const bool replacing = action == "reset" || action == "message";
+        f.session->command(action, replacing ? "Replacement task" : "", action == "message" ? "A" : "both");
+        if (replacing) {
+            f.wait_mode("thinking");
+            auto a2 = f.peers[0]->request(2);
+            check(!count(a2->prompt, 40) && events_of(f, "protocol_feedback").empty() &&
+                    f.session->state().at("peers").at(0).at("protocol_retries") == 0,
+                    "replacement task committed stale feedback or consumed its new repair budget");
+            if (action == "reset") {
+                check(a2->prompt == std::vector<llama_token>({1, 10, 11}), "reset retained the invalid native turn");
+                f.peers[1]->request(1);
+            } else {
+                check(ends_with(a2->prompt, {501, 3, 20, 21, 1}) && count(a2->prompt, 3) == 1 && request_is_active(b0),
+                        "targeted replacement duplicated EOG or interrupted the partner");
+            }
+            f.pause();
+            continue;
+        }
+        check(f.session->state().at("busy").get<bool>() && f.peers[0]->request_count() == 2,
+                "control request crossed an unfinished protocol feedback boundary");
+        gate->release();
+        if (action == "pause") {
+            f.wait_mode("paused");
+            check(f.peers[0]->request_count() == 2 && events_of(f, "protocol_feedback", "A").size() == 1,
+                    "pause lost committed feedback or prematurely started generation: " + f.session->state().dump());
+            f.session->command("resume");
+            f.wait_mode("thinking");
+            auto a2 = f.peers[0]->request(2);
+            check(ends_with(a2->prompt, {501, 3, 40, 1}) && count(a2->prompt, 3) == 1,
+                    "resuming after repair duplicated the native terminator or omitted feedback");
+            f.peers[1]->request(1);
+            f.pause();
+        } else {
+            f.wait_mode("answering");
+            auto b1 = f.peers[1]->request(1);
+            {
+                std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+                f.peers[1]->parsed_assistant = {{"role", "assistant"}, {"content", "B forced answer"}};
+            }
+            b1->send({502, 3}, "B forced answer");
+            b1->finish("eos", "");
+            f.wait_mode("incomplete");
+            check(f.peers[0]->request_count() == 2 && events_of(f, "protocol_feedback").empty(),
+                    "Answer now resumed protocol repair instead of terminating the malformed response");
+        }
+    }
 }
 
 static void test_thought_reset_discards_stale_streams_and_mail() {
@@ -1902,6 +2148,16 @@ int main() {
         test_thought_empty_native_answer_is_incomplete();
         current_test = "test_thought_native_output_survives_parse_failure";
         test_thought_native_output_survives_parse_failure();
+        current_test = "test_thought_protocol_repair_and_targeted_budget";
+        test_thought_protocol_repair_and_targeted_budget();
+        current_test = "test_thought_protocol_repair_limits";
+        test_thought_protocol_repair_limits();
+        current_test = "test_thought_protocol_repair_unusable_suffix";
+        test_thought_protocol_repair_unusable_suffix();
+        current_test = "test_thought_protocol_repair_disabled_after_answer_now";
+        test_thought_protocol_repair_disabled_after_answer_now();
+        current_test = "test_thought_protocol_repair_control_boundaries";
+        test_thought_protocol_repair_control_boundaries();
         current_test = "test_thought_reset_discards_stale_streams_and_mail";
         test_thought_reset_discards_stale_streams_and_mail();
         test_thought_peek_defers_incomplete_utf8_packets();

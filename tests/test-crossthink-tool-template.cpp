@@ -1,4 +1,5 @@
 #include "server-common.h"
+#include "../tools/crossthink/crossthink.h"
 #include "../tools/crossthink/crossthink-prompt.h"
 
 #include <cstdio>
@@ -181,6 +182,7 @@ static void test_native_answers() {
             unknown_call,
             std::string("My plan is ready.\n") + unknown_call,
             valid_call + '\n' + unknown_call,
+            std::string("<tool_call>\n<function=ct:send>\n<parameter=</ct:send>\n</function>\n</tool_call>"),
             std::string("<tool_call>\n<function=calculator>\n</function>\n</tool_call>"),
             std::string("<tool_call>\n{\"name\":\"ct:send\",\"arguments\":{\"message\":\"hello\"}}\n</tool_call>")}) {
         std::vector<raw_buffer> files;
@@ -206,6 +208,106 @@ static void test_native_answers() {
     std::puts("native answers with and without tools: passed");
 }
 
+static void test_coordinator_feedback(const char * path, bool supported) {
+    std::ifstream file(path);
+    check(file.good(), "could not open coordinator feedback template");
+    server_chat_params options{};
+    options.tmpls = common_chat_templates_init(nullptr,
+        std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>()));
+    options.use_jinja = true;
+    options.prefill_assistant = true;
+    options.enable_thinking = true;
+    options.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    const std::string feedback = "<ct:protocol_error source=\"coordinator\">\n"
+        "No command was executed. Continue the task inside the new reasoning block.\n"
+        "</ct:protocol_error>";
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"calculator",
+        "description":"Evaluate an expression","parameters":{"type":"object",
+        "properties":{"expression":{"type":"string"}},"required":["expression"]}}}])");
+    for (const bool with_tools : {false, true}) {
+        json body = {
+            {"messages", json::array({
+                {{"role", "system"}, {"content", crossthink_system_prompt("B")}},
+                {{"role", "user"}, {"content", "Work together."}},
+                {{"role", "assistant"}, {"content", ""}},
+            })},
+            {"tools", with_tools ? tools : json::array()}, {"add_generation_prompt", false},
+            {"chat_template_kwargs", {{"enable_thinking", true}}},
+        };
+        std::vector<raw_buffer> files;
+        common_chat_session session;
+        auto parameters = oaicompat_chat_params_parse(nullptr, body, options, files, session);
+        const auto before = parameters.at("prompt").get<std::string>();
+        const std::string end = "<|im_end|>";
+        const auto boundary = before.rfind(end);
+        check(boundary != std::string::npos, "coordinator feedback skeleton omitted assistant EOG");
+
+        // The coordinator validates the previous output; no native function was invoked.
+        body["messages"].push_back({{"role", "tool"}, {"content", feedback}});
+        body["add_generation_prompt"] = true;
+        parameters = oaicompat_chat_params_parse(nullptr, body, options, files, session);
+        const auto after = parameters.at("prompt").get<std::string>();
+        const auto open = after.rfind("<think>");
+        const bool reasoning_open = open != std::string::npos &&
+            after.find_first_not_of(" \t\r\n", open + 7) == std::string::npos;
+        const bool prefix_preserved = after.compare(0, boundary + end.size(), before, 0,
+            boundary + end.size()) == 0;
+        if (!supported) {
+            check(!reasoning_open || !prefix_preserved,
+                "unsupported template unexpectedly permits coordinator feedback continuation");
+            continue;
+        }
+        check(prefix_preserved, "coordinator feedback changes the existing assistant prefix");
+        const auto suffix = after.substr(boundary + end.size());
+        check(!suffix.empty() && suffix.front() == '\n', "coordinator suffix dropped newline after EOG");
+        check(suffix.find("<tool_response>\n" + feedback + "\n</tool_response>") != std::string::npos,
+            "coordinator feedback is missing from template result envelope");
+        check(suffix.find("<tool_call>") == std::string::npos,
+            "coordinator feedback fabricated a native tool call");
+        check(reasoning_open, "coordinator feedback did not reopen reasoning");
+    }
+    std::printf("coordinator feedback template %s: passed\n", path);
+}
+
+static void test_native_parse_rejections() {
+    const crossthink_json response = {{"error", {
+        {"code", 500}, {"type", "server_error"},
+        {"message", "The model produced output that does not match the expected peg-native format"},
+    }}};
+    check(crossthink_native_parse_error::is_response(500, response),
+        "native parser validation rejection was not classified");
+    for (const int status : {200, 400, 401, 403, 404, 502, 503}) {
+        check(!crossthink_native_parse_error::is_response(status, response),
+            "nonvalidation HTTP status classified as native parse rejection");
+    }
+    for (const auto & entry : response.at("error").items()) {
+        auto changed = response;
+        changed["error"].erase(entry.key());
+        check(!crossthink_native_parse_error::is_response(500, changed),
+            "incomplete error body classified as native parse rejection");
+        changed["error"][entry.key()] = nullptr;
+        check(!crossthink_native_parse_error::is_response(500, changed),
+            "invalid error field type classified as native parse rejection");
+    }
+    auto changed = response;
+    changed["error"]["message"] = "Internal Server Error";
+    check(!crossthink_native_parse_error::is_response(500, changed),
+        "generic server failure classified as native parse rejection");
+    changed["error"]["message"] = response["error"]["message"].get<std::string>() + " (details)";
+    check(!crossthink_native_parse_error::is_response(500, changed),
+        "partial message match classified as native parse rejection");
+    changed = response;
+    changed["error"]["type"] = "unavailable_error";
+    check(!crossthink_native_parse_error::is_response(500, changed),
+        "unavailability classified as native parse rejection");
+    for (const auto & invalid : {crossthink_json(), crossthink_json::array(),
+            crossthink_json{{"error", "invalid"}}, crossthink_json::parse("not JSON", nullptr, false)}) {
+        check(!crossthink_native_parse_error::is_response(500, invalid),
+            "invalid error body classified as native parse rejection");
+    }
+    std::puts("native parse rejection classification: passed");
+}
+
 int main() {
     try {
         test_template("models/templates/Qwen3.5-4B.jinja",
@@ -218,6 +320,10 @@ int main() {
             "</think>\n\n<tool_call>\n{\"name\":\"calculator\",\"arguments\":{\"expression\":\"1 + 1\"}}\n</tool_call>");
         test_thought_prompt();
         test_native_answers();
+        test_coordinator_feedback("models/templates/Qwen3.5-4B.jinja", true);
+        test_coordinator_feedback("models/templates/Qwen-QwQ-32B.jinja", true);
+        test_coordinator_feedback("models/templates/Qwen-Qwen3-0.6B.jinja", false);
+        test_native_parse_rejections();
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "tool template test: %s\n", error.what());
