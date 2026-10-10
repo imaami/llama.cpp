@@ -8,7 +8,7 @@ target_include_directories(crossthink-mcp PUBLIC .)
 target_link_libraries(crossthink-mcp PUBLIC cpp-httplib vendor::nlohmann Threads::Threads)
 target_compile_features(crossthink-mcp PUBLIC cxx_std_17)
 
-add_executable(llama-crossthink crossthink-main.cpp crossthink-transport.cpp crossthink-ui.h)
+add_executable(llama-crossthink crossthink-main.cpp crossthink-transport.cpp crossthink-prompt.h crossthink-ui.h)
 target_link_libraries(llama-crossthink PRIVATE crossthink-engine crossthink-mcp cpp-httplib)
 if (LLAMA_TOOLS_INSTALL)
     install(TARGETS llama-crossthink RUNTIME)

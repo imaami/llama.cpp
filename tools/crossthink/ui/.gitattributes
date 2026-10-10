@@ -1,0 +1,3 @@
+# Bundled JavaScript template literals and original license text retain whitespace.
+crossthink-ui.generated.h -whitespace linguist-generated=true
+THIRD_PARTY_LICENSES.txt -whitespace

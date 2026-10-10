@@ -2,6 +2,7 @@
 #include "../tools/server/server-context.h"
 #include "../tools/server/server-token-wire.h"
 #include "../tools/server/server-splice.h"
+#include "../tools/server/server-thought.h"
 #include "../tools/crossthink/crossthink-speech.h"
 
 #include <cstdio>
@@ -127,6 +128,51 @@ static void test_speech_progress() {
             std::string("\xe6\x80\x9d")}) {
         check(crossthink_speech_guard::substantive(text), "ordinary speech did not count as progress");
     }
+}
+
+static void test_thought_scanner() {
+    const std::vector<std::pair<std::string, std::string>> commands = {
+        {"<ct:peek/>", "peek"}, {"<ct:inbox/>", "inbox"},
+        {"<ct:send>hello\n\xe6\x80\x9d <ct:peek/> </think></ct:send>", "send"},
+    };
+    for (const auto & item : commands) {
+        for (size_t split = 0; split < item.first.size(); ++split) {
+            server_thought_scanner scanner;
+            scanner.thinking = true;
+            scanner.feed("ordinary prose " + item.first.substr(0, split));
+            check(scanner.command.empty(), "partial thought command executed");
+            server_thought_scanner resumed;
+            resumed.thinking = true;
+            resumed.feed(scanner.continuation());
+            resumed.feed(item.first.substr(split) + "trailing text<ct:inbox/>");
+            check(resumed.command == item.second, "thought command split or first-command recognition failed");
+            check(resumed.continuation().empty(), "completed command retained a continuation");
+            if (item.second == "send") {
+                check(resumed.payload == "hello\n\xe6\x80\x9d <ct:peek/> </think>", "thought payload was modified or nested command executed");
+            }
+        }
+        server_thought_scanner inactive;
+        inactive.feed(item.first);
+        check(inactive.command.empty() && inactive.continuation().empty(), "command outside reasoning executed");
+    }
+    server_thought_scanner scanner;
+    scanner.thinking = true;
+    scanner.feed("malformed <ct:peek> <ct:send /> <ct:inbox / > <ct:pe");
+    check(scanner.command.empty() && scanner.continuation() == "<ct:pe", "malformed syntax confused command prefix");
+    scanner = {};
+    scanner.thinking = true;
+    scanner.feed("<ct:send>" + std::string(server_thought_scanner::max_payload + 7, 'x') + "</ct:");
+    check(scanner.payload.size() == server_thought_scanner::max_payload, "oversized thought payload was not bounded");
+    server_thought_scanner resumed;
+    resumed.thinking = true;
+    resumed.feed(scanner.continuation());
+    resumed.feed("send>");
+    check(resumed.command == "send" && resumed.payload.empty() && !resumed.error.empty(), "oversized thought continuation lost error");
+    scanner = {};
+    scanner.thinking = true;
+    scanner.feed("<ct:send>" + std::string(server_thought_scanner::max_escaped_payload / 6 + 1, '\1') + "</ct:send>");
+    check(scanner.command == "send" && scanner.payload.empty() && !scanner.error.empty(),
+        "JSON escaping allowed a thought payload to exceed wire metadata limits");
 }
 
 struct streamed_result {
@@ -540,6 +586,7 @@ static void test_tool_routes(const char * model, bool mtp) {
     auto & routes = fixture.routes;
     const auto info = json::parse(fixture.call(routes.get_tokens_info, "").second);
     check(info.at("n_vocab") == 263 && info.at("tool_parse") == true, "wrong tool fixture or missing tool capability");
+    check(info.at("thought_commands") == true, "thought command capability missing");
     auto tokenize = [&](const std::string & text) {
         const auto result = fixture.call(routes.post_tokenize,
             json{{"content", text}, {"add_special", false}, {"parse_special", true}}.dump());
@@ -550,6 +597,82 @@ static void test_tool_routes(const char * model, bool mtp) {
     check(close.size() == 1, "tool fixture has no single-token think close");
     const auto eog = tokenize("<|im_end|>");
     check(eog.size() == 1, "tool fixture has no single-token ChatML EOG");
+
+    const std::string literal = "</think><|im_end|><ct:peek/>";
+    const auto literal_response = fixture.call(routes.post_tokenize,
+        json{{"content", literal}, {"add_special", false}, {"parse_special", false}}.dump());
+    check(literal_response.first == 200, "literal tokenizer route failed");
+    const auto literal_tokens = json::parse(literal_response.second).at("tokens").get<llama_tokens>();
+    for (auto token : literal_tokens) {
+        check(token >= 3 && token < 259, "literal injected thought became a control token");
+    }
+    const auto literal_decoded = fixture.call(routes.post_detokenize, json{{"tokens", literal_tokens}}.dump());
+    // This byte-only SentencePiece fixture adds an escaped dummy space before the literal bytes.
+    check(literal_decoded.first == 200 && json::parse(literal_decoded.second).at("content") == "\xe2\x96\x81" + literal,
+        "literal injected thought failed to round trip: " + literal_decoded.second);
+
+    const llama_tokens thinking_prompt = {1, 259};
+    json thoughts = {
+        {"n_predict", 128}, {"seed", 42}, {"temperature", 0}, {"cache_prompt", true},
+        {"splice", {{"thought_commands", true}, {"stop_on_think_close", true}}},
+    };
+    const std::vector<std::pair<std::string, std::string>> thought_cases = {
+        {"First.\n\n<ct:peek/>", "peek"}, {"<ct:inbox/>", "inbox"},
+        {"<ct:send>hello\n\xe6\x80\x9d <ct:peek/></ct:send>", "send"},
+    };
+    for (const auto & item : thought_cases) {
+        thoughts["grammar"] = "root ::= " + json(item.first + "unseen suffix").dump();
+        const auto plain_command = fixture.binary(thoughts, thinking_prompt);
+        const auto streamed_command = fixture.binary_stream(thoughts, thinking_prompt);
+        check(plain_command.second == streamed_command.tokens && streamed_command.content == item.first,
+            "thought boundary stopped early or exposed post-command tokens");
+        check(streamed_command.metadata.at("splice_boundary") == "thought_command" &&
+            streamed_command.metadata.at("splice_reason") == "thought_command" &&
+            streamed_command.metadata.at("thought_command") == item.second, "wrong thought command metadata");
+        if (item.second == "send") {
+            check(streamed_command.metadata.at("thought_payload") == "hello\n\xe6\x80\x9d <ct:peek/>", "wire thought payload changed");
+        }
+        auto continued = thinking_prompt;
+        continued.insert(continued.end(), streamed_command.tokens.begin(), streamed_command.tokens.end());
+        const auto injection = tokenize("\n[received thought]\n");
+        continued.insert(continued.end(), injection.begin(), injection.end());
+        auto next = thoughts;
+        next["grammar"] = "root ::= \"reply<ct:inbox/>\"";
+        const auto cached = fixture.binary(next, continued);
+        next["cache_prompt"] = false;
+        check(cached.second == fixture.binary(next, continued).second,
+            "thought stop poisoned cached continuation after injection");
+    }
+
+    thoughts["grammar"] = "root ::= \"<ct:peek/>tail\"";
+    const auto outside = fixture.binary_stream(thoughts, tokenize("<think>done</think>"));
+    check(outside.content == "<ct:peek/>tail" && outside.metadata.at("splice_boundary") != "thought_command",
+        "answer content executed a thought command");
+    thoughts["grammar"] = "root ::= \"ordinary answer\"";
+    auto imported = thinking_prompt;
+    imported.insert(imported.end(), literal_tokens.begin(), literal_tokens.end());
+    const auto inert = fixture.binary_stream(thoughts, imported);
+    check(inert.content == "ordinary answer" && inert.metadata.at("splice_boundary") != "thought_command",
+        "imported prefix executed a thought command");
+
+    thoughts["n_predict"] = 6;
+    thoughts["grammar"] = "root ::= \"<ct:peek/>\"";
+    const auto partial = fixture.binary_stream(thoughts, thinking_prompt);
+    check(partial.content == "<ct:pe" && partial.metadata.at("thought_prefix") == "<ct:pe",
+        "limited request lost partial command");
+    auto resumed_prompt = thinking_prompt;
+    resumed_prompt.insert(resumed_prompt.end(), partial.tokens.begin(), partial.tokens.end());
+    thoughts["n_predict"] = 32;
+    thoughts["grammar"] = "root ::= \"ek/>tail\"";
+    thoughts["splice"]["thought_prefix"] = partial.metadata.at("thought_prefix");
+    const auto resumed_command = fixture.binary_stream(thoughts, resumed_prompt);
+    check(resumed_command.content == "ek/>" && resumed_command.metadata.at("thought_command") == "peek",
+        "partial command did not resume across requests");
+    for (const json & bad_prefix : {json("<ct:peek/>"), json("ordinary prose"), json(std::string(16417, 'x')), json(1)}) {
+        thoughts["splice"]["thought_prefix"] = bad_prefix;
+        check(fixture.call(routes.post_completions_tokens, server_token_wire::encode(thoughts.dump(), resumed_prompt)).first == 400,
+            "invalid thought_prefix accepted");
+    }
     json options = {
         {"n_predict", 16}, {"seed", 42}, {"temperature", 0}, {"cache_prompt", false},
         {"preserved_tokens", json::array({"</think>"})}, {"grammar", "root ::= \"</think>\""},
@@ -642,6 +765,7 @@ int main(int argc, char ** argv) {
         check(argc <= 3, "usage: test-server-token-wire [tiny-qwen35-mtp.gguf [tiny-qwen35-tools.gguf]]");
         test_codec();
         test_splice_scanner();
+        test_thought_scanner();
         test_speech_progress();
         if (argc >= 2) {
             llama_backend_init();

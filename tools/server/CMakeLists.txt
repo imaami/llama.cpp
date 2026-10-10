@@ -19,6 +19,7 @@ add_library(${TARGET} STATIC
     server-context.h
     server-token-wire.h
     server-splice.h
+    server-thought.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

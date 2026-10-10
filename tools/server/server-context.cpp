@@ -97,6 +97,7 @@ static json server_token_wire_info(const llama_vocab * vocab, int32_t n_ctx) {
         {"stream", true},
         {"splice", true},
         {"splice_quantum", true},
+        {"thought_commands", true},
         {"tool_parse", true},
         {"fingerprint", string_format("%016" PRIx64, hash)},
         {"n_vocab", n_vocab},
@@ -351,6 +352,7 @@ struct server_slot {
 
     stop_type stop;
     server_splice_scanner splice;
+    server_thought_scanner thought;
     std::string splice_boundary;
 
     std::string stopping_word;
@@ -442,6 +444,7 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         splice         = {};
+        thought        = {};
         splice_boundary.clear();
         n_sent_text    = 0;
 
@@ -2047,6 +2050,7 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.splice = task.params.splice_prompt;
+        slot.thought = task.params.splice_thought;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2193,15 +2197,32 @@ private:
             SLT_DBG(slot, "%s", "stopped by EOS\n");
         }
 
-        if (slot.task->params.splice_sentence_after || slot.task->params.splice_token_after) {
-            slot.splice.feed(common_token_to_piece(vocab, result.tok, true));
+        if (slot.task->params.splice_sentence_after || slot.task->params.splice_token_after ||
+                slot.task->params.splice_thought_commands || slot.task->params.splice_think_close != LLAMA_TOKEN_NULL) {
+            const auto piece = common_token_to_piece(vocab, result.tok, true);
+            slot.splice.feed(piece);
+            if (slot.task->params.splice_thought_commands) {
+                if (result.tok == slot.task->params.splice_think_open || result.tok == slot.task->params.splice_thought_close ||
+                        llama_vocab_is_control(vocab, result.tok)) {
+                    slot.thought = {};
+                    slot.thought.thinking = result.tok == slot.task->params.splice_think_open;
+                } else {
+                    slot.thought.feed(piece);
+                }
+            }
             if (result.tok == slot.task->params.splice_think_close && !slot.truncated) {
                 slot.splice_boundary = "tool";
                 slot.stop = STOP_TYPE_LIMIT;
                 slot.has_next_token = false;
+            } else if (!slot.thought.command.empty() && !incomplete && !slot.truncated &&
+                    (slot.has_next_token || slot.stop == STOP_TYPE_LIMIT)) {
+                slot.splice_boundary = "thought_command";
+                slot.stop = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
             } else if (!incomplete && (slot.has_next_token || (slot.stop == STOP_TYPE_LIMIT && !slot.truncated))) {
-                const char * boundary = slot.splice.boundary(slot.task->params.splice_sentence_after &&
-                    slot.stats.n_gen >= static_cast<size_t>(slot.task->params.splice_sentence_after));
+                const char * boundary = slot.task->params.splice_sentence_after || slot.task->params.splice_token_after ?
+                    slot.splice.boundary(slot.task->params.splice_sentence_after &&
+                        slot.stats.n_gen >= static_cast<size_t>(slot.task->params.splice_sentence_after)) : "";
                 if (!*boundary && slot.task->params.splice_token_after &&
                         slot.stats.n_gen >= static_cast<size_t>(slot.task->params.splice_token_after)) {
                     boundary = "quantum";
@@ -2214,6 +2235,9 @@ private:
             }
             if (slot.task->params.splice_token_after && incomplete && !slot.has_next_token) {
                 throw std::runtime_error("splice token limit ended before a complete UTF-8 character");
+            }
+            if (slot.task->params.splice_thought_commands && incomplete && !slot.has_next_token) {
+                throw std::runtime_error("thought command token limit ended before a complete UTF-8 character");
             }
         }
 
@@ -2380,9 +2404,16 @@ private:
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
-        if (slot.task->params.splice_sentence_after || slot.task->params.splice_token_after) {
+        if (slot.task->params.splice_sentence_after || slot.task->params.splice_token_after ||
+                slot.task->params.splice_thought_commands || slot.task->params.splice_think_close != LLAMA_TOKEN_NULL) {
             res->splice_boundary = !slot.splice_boundary.empty() ? slot.splice_boundary :
                 slot.stop == STOP_TYPE_LIMIT ? "limit" : "none";
+            if (res->splice_boundary == "thought_command") {
+                res->thought_command = slot.thought.command;
+                res->thought_payload = slot.thought.payload;
+                res->thought_error = slot.thought.error;
+            }
+            res->thought_prefix = slot.thought.continuation();
         }
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
@@ -4955,6 +4986,19 @@ static std::string server_token_wire_result(server_task_result & result, bool st
         if (!final->splice_boundary.empty()) {
             metadata["splice_boundary"] = final->splice_boundary;
         }
+        if (!final->thought_command.empty()) {
+            metadata["splice_reason"] = "thought_command";
+            metadata["thought_command"] = final->thought_command;
+            if (final->thought_command == "send") {
+                metadata["thought_payload"] = final->thought_payload;
+            }
+            if (!final->thought_error.empty()) {
+                metadata["thought_error"] = final->thought_error;
+            }
+        }
+        if (!final->thought_prefix.empty()) {
+            metadata["thought_prefix"] = final->thought_prefix;
+        }
         if (stream) {
             metadata["type"] = "done";
         } else if (return_content) {
@@ -5052,6 +5096,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     }
                     task.params.splice_sentence_after = json_value(data.at("splice"), "sentence_after", 0);
                     task.params.splice_token_after = json_value(data.at("splice"), "token_after", 0);
+                    task.params.splice_thought_commands = json_value(data.at("splice"), "thought_commands", false);
                     const auto open = common_tokenize(ctx_server.vocab, "<think>", false, true);
                     const auto close = common_tokenize(ctx_server.vocab, "</think>", false, true);
                     if (json_value(data.at("splice"), "stop_on_think_close", false)) {
@@ -5065,26 +5110,47 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     const auto close_id = close.size() == 1 &&
                         common_token_to_piece(ctx_server.vocab, close.front(), true) == "</think>" ? close.front() : LLAMA_TOKEN_NULL;
                     const auto & tokens = task.tokens.get_tokens();
-                    size_t begin = tokens.size();
-                    // Earlier text cannot affect scanner state past a control or think delimiter.
-                    while (begin) {
-                        const auto token = tokens[begin - 1];
-                        if (llama_vocab_is_control(ctx_server.vocab, token) || token == open_id || token == close_id) {
-                            break;
+                    if (task.params.splice_thought_commands) {
+                        if (open_id == LLAMA_TOKEN_NULL || close_id == LLAMA_TOKEN_NULL) {
+                            throw std::invalid_argument("thought_commands requires single-token <think> and </think> delimiters");
                         }
-                        --begin;
-                    }
-                    auto & scanner = task.params.splice_prompt;
-                    for (size_t index = begin; index < tokens.size(); ++index) {
-                        const auto token = tokens[index];
-                        const std::string piece = common_token_to_piece(ctx_server.vocab, token, true);
-                        if (llama_vocab_is_control(ctx_server.vocab, token) || piece == "<think>" || piece == "</think>") {
-                            scanner = {};
-                        } else {
-                            scanner.feed(piece);
+                        task.params.splice_think_open = open_id;
+                        task.params.splice_thought_close = close_id;
+                        for (size_t index = tokens.size(); index; --index) {
+                            const auto token = tokens[index - 1];
+                            if (token == open_id || token == close_id || llama_vocab_is_control(ctx_server.vocab, token)) {
+                                task.params.splice_thought.thinking = token == open_id;
+                                break;
+                            }
+                        }
+                        const auto prefix = json_value(data.at("splice"), "thought_prefix", std::string());
+                        task.params.splice_thought.feed(prefix);
+                        if (!task.params.splice_thought.command.empty() || task.params.splice_thought.continuation() != prefix) {
+                            throw std::invalid_argument("thought_prefix must be an incomplete generated command inside reasoning");
                         }
                     }
-                    scanner.begin_generation(task.params.splice_token_after != 0);
+                    if (task.params.splice_sentence_after || task.params.splice_token_after) {
+                        size_t begin = tokens.size();
+                        // Earlier text cannot affect scanner state past a control or think delimiter.
+                        while (begin) {
+                            const auto token = tokens[begin - 1];
+                            if (llama_vocab_is_control(ctx_server.vocab, token) || token == open_id || token == close_id) {
+                                break;
+                            }
+                            --begin;
+                        }
+                        auto & scanner = task.params.splice_prompt;
+                        for (size_t index = begin; index < tokens.size(); ++index) {
+                            const auto token = tokens[index];
+                            const std::string piece = common_token_to_piece(ctx_server.vocab, token, true);
+                            if (llama_vocab_is_control(ctx_server.vocab, token) || piece == "<think>" || piece == "</think>") {
+                                scanner = {};
+                            } else {
+                                scanner.feed(piece);
+                            }
+                        }
+                        scanner.begin_generation(task.params.splice_token_after != 0);
+                    }
                 }
             }
 
@@ -5774,8 +5840,8 @@ void server_routes::init_routes() {
             }
             if (body.contains("splice")) {
                 const auto & splice = body.at("splice");
-                if (!splice.is_object() || (!splice.contains("sentence_after") && !splice.contains("token_after"))) {
-                    throw std::invalid_argument("splice requires sentence_after or token_after");
+                if (!splice.is_object()) {
+                    throw std::invalid_argument("splice must be an object");
                 }
                 for (const auto & field : splice.items()) {
                     if (field.key() == "sentence_after" || field.key() == "token_after") {
@@ -5785,9 +5851,22 @@ void server_routes::init_routes() {
                         }
                         continue;
                     }
-                    if (field.key() != "stop_on_think_close" || !field.value().is_boolean()) {
-                        throw std::invalid_argument("splice accepts only sentence_after, token_after and boolean stop_on_think_close");
+                    if (field.key() == "thought_prefix") {
+                        if (!field.value().is_string() || field.value().template get<std::string>().size() > server_thought_scanner::max_payload + 32) {
+                            throw std::invalid_argument("thought_prefix must be a bounded string");
+                        }
+                        continue;
                     }
+                    if ((field.key() != "stop_on_think_close" && field.key() != "thought_commands") || !field.value().is_boolean()) {
+                        throw std::invalid_argument("splice accepts sentence_after, token_after and boolean stop_on_think_close or thought_commands");
+                    }
+                }
+                if (splice.contains("thought_prefix") && !json_value(splice, "thought_commands", false)) {
+                    throw std::invalid_argument("thought_prefix requires thought_commands");
+                }
+                if (!splice.contains("sentence_after") && !splice.contains("token_after") &&
+                        !json_value(splice, "stop_on_think_close", false) && !json_value(splice, "thought_commands", false)) {
+                    throw std::invalid_argument("splice requires a boundary, think-close stop or thought commands");
                 }
             }
             if (packet.tokens.size() >= static_cast<size_t>(meta->slot_n_ctx) ||

@@ -1,4 +1,5 @@
 #include "crossthink.h"
+#include "crossthink-prompt.h"
 
 #include <cpp-httplib/httplib.h>
 #include <sys/socket.h>
@@ -34,8 +35,8 @@ class unix_transport final : public crossthink_transport {
         return json::parse(response(client.Post(path, body.dump(), "application/json")));
     }
 
-    std::vector<llama_token> tokenize(const std::string & text, bool special = false) {
-        const auto result = post("/tokenize", {{"content", text}, {"add_special", special}, {"parse_special", true}});
+    std::vector<llama_token> tokenize(const std::string & text, bool special = false, bool parse_special = true) {
+        const auto result = post("/tokenize", {{"content", text}, {"add_special", special}, {"parse_special", parse_special}});
         std::vector<llama_token> tokens;
         for (const auto & value : result.at("tokens")) {
             if (!value.is_number_integer()) {
@@ -115,28 +116,15 @@ public:
     }
 
     void configure_peer(const std::string & name) override {
-        if (name != "A" && name != "B") {
-            throw std::invalid_argument("telepathy peer must be A or B");
-        }
-        const std::string other = name == "A" ? "B" : "A";
-        system_text = "You are agent " + name + ", an independent assistant working alongside agent " + other + ". "
-            "You each answer the user separately. A telepathic reasoning link is initially OFF. "
-            "Call think_with_telepathic_link with enabled=true to open it or enabled=false to close it. "
-            "Either agent controls the same global link. While ON, both see the same combined reasoning channel, "
-            "with each contribution labeled by the coordinator as A or B. Labels and link status messages are "
-            "coordinator-owned: generate only your own contribution, never impersonate the other agent or invent "
-            "speaker labels or coordinator messages. Short streamed contributions can interrupt a thought before "
-            "its sentence ends; read the speaker labels to distinguish your thought from the other's. You may "
-            "continue, respond to, or question what the other just said. To listen intentionally, call "
-            "think_with_telepathic_link(enabled=true, yield_until=\"fragment\"), or choose \"sentence\" or "
-            "\"paragraph\" to let the other continue to that boundary within a bounded token allowance. "
-            "When the link is OFF, new reasoning is private. Tool calls and results are always private; "
-            "describe useful results yourself on the shared channel. Final responses are private to each "
-            "agent's user-facing answer, never part of the shared reasoning channel.";
+        system_text = crossthink_system_prompt(name);
     }
 
     std::vector<llama_token> text_tokens(const std::string & text) override {
         return tokenize(text);
+    }
+
+    std::vector<llama_token> literal_tokens(const std::string & text) override {
+        return tokenize(text, false, false);
     }
 
     json parse_tool_turn(const std::vector<llama_token> & tokens) override {

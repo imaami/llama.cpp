@@ -16,23 +16,6 @@ static const char * peer_name(size_t index) {
     return index ? "B" : "A";
 }
 
-static constexpr const char * link_tool_name = "think_with_telepathic_link";
-static constexpr uint64_t link_blank_limit = 64;
-
-static json link_tool() {
-    return {{"type", "function"}, {"function", {
-        {"name", link_tool_name},
-        {"description", "Enable or disable the shared telepathic reasoning channel for both twins. "
-            "While enabled, both see the same live reasoning with coordinator-owned A/B speaker labels. "
-            "Use yield_until to let your twin finish a fragment, sentence, or paragraph before you continue; "
-            "the wait is bounded. Tool calls and final answers remain private."},
-        {"parameters", {{"type", "object"}, {"properties", {
-            {"enabled", {{"type", "boolean"}}},
-            {"yield_until", {{"type", "string"}, {"enum", {"fragment", "sentence", "paragraph"}}}},
-        }}, {"required", {"enabled"}}, {"additionalProperties", false}}},
-    }}};
-}
-
 crossthink_session::crossthink_session(
         std::array<std::unique_ptr<crossthink_transport>, 2> transports,
         const crossthink_options & opts,
@@ -65,20 +48,14 @@ crossthink_session::crossthink_session(
             json definitions = peer.tools ? peer.tools->tools() : json::array();
             if (options.telepathy) {
                 peer.transport->configure_peer(peer_name(index));
-                for (const auto & definition : definitions) {
-                    if (definition.at("function").at("name") == link_tool_name) {
-                        throw std::runtime_error("MCP tool name conflicts with the built-in telepathic link tool");
-                    }
-                }
-                definitions.push_back(link_tool());
             }
             peer.transport->configure_tools(definitions);
         }
         if ((options.paragraph_splice || options.telepathy) && !peer.info.value("splice", false)) {
             throw std::runtime_error("paragraph splicing requires updated model servers with splice support");
         }
-        if (options.telepathy && !peer.info.value("splice_quantum", false)) {
-            throw std::runtime_error("telepathy requires updated model servers with UTF-8 quantum support");
+        if (options.telepathy && !peer.info.value("thought_commands", false)) {
+            throw std::runtime_error("thought commands require updated model servers with reasoning-command support");
         }
         const int64_t n_vocab = peer.info.at("n_vocab").get<int64_t>();
         const int64_t context = peer.info.at("context_size").get<int64_t>();
@@ -108,27 +85,6 @@ crossthink_session::crossthink_session(
             peers[0].eog != peers[1].eog || peers[0].close_token != peers[1].close_token ||
             peers[0].controls != peers[1].controls) {
         throw std::runtime_error("peers have incompatible tokenizer mappings or control tokens");
-    }
-    if (options.telepathy) {
-        for (size_t index = 0; index < peers.size(); ++index) {
-            const std::string name = peer_name(index);
-            link_labels[index] = peers[0].transport->text_tokens("\n[" + name + "]: ");
-            link_interrupt_labels[index] = peers[0].transport->text_tokens(
-                "\n[" + name + " interrupts " + peer_name(1 - index) + "]: ");
-        }
-        link_markers[0] = peers[0].transport->text_tokens("\n[Telepathic link OFF: continue privately.]\n");
-        link_markers[1] = peers[0].transport->text_tokens("\n[Telepathic link ON: shared reasoning follows.]\n");
-        for (const auto * collection : {&link_labels, &link_interrupt_labels, &link_markers}) {
-            for (const auto & tokens : *collection) {
-                if (tokens.empty()) { throw std::runtime_error("empty telepathic marker tokenization"); }
-                for (llama_token token : tokens) {
-                    if (token < 0 || token >= peers[0].info.at("n_vocab").get<int64_t>() ||
-                            contains(peers[0].controls, token)) {
-                        throw std::runtime_error("invalid control token in telepathic marker");
-                    }
-                }
-            }
-        }
     }
     try {
         for (size_t index = 0; index < workers.size(); ++index) {
@@ -172,23 +128,70 @@ json crossthink_session::state_locked() const {
     json result = {
         {"mode", mode}, {"busy", busy}, {"epoch", epoch}, {"round", round},
         {"error", error}, {"last_event_id", next_event_id - 1}, {"peers", json::array()},
-        {"splice_mode", options.paragraph_splice ? "paragraph" : "fixed"}, {"exchanges", exchanges},
-        {"tools", (peers[0].tools ? peers[0].tools->tools().size() : 0) + (options.telepathy ? 1 : 0)},
-        {"telepathy", options.telepathy}, {"link_enabled", link_enabled},
-        {"link_speaker", link_speaker < 0 ? json(nullptr) : json(peer_name(link_speaker))},
-        {"link_wait", link_wait},
+        {"splice_mode", options.telepathy ? "independent" : options.paragraph_splice ? "paragraph" : "fixed"},
+        {"exchanges", exchanges}, {"tools", peers[0].tools ? peers[0].tools->tools().size() : 0},
+        {"telepathy", options.telepathy}, {"thought_tools", options.telepathy ? 3 : 0},
+        {"thinking_tokens", 0}, {"tokens_per_second", 0.0}, {"thinking_tokens_per_second", 0.0},
     };
+    const auto now = std::chrono::steady_clock::now();
+    uint64_t total_thinking = 0;
+    double total_rate = 0, total_thinking_rate = 0;
     for (size_t index = 0; index < peers.size(); ++index) {
         const auto & peer = peers[index];
+        uint64_t recent_generated = 0, recent_thinking = 0;
+        for (const auto & sample : peer.samples) {
+            if (now - sample.time <= std::chrono::seconds(5)) {
+                recent_generated += sample.generated;
+                recent_thinking += sample.thinking;
+            }
+        }
+        const double seconds = std::max(0.1, std::min(5.0,
+            std::chrono::duration<double>(now - peer.sampling_started).count()));
+        const double rate = recent_generated / seconds, thinking_rate = recent_thinking / seconds;
+        total_thinking += peer.thinking_tokens;
+        total_rate += rate;
+        total_thinking_rate += thinking_rate;
         result["peers"].push_back({
             {"name", peer_name(index)}, {"tokens", peer.tape.size()}, {"queued", peer.inbox.size()},
-            {"generated", peer.generated}, {"imported", peer.imported},
+            {"generated", peer.generated}, {"imported", peer.imported}, {"thinking_tokens", peer.thinking_tokens},
+            {"tokens_per_second", rate}, {"thinking_tokens_per_second", thinking_rate},
             {"context_size", peer.context_size}, {"active", peer.active},
-            {"waiting", peer.segment_done || (options.telepathy && link_yield_to == int(1 - index))}, {"boundary", peer.boundary}, {"forced_splices", peer.forced_splices},
+            {"waiting", peer.segment_done}, {"boundary", peer.boundary}, {"forced_splices", peer.forced_splices},
             {"tool_calls", peer.tool_calls}, {"tool_status", peer.tool_status}, {"answer_done", peer.answer_done},
+            {"mailbox", peer.mailbox.size()}, {"thought_turn", peer.thought_turn},
         });
     }
+    result["thinking_tokens"] = total_thinking;
+    result["tokens_per_second"] = total_rate;
+    result["thinking_tokens_per_second"] = total_thinking_rate;
     return result;
+}
+
+bool crossthink_session::blocked(size_t index) const {
+    return busy && (pending.target < 0 || pending.target == static_cast<int>(index));
+}
+
+uint64_t crossthink_session::generation_id(size_t index) const {
+    return options.telepathy ? peers[index].revision : epoch;
+}
+
+void crossthink_session::begin_thought(peer_state & peer) {
+    ++peer.thought_turn;
+    peer.thought_text.clear();
+    peer.thought_tokens.clear();
+    peer.thought_visible_tokens = 0;
+    peer.thought_scanner = {};
+    peer.thought_scanner.thinking = true;
+}
+
+void crossthink_session::count_tokens(peer_state & peer, uint64_t generated, uint64_t thinking) {
+    peer.generated += generated;
+    peer.thinking_tokens += thinking;
+    const auto now = std::chrono::steady_clock::now();
+    while (!peer.samples.empty() && now - peer.samples.front().time > std::chrono::seconds(5)) {
+        peer.samples.pop_front();
+    }
+    if (generated) { peer.samples.push_back({now, generated, thinking}); }
 }
 
 json crossthink_session::state() {
@@ -233,44 +236,31 @@ std::vector<json> crossthink_session::events_after(uint64_t cursor, bool wait) {
     return result;
 }
 
-void crossthink_session::command(const std::string & action, const std::string & text) {
+void crossthink_session::command(const std::string & action, const std::string & text, const std::string & target) {
     {
         std::lock_guard<std::mutex> lock(mutex);
-        if (busy || stopping) {
-            throw std::logic_error("another control operation is pending");
-        }
-        if (text.size() > 1024 * 1024) {
-            throw std::invalid_argument("message exceeds 1 MiB");
+        if (busy || stopping) { throw std::logic_error("another control operation is pending"); }
+        if (text.size() > 1024 * 1024) { throw std::invalid_argument("message exceeds 1 MiB"); }
+        const int selected = target == "both" ? -1 : target == "A" ? 0 : target == "B" ? 1 : -2;
+        if (selected == -2 || (selected >= 0 && (action != "message" || !options.telepathy))) {
+            throw std::invalid_argument("target must be both, A, or B; targeted messages require independent mode");
         }
         if (action == "message") {
-            if (text.empty()) {
-                throw std::invalid_argument("message text must not be empty");
-            }
-            if (mode == "answering") {
-                throw std::logic_error("wait for the answers before sending the next message");
-            }
+            if (text.empty()) { throw std::invalid_argument("message text must not be empty"); }
+            if (mode == "answering" && selected < 0) { throw std::logic_error("wait for the answers before sending the next message"); }
             if ((options.telepathy || options.paragraph_splice) && mode == "error") {
                 throw std::logic_error("reset the failed session before starting another message");
             }
         } else if (action == "pause") {
-            if (mode != "thinking") {
-                throw std::logic_error("only an active thinking session can be paused");
-            }
+            if (mode != "thinking") { throw std::logic_error("only an active thinking session can be paused"); }
         } else if (action == "resume") {
-            if (mode != "paused" || !error.empty() || peers[0].tape.empty() ||
+            if (mode != "paused" || !error.empty() || (peers[0].tape.empty() && peers[1].tape.empty()) ||
                     (peers[0].answer_done && peers[1].answer_done)) {
                 throw std::logic_error("there is no paused reasoning session to resume");
             }
         } else if (action == "answer") {
-            if ((mode != "thinking" && mode != "paused") || peers[0].tape.empty()) {
+            if ((mode != "thinking" && mode != "paused") || (peers[0].tape.empty() && peers[1].tape.empty())) {
                 throw std::logic_error("start or resume a conversation before requesting answers");
-            }
-        } else if (action == "link_on" || action == "link_off") {
-            if (!options.telepathy || (mode != "thinking" && mode != "paused") || peers[0].tape.empty()) {
-                throw std::logic_error("link controls require an active telepathy conversation");
-            }
-            if (action == "link_on" && (peers[0].answer_done || peers[1].answer_done)) {
-                throw std::logic_error("both twins must still be thinking to enable the link");
             }
         } else if (action == "reset") {
             ++epoch;
@@ -278,13 +268,15 @@ void crossthink_session::command(const std::string & action, const std::string &
             throw std::invalid_argument("unknown control operation");
         }
         busy = true;
-        pending = {action, text, mode};
-        mode = "paused";
-        if (options.telepathy) { clear_link_wait(); }
-        if (action == "reset") {
-            for (auto & peer : peers) {
-                peer.transport->cancel();
-                if (peer.tools) { peer.tools->cancel(); }
+        pending = {action, text, mode, selected};
+        if (selected < 0) { mode = "paused"; }
+        if (options.telepathy || action == "reset") {
+            for (size_t i = 0; i < peers.size(); ++i) {
+                if (selected >= 0 && selected != static_cast<int>(i)) { continue; }
+                if ((action == "pause" || action == "answer") && !peers[i].thinking_open) { continue; }
+                ++peers[i].revision;
+                peers[i].transport->cancel();
+                if (peers[i].tools) { peers[i].tools->cancel(); }
             }
         }
         emit_state();
@@ -293,7 +285,6 @@ void crossthink_session::command(const std::string & action, const std::string &
 }
 
 void crossthink_session::fail(const std::string & message) {
-    clear_link_wait();
     error = message;
     mode = "error";
     for (auto & peer : peers) {
@@ -338,85 +329,58 @@ bool crossthink_session::receive(size_t index, uint64_t generation_epoch, bool a
         size_t & received, const server_token_wire::packet & packet) {
     const json metadata = json::parse(packet.metadata);
     std::lock_guard<std::mutex> lock(mutex);
-    if (stopping || epoch != generation_epoch || (options.telepathy && mode == "error")) {
-        return false;
-    }
+    if (stopping || generation_id(index) != generation_epoch || (options.telepathy && mode == "error")) { return false; }
     auto & peer = peers[index];
     auto & other = peers[1 - index];
-    const size_t maximum = answer ? options.answer_tokens :
-        (options.telepathy ? peer.generation_limit : options.chunk_tokens);
-    if (packet.tokens.size() > maximum - received) {
+    const size_t maximum = answer ? options.answer_tokens : (options.telepathy ? peer.generation_limit : options.chunk_tokens);
+    if (received > maximum || packet.tokens.size() > maximum - received) {
         throw std::runtime_error("server generated more tokens than requested");
     }
     received += packet.tokens.size();
+    bool closed = false;
+    uint64_t generated = 0, thinking = 0;
     for (llama_token token : packet.tokens) {
-        if (token < 0 || token >= peer.info.at("n_vocab").get<int64_t>()) {
-            throw std::runtime_error("server returned a token outside the vocabulary");
-        }
+        if (token < 0 || token >= peer.info.at("n_vocab").get<int64_t>()) { throw std::runtime_error("server returned a token outside the vocabulary"); }
         if (contains(peer.controls, token) && !(answer && contains(peer.eog, token)) &&
                 !(!answer && native_tools(peer) && token == peer.close_token)) {
             throw std::runtime_error("server generated a forbidden reasoning/chat control token");
         }
-    }
-    const bool shared = options.telepathy && link_enabled && !answer;
-    bool closed = false;
-    if (options.telepathy) {
-        if (!answer && !peer.thinking_open && !packet.tokens.empty()) {
-            throw std::runtime_error("server streamed another packet after the private reasoning terminator");
+        if (options.telepathy && !answer && (!peer.thinking_open || closed)) {
+            throw std::runtime_error("server streamed tokens after the private reasoning terminator");
         }
-        for (llama_token token : packet.tokens) {
-            if (closed) { throw std::runtime_error("server streamed tokens after the private reasoning terminator"); }
-            closed = token == peer.close_token;
-        }
-        if (shared && other.tape.size() + packet.tokens.size() >= other.context_size) {
-            throw std::runtime_error("peer context full while receiving telepathic tokens");
-        }
-    }
-    for (llama_token token : packet.tokens) {
-        // The next-user template supplies the assistant terminator exactly once.
-        if (answer && contains(peer.eog, token)) {
-            continue;
-        }
+        if (answer && contains(peer.eog, token)) { continue; }
         peer.tape.push_back(token);
-        ++peer.generated;
-        if (options.telepathy && !answer && token != peer.close_token) { peer.tool_rounds = 0; }
+        ++generated;
         if (!answer && native_tools(peer) && token == peer.close_token) {
+            closed = true;
             peer.thinking_open = false;
-            other.inbox.clear();
+            if (options.telepathy) { peer.private_pending = true; }
+            else { other.inbox.clear(); }
+        } else if (!answer) {
+            ++thinking;
             if (options.telepathy) {
-                peer.private_pending = true;
-                if (private_owner < 0) { private_owner = static_cast<int>(index); }
+                peer.tool_rounds = 0;
+                peer.thought_tokens.push_back(token);
+            } else if (peer.thinking_open && !other.answer_done && mode != "answering") {
+                other.inbox.push_back(token);
             }
-        } else if (shared) {
-            if (!other.thinking_open || other.answer_done) {
-                throw std::runtime_error("shared token targeted a peer outside its thinking block");
-            }
-            other.tape.push_back(token);
-            ++other.imported;
-        } else if (!options.telepathy && !answer && peer.thinking_open && !other.answer_done && mode != "answering") {
-            other.inbox.push_back(token);
         }
     }
+    count_tokens(peer, generated, thinking);
     std::string content = metadata.value("content", std::string());
     if (options.telepathy && closed) {
-        const auto end = content.find("</think>");
-        if (end != std::string::npos) { content.resize(end); }
-    }
-    if (shared) {
-        // Only newly generated text is speech. Coordinator labels are already
-        // in the prompt and can make the server report a blank paragraph.
-        const size_t spoken_tokens = packet.tokens.size() - (closed ? 1 : 0);
-        if (spoken_tokens && crossthink_speech_guard::substantive(content)) {
-            peer.link_turn_content = true;
-            peer.link_blank_tokens = 0;
-        } else {
-            peer.link_blank_tokens += spoken_tokens;
+        const std::string close = "</think>";
+        if (content.size() >= close.size() && content.compare(content.size() - close.size(), close.size(), close) == 0) {
+            content.resize(content.size() - close.size());
         }
-        peer.speech_guard.feed(content);
     }
-    if (!content.empty()) {
-        emit({{"type", shared ? "shared" : answer ? "answer" : "token"}, {"peer", peer_name(index)}, {"text", content}});
+    if (options.telepathy && !answer && !content.empty()) {
+        peer.thought_text += content;
+        peer.thought_visible_tokens = peer.thought_tokens.size();
+        peer.thought_scanner.feed(content);
     }
+    if (closed) { peer.thought_scanner = {}; }
+    if (!content.empty()) { emit({{"type", answer ? "answer" : "token"}, {"peer", peer_name(index)}, {"text", content}}); }
     changed.notify_all();
     return true;
 }
@@ -424,7 +388,7 @@ bool crossthink_session::receive(size_t index, uint64_t generation_epoch, bool a
 bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std::unique_lock<std::mutex> & lock) {
     auto & peer = peers[index];
     auto & other = peers[1 - index];
-    if (stopping || epoch != generation_epoch || mode == "error") {
+    if (stopping || generation_id(index) != generation_epoch || mode == "error") {
         return false;
     }
     if (peer.tools) { peer.tools->begin_turn(); }
@@ -452,7 +416,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
     try {
         const auto result = peer.transport->generate(prompt, parameters, [&](const server_token_wire::packet & packet) {
             std::lock_guard<std::mutex> guard(mutex);
-            if (stopping || epoch != generation_epoch || mode == "error") {
+            if (stopping || generation_id(index) != generation_epoch || mode == "error") {
                 return false;
             }
             if (packet.tokens.size() > budget - (output.size() - 1)) {
@@ -466,11 +430,11 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
             }
             output.insert(output.end(), packet.tokens.begin(), packet.tokens.end());
             peer.tape.insert(peer.tape.end(), packet.tokens.begin(), packet.tokens.end());
-            peer.generated += packet.tokens.size();
+            count_tokens(peer, packet.tokens.size(), 0);
             return true;
         });
         lock.lock();
-        if (stopping || epoch != generation_epoch || mode == "error") {
+        if (stopping || generation_id(index) != generation_epoch || mode == "error") {
             return false;
         }
         if (!result.is_object() || result.value("type", std::string()) != "done" ||
@@ -485,22 +449,21 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
             throw std::runtime_error("invalid number of tool calls in assistant turn");
         }
         lock.lock();
-        if (stopping || epoch != generation_epoch || mode == "error") {
+        if (stopping || generation_id(index) != generation_epoch || mode == "error") {
             return false;
         }
         if (calls.empty()) {
             peer.tape.pop_back(); // next_user() supplies the assistant terminator.
             peer.answer_done = true;
-            if (options.telepathy) { finish_link("final answer"); }
             peer.segment_done = false;
             peer.tool_status.clear();
             peer.inbox.clear();
-            other.inbox.clear();
+            if (!options.telepathy) { other.inbox.clear(); }
             emit({{"type", "answer_start"}, {"peer", peer_name(index)}});
             emit({{"type", "answer"}, {"peer", peer_name(index)}, {"text", assistant.value("content", std::string())}});
-            if (!busy) {
-                mode = other.answer_done ? "answered" :
-                    (options.telepathy && !answer_requested ? "thinking" : "answering");
+            if (!blocked(index)) {
+                mode = (other.answer_done || other.tape.empty()) ? "answered" :
+                    (options.telepathy && !other.force_answer ? "thinking" : "answering");
             }
             changed.notify_all();
             return false;
@@ -541,30 +504,10 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
                 if (!parsed.is_object()) {
                     throw std::runtime_error("tool arguments must be a JSON object");
                 }
-                if (options.telepathy && name == link_tool_name) {
-                    if (!parsed.contains("enabled") || !parsed.at("enabled").is_boolean()) {
-                        throw std::runtime_error("enabled must be a boolean");
-                    }
-                    const bool enabled = parsed.at("enabled").get<bool>();
-                    const auto wait = parsed.value("yield_until", std::string());
-                    if ((!wait.empty() && wait != "fragment" && wait != "sentence" && wait != "paragraph") ||
-                            (!enabled && !wait.empty())) {
-                        throw std::runtime_error("yield_until requires an enabled link and fragment, sentence, or paragraph");
-                    }
-                    if (enabled && (mode == "answering" || other.answer_done)) {
-                        throw std::runtime_error("the linked thinking stage has ended; finish your separate answer");
-                    }
-                    request_link(enabled, static_cast<int>(index), wait);
-                    response = {{"content", json::array({{{"type", "text"}, {"text",
-                        std::string("Telepathic link ") + (enabled ? "ON" : "OFF") +
-                        " requested. It takes effect at the next safe reasoning boundary; coordinator markers announce the change." +
-                        (wait.empty() ? "" : " Your twin has the floor until the requested bounded boundary.")}}})}};
-                } else {
-                    if (!peer.tools) { throw std::runtime_error("unknown tool: " + name); }
-                    lock.unlock();
-                    response = peer.tools->call(name, parsed);
-                    lock.lock();
-                }
+                if (!peer.tools) { throw std::runtime_error("unknown tool: " + name); }
+                lock.unlock();
+                response = peer.tools->call(name, parsed);
+                lock.lock();
             } catch (const std::exception & exception) {
                 if (!lock.owns_lock()) { lock.lock(); }
                 response = {{"isError", true}, {"content", json::array({{
@@ -572,7 +515,7 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
                         ". A transport failure may occur after execution; do not blindly repeat a side effect."},
                 }})}};
             }
-            if (stopping || epoch != generation_epoch || mode == "error") {
+            if (stopping || generation_id(index) != generation_epoch || mode == "error") {
                 return false;
             }
             emit({{"type", "tool_result"}, {"peer", peer_name(index)}, {"name", name},
@@ -589,207 +532,181 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         lock.unlock();
         const auto suffix = peer.transport->tool_results(assistant, results);
         lock.lock();
-        if (stopping || epoch != generation_epoch || mode == "error") {
+        if (stopping || generation_id(index) != generation_epoch || mode == "error") {
             return false;
         }
-        const uint64_t reserve = (options.telepathy ? std::max(options.link_quantum, options.private_quantum) + 128 : 2 * options.chunk_tokens) +
+        const uint64_t reserve = (options.telepathy ? 256 : 2 * options.chunk_tokens) +
             budget + options.answer_tokens + 2;
         if (suffix.empty() || peer.tape.size() + suffix.size() + reserve >= peer.context_size) {
             throw std::runtime_error("tool results do not fit the remaining context; reset or reduce token budgets");
         }
         peer.tape.insert(peer.tape.end(), suffix.begin(), suffix.end());
         peer.thinking_open = true;
+        if (options.telepathy) { begin_thought(peer); }
         peer.tool_status.clear();
         return true;
     } catch (...) {
         if (!lock.owns_lock()) { lock.lock(); }
         peer.tool_status.clear();
-        if (stopping || epoch != generation_epoch || mode == "error") { return false; }
+        if (stopping || generation_id(index) != generation_epoch || mode == "error") { return false; }
         throw;
     }
 }
 
-void crossthink_session::clear_link_wait() {
-    link_yield_to = -1;
-    link_yield_tokens = 0;
-    link_wait.clear();
-}
-
-void crossthink_session::clear_link_speech() {
-    for (auto & peer : peers) {
-        peer.link_blank_tokens = 0;
-        peer.link_turn_content = false;
-        peer.speech_guard.reset();
+bool crossthink_session::thought_command(size_t index, uint64_t generation_epoch, const json & result,
+        std::unique_lock<std::mutex> & lock) {
+    auto & peer = peers[index];
+    auto & other = peers[1 - index];
+    const std::string command = result.value("thought_command", std::string());
+    const std::string failure = result.value("thought_error", std::string());
+    if (command != "peek" && command != "send" && command != "inbox") {
+        throw std::runtime_error("server returned an unknown thought command");
     }
-}
-
-void crossthink_session::request_link(bool enabled, int requester, const std::string & wait) {
-    if (!enabled && !link_enabled) {
-        link_pending = false;
-        link_requested = false;
-        clear_link_wait();
-        changed.notify_all();
-        return;
-    }
-    if (enabled && (peers[0].answer_done || peers[1].answer_done)) {
-        throw std::logic_error("both twins must still be thinking to enable the link");
-    }
-    link_pending = true;
-    link_requested = enabled;
-    link_requester = requester;
-    clear_link_wait();
-    if (enabled && !wait.empty() && requester >= 0) {
-        link_yield_to = 1 - requester;
-        link_wait = wait;
-    }
-    changed.notify_all();
-}
-
-void crossthink_session::append_shared(const std::vector<llama_token> & tokens) {
-    for (const auto & peer : peers) {
-        if (peer.tape.size() + tokens.size() >= peer.context_size) {
-            throw std::runtime_error("context full for the shared telepathic transcript");
+    const uint64_t captured_turn = other.thought_turn;
+    const size_t start_tokens = peer.peek_turn == captured_turn ? peer.peek_tokens : 0;
+    const size_t start_bytes = peer.peek_turn == captured_turn ? peer.peek_bytes : 0;
+    const size_t end_tokens = other.thought_visible_tokens, end_bytes = other.thought_text.size();
+    const bool source_active = other.active && other.thinking_open && !other.answer_done;
+    const uint64_t outgoing_id = command == "send" ? next_message_id++ : 0;
+    std::vector<llama_token> captured;
+    std::deque<thought_message> messages;
+    std::string payload, prefix = "\n<ct:result command=\"" + command + "\">\n", suffix = "\n</ct:result>\n";
+    bool successful = failure.empty();
+    std::string detail = failure;
+    if (successful && command == "peek") {
+        if (start_tokens > end_tokens || start_bytes > end_bytes) { throw std::runtime_error("invalid thought cursor"); }
+        payload = other.thought_text.substr(start_bytes);
+        captured.assign(other.thought_tokens.begin() + start_tokens, other.thought_tokens.begin() + end_tokens);
+        prefix += "<ct:thought source=\"" + std::string(peer_name(1 - index)) + "\" turn=\"" +
+            std::to_string(captured_turn) + "\" offset=\"" + std::to_string(start_bytes) +
+            "\" bytes=\"" + std::to_string(payload.size()) + "\" active=\"" + (source_active ? "true" : "false") + "\">";
+        suffix = "</ct:thought>" + suffix;
+    } else if (successful && command == "send") {
+        payload = result.value("thought_payload", std::string());
+        if (payload.size() > 16384) { successful = false; detail = "Message exceeds 16 KiB; nothing was sent."; }
+        else if (other.mailbox.size() >= 256 || other.mailbox_bytes + payload.size() > 1024 * 1024) {
+            successful = false; detail = "The recipient's inbox is full; nothing was sent.";
+        } else {
+            detail = "Queued message " + std::to_string(outgoing_id) + " for " + peer_name(1 - index) +
+                ". It will be delivered when they check their inbox.";
+        }
+    } else if (successful && command == "inbox") {
+        messages = peer.mailbox;
+        if (messages.empty()) { detail = "Inbox empty."; }
+        for (const auto & message : messages) {
+            detail += "<ct:message id=\"" + std::to_string(message.id) + "\" from=\"" + peer_name(message.sender) +
+                "\" bytes=\"" + std::to_string(message.text.size()) + "\">" + message.text + "</ct:message>\n";
         }
     }
-    for (auto & peer : peers) {
-        peer.tape.insert(peer.tape.end(), tokens.begin(), tokens.end());
+    if (!successful) { prefix += "Error: "; }
+    const bool raw_capture = successful && command == "peek";
+    std::string text = prefix + (raw_capture ? payload : detail) + suffix;
+    lock.unlock();
+    std::vector<llama_token> injected;
+    try {
+        if (raw_capture) {
+            injected = peer.transport->literal_tokens(prefix);
+            injected.insert(injected.end(), captured.begin(), captured.end());
+            const auto ending = peer.transport->literal_tokens(suffix);
+            injected.insert(injected.end(), ending.begin(), ending.end());
+        } else {
+            injected = peer.transport->literal_tokens(text);
+        }
+    } catch (...) { lock.lock(); throw; }
+    lock.lock();
+    if (stopping || generation_id(index) != generation_epoch || mode == "error") { return false; }
+    const size_t reserve = std::max(options.tool_tokens, options.answer_tokens) + options.answer_tokens + 128;
+    if (peer.tape.size() + injected.size() + reserve >= peer.context_size) {
+        successful = false;
+        text = "\n<ct:result command=\"" + command + "\" error=\"context_full\">Requested data does not fit the remaining context. "
+            "No cursor was advanced, message sent, or inbox drained. Finish your answer or request a new user turn.</ct:result>\n";
+        lock.unlock();
+        try { injected = peer.transport->literal_tokens(text); }
+        catch (...) { lock.lock(); throw; }
+        lock.lock();
+        if (stopping || generation_id(index) != generation_epoch || mode == "error") { return false; }
+        if (peer.tape.size() + injected.size() + reserve >= peer.context_size) {
+            throw std::runtime_error("context full for a thought-command response; request answers or reset");
+        }
     }
-}
-
-bool crossthink_session::apply_link() {
-    if (!link_pending || peers[0].active || peers[1].active || private_owner >= 0 ||
-            !peers[0].thinking_open || !peers[1].thinking_open ||
-            peers[0].answer_done || peers[1].answer_done) {
-        return false;
+    for (const auto token : injected) {
+        if (token < 0 || token >= peer.info.at("n_vocab").get<int64_t>() || contains(peer.controls, token)) {
+            throw std::runtime_error("thought data tokenization produced a control token");
+        }
     }
-    if (link_enabled != link_requested) {
-        append_shared(link_markers[link_requested ? 1 : 0]);
-        link_enabled = link_requested;
-        clear_link_speech();
-        link_speaker = -1;
-        link_previous_boundary.clear();
-        link_next = 0;
-        emit({{"type", "link"}, {"enabled", link_enabled},
-            {"peer", link_requester < 0 ? "coordinator" : peer_name(link_requester)},
-            {"reason", "requested"}});
+    peer.tape.insert(peer.tape.end(), injected.begin(), injected.end());
+    peer.imported += injected.size();
+    ++exchanges;
+    emit({{"type", "thought_result"}, {"peer", peer_name(index)}, {"command", command}, {"text", text}, {"success", successful}});
+    if (successful && command == "peek") {
+        peer.peek_turn = captured_turn;
+        peer.peek_tokens = end_tokens;
+        peer.peek_bytes = end_bytes;
+        emit({{"type", "thought_capture"}, {"peer", peer_name(index)}, {"source", peer_name(1 - index)},
+            {"turn", captured_turn}, {"offset", start_bytes}, {"end", end_bytes}, {"text", payload}});
+    } else if (successful && command == "send") {
+        const uint64_t id = outgoing_id;
+        other.mailbox.push_back({id, index, payload});
+        other.mailbox_bytes += payload.size();
+        emit({{"type", "thought_message"}, {"message_id", id}, {"from", peer_name(index)},
+            {"to", peer_name(1 - index)}, {"text", payload}, {"status", "sent"}});
+    } else if (successful && command == "inbox") {
+        for (const auto & message : messages) {
+            if (peer.mailbox.empty() || peer.mailbox.front().id != message.id) { throw std::runtime_error("inbox changed during delivery"); }
+            peer.mailbox_bytes -= message.text.size();
+            peer.mailbox.pop_front();
+            emit({{"type", "thought_message"}, {"message_id", message.id}, {"from", peer_name(message.sender)},
+                {"to", peer_name(index)}, {"text", message.text}, {"status", "received"}});
+        }
     }
-    if (link_enabled && link_yield_to >= 0) {
-        link_next = static_cast<size_t>(link_yield_to);
-    }
-    link_pending = false;
-    emit_state();
-    changed.notify_all();
     return true;
-}
-
-void crossthink_session::start_speaker(size_t index) {
-    if (link_speaker == static_cast<int>(index)) { return; }
-    const bool interrupted = link_speaker >= 0 && link_previous_boundary != "sentence" &&
-        link_previous_boundary != "paragraph";
-    append_shared(interrupted ? link_interrupt_labels[index] : link_labels[index]);
-    const std::string text = "\n[" + std::string(peer_name(index)) +
-        (interrupted ? " interrupts " + std::string(peer_name(1 - index)) : "") + "]: ";
-    link_speaker = static_cast<int>(index);
-    peers[index].link_turn_content = false;
-    peers[index].link_blank_tokens = 0;
-    peers[index].speech_guard.reset();
-    emit({{"type", "shared"}, {"peer", peer_name(index)}, {"text", text}, {"label", true}});
-}
-
-void crossthink_session::finish_link(const std::string & reason) {
-    const bool was_enabled = link_enabled;
-    clear_link_speech();
-    link_enabled = false;
-    link_pending = false;
-    link_requested = false;
-    link_requester = -1;
-    link_speaker = -1;
-    clear_link_wait();
-    if (was_enabled) {
-        // A completed answer has left its thinking block. Only the still-thinking
-        // twin needs the marker; no answer or private tail crosses the link.
-        for (auto & peer : peers) {
-            if (peer.thinking_open && peer.tape.size() + link_markers[0].size() < peer.context_size) {
-                peer.tape.insert(peer.tape.end(), link_markers[0].begin(), link_markers[0].end());
-            }
-        }
-        emit({{"type", "link"}, {"enabled", false}, {"peer", "coordinator"}, {"reason", reason}});
-    }
-    changed.notify_all();
 }
 
 void crossthink_session::telepathy_worker(size_t index) {
     auto & peer = peers[index];
-    auto & other = peers[1 - index];
     std::unique_lock<std::mutex> lock(mutex);
     while (!stopping) {
         changed.wait(lock, [&] {
-            if (stopping) { return true; }
-            if (busy || (mode != "thinking" && mode != "answering") || peer.answer_done) { return false; }
-            if (private_owner >= 0) {
-                return private_owner == static_cast<int>(index) && !other.active;
-            }
-            if (peer.private_pending) { return !other.active; }
-            if (other.private_pending) { return false; }
-            if (link_pending) { return !other.active; }
-            return !link_enabled || (!other.active && link_next == index);
+            return stopping || (!blocked(index) && (mode == "thinking" || mode == "answering") &&
+                !peer.answer_done && !peer.tape.empty());
         });
         if (stopping) { break; }
+        const uint64_t generation_epoch = generation_id(index);
         try {
-            if (link_pending && private_owner < 0 && !peer.private_pending && !other.private_pending) {
-                apply_link();
-                if (link_pending || (link_enabled && link_next != index)) { continue; }
-            }
-            const bool answer = mode == "answering";
-            if (answer || peer.private_pending || private_owner == static_cast<int>(index)) {
-                // Tool and answer tails never run while another shared fragment is
-                // being accepted. An off-link quantum already in flight may finish.
-                if (other.active) { continue; }
-                private_owner = static_cast<int>(index);
+            peer.active = true;
+            if (peer.force_answer || peer.private_pending || !peer.thinking_open) {
+                if (peer.thinking_open) { peer.tape.push_back(peer.close_token); peer.thinking_open = false; }
                 peer.private_pending = false;
-                peer.link_turn_content = false;
-                peer.link_blank_tokens = 0;
-                peer.speech_guard.reset();
-                peer.active = true;
-                if (peer.thinking_open) {
-                    peer.tape.push_back(peer.close_token);
-                    peer.thinking_open = false;
-                }
-                tool_turn(index, epoch, lock);
+                tool_turn(index, generation_epoch, lock);
                 peer.active = false;
-                private_owner = -1;
-                link_speaker = -1;
-                if (!stopping && mode != "error") {
-                    apply_link();
+                emit_state();
+                changed.notify_all();
+                continue;
+            }
+            if (!peer.thought_scanner.command.empty()) {
+                const json result = {{"thought_command", peer.thought_scanner.command},
+                    {"thought_payload", peer.thought_scanner.payload}, {"thought_error", peer.thought_scanner.error}};
+                if (thought_command(index, generation_epoch, result, lock)) {
+                    peer.thought_scanner = {};
+                    peer.thought_scanner.thinking = true;
                 }
+                peer.active = false;
                 emit_state();
                 changed.notify_all();
                 continue;
             }
-            const uint64_t quantum = !link_enabled ? options.private_quantum :
-                link_yield_to == static_cast<int>(index)
-                    ? std::min<uint64_t>(options.link_quantum, options.link_wait_tokens - link_yield_tokens)
-                    : options.link_quantum;
-            const uint64_t budget = quantum + 8;
-            const uint64_t reserve = budget + std::max(options.tool_tokens, options.answer_tokens) +
-                options.answer_tokens + 2;
-            const auto has_space = [&](const peer_state & target) {
-                const size_t label = std::max(link_labels[index].size(), link_interrupt_labels[index].size());
-                return target.tape.size() + reserve + label < target.context_size;
-            };
-            if (!has_space(peer) || (link_enabled && !has_space(other))) {
-                error = std::string(peer_name(index)) + ": context full for further telepathy; request answers or reset";
-                mode = "paused";
-                clear_link_wait();
-                emit({{"type", "error"}, {"message", error}});
-                emit_state();
+            const uint64_t reserve = std::max(options.tool_tokens, options.answer_tokens) + options.answer_tokens + 128;
+            if (peer.tape.size() + reserve + 1 >= peer.context_size) {
+                peer.active = false;
+                peer.private_pending = true;
+                peer.force_answer = true;
+                emit({{"type", "notice"}, {"message", std::string(peer_name(index)) + ": reasoning context budget reached; generating its separate answer"}});
                 changed.notify_all();
                 continue;
             }
-            const bool shared = link_enabled;
-            if (shared) { start_speaker(index); }
+            const uint32_t budget = static_cast<uint32_t>(peer.context_size - peer.tape.size() - reserve);
+            peer.generation_limit = budget;
             const auto prompt = peer.tape;
-            const uint64_t generation_epoch = epoch;
             json bias = json::array();
             for (llama_token token : peer.controls) {
                 if (token != peer.close_token) { bias.push_back(json::array({token, false})); }
@@ -800,16 +717,10 @@ void crossthink_session::telepathy_worker(size_t index) {
                 {"cache_prompt", true}, {"stream", true}, {"return_content", true},
                 {"reasoning_budget_tokens", -1}, {"logit_bias", std::move(bias)}, {"stop", json::array()},
                 {"preserved_tokens", json::array({"</think>"})},
-                {"splice", {{"token_after", quantum}, {"stop_on_think_close", true}}},
+                {"splice", {{"thought_commands", true}, {"stop_on_think_close", true}}},
             };
-            if (shared) {
-                parameters["splice"]["sentence_after"] = 1;
-                parameters["grammar"] = peer.speech_guard.grammar();
-                parameters["grammar_lazy"] = false;
-                parameters["backend_sampling"] = false;
-            }
-            peer.generation_limit = static_cast<uint32_t>(budget);
-            peer.active = true;
+            const auto continuation = peer.thought_scanner.continuation();
+            if (!continuation.empty()) { parameters["splice"]["thought_prefix"] = continuation; }
             lock.unlock();
             size_t received = 0;
             json result;
@@ -818,84 +729,54 @@ void crossthink_session::telepathy_worker(size_t index) {
                 result = peer.transport->generate(prompt, parameters, [&](const server_token_wire::packet & packet) {
                     return receive(index, generation_epoch, false, received, packet);
                 });
-            } catch (const std::exception & exception) {
-                failure = exception.what();
-            }
+            } catch (const std::exception & exception) { failure = exception.what(); }
             lock.lock();
-            peer.active = false;
-            changed.notify_all();
-            if (stopping || epoch != generation_epoch || mode == "error") { continue; }
+            if (stopping || generation_id(index) != generation_epoch || mode == "error") {
+                if (peer.thinking_open && peer.thought_tokens.size() > peer.thought_visible_tokens) {
+                    const size_t incomplete = peer.thought_tokens.size() - peer.thought_visible_tokens;
+                    peer.tape.resize(peer.tape.size() - incomplete);
+                    peer.thought_tokens.resize(peer.thought_visible_tokens);
+                }
+                peer.active = false;
+                changed.notify_all();
+                continue;
+            }
             if (!failure.empty()) { throw std::runtime_error(failure); }
             if (!result.is_object() || result.value("type", std::string()) != "done" ||
-                    result.value("truncated", false) || !received ||
-                    result.value("stop_type", std::string()) != "limit") {
-                throw std::runtime_error("telepathic reasoning ended without a valid final boundary");
+                    result.value("truncated", false) || !received || result.value("stop_type", std::string()) != "limit") {
+                throw std::runtime_error("reasoning ended without a valid final boundary");
             }
             const auto boundary = result.value("splice_boundary", std::string());
+            peer.boundary = boundary;
             if (boundary == "tool") {
                 if (peer.thinking_open || peer.tape.empty() || peer.tape.back() != peer.close_token) {
                     throw std::runtime_error("private tool boundary did not end with the reasoning terminator");
                 }
                 peer.private_pending = true;
-                if (private_owner < 0) { private_owner = static_cast<int>(index); }
-                if (shared && link_yield_to == static_cast<int>(index)) {
-                    // A tool call does not let the current speaker evade a bounded
-                    // yield. Count its preceding shared words, excluding </think>.
-                    link_yield_tokens += received - 1;
-                    if ((link_wait == "fragment" && received > 1 && peer.link_turn_content) ||
-                            link_yield_tokens >= static_cast<uint64_t>(options.link_wait_tokens)) {
-                        clear_link_wait();
-                        link_next = 1 - index;
-                    }
+            } else if (boundary == "thought_command") {
+                if (!peer.thinking_open) { throw std::runtime_error("thought command outside reasoning"); }
+                if (thought_command(index, generation_epoch, result, lock)) {
+                    peer.thought_scanner = {};
+                    peer.thought_scanner.thinking = true;
                 }
-            } else {
-                if (boundary != "paragraph" && boundary != "sentence" && boundary != "quantum" &&
-                        (boundary != "limit" || received != budget)) {
-                    throw std::runtime_error("completion did not report a valid telepathic boundary");
-                }
-                if (!peer.thinking_open) {
-                    throw std::runtime_error("reasoning terminator was not reported as a private tool boundary");
-                }
-                peer.boundary = boundary;
-                if (boundary == "paragraph") { peer.tool_rounds = 0; }
-                if (boundary == "limit") { ++peer.forced_splices; }
-                if (shared) {
-                    if (peer.link_blank_tokens >= link_blank_limit) {
-                        error = std::string(peer_name(index)) +
-                            ": telepathic generation produced 64 consecutive tokens with no substantive speech; request answers or reset";
-                        mode = "paused";
-                        clear_link_wait();
-                        emit({{"type", "error"}, {"message", error}});
-                        emit_state();
-                        changed.notify_all();
-                        continue;
-                    }
-                    ++exchanges;
-                    link_previous_boundary = boundary;
-                    bool keep_floor = !peer.link_turn_content;
-                    if (link_yield_to == static_cast<int>(index)) {
-                        link_yield_tokens += received;
-                        const bool natural = peer.link_turn_content &&
-                            (link_wait == "fragment" || boundary == "paragraph" ||
-                                (link_wait == "sentence" && boundary == "sentence"));
-                        const bool done = natural ||
-                            link_yield_tokens >= static_cast<uint64_t>(options.link_wait_tokens);
-                        if (done) { clear_link_wait(); keep_floor = false; }
-                        else { keep_floor = true; }
-                    }
-                    link_next = keep_floor ? index : 1 - index;
-                }
+            } else if (boundary != "limit" || received != budget) {
+                throw std::runtime_error("completion did not report a valid independent reasoning boundary");
             }
-            if (!busy && private_owner < 0) { apply_link(); }
+            peer.active = false;
             emit_state();
             changed.notify_all();
         } catch (const std::exception & exception) {
+            if (!lock.owns_lock()) { lock.lock(); }
             peer.active = false;
-            private_owner = -1;
+            if (stopping || generation_id(index) != generation_epoch || mode == "error") {
+                changed.notify_all();
+                continue;
+            }
             fail(std::string(peer_name(index)) + ": " + exception.what());
         }
     }
 }
+
 
 void crossthink_session::worker(size_t index) {
     if (options.telepathy) { telepathy_worker(index); return; }
@@ -992,7 +873,7 @@ void crossthink_session::worker(size_t index) {
             lock.lock();
             peer.active = false;
             changed.notify_all();
-            if (stopping || epoch != generation_epoch || mode == "error") {
+            if (stopping || generation_id(index) != generation_epoch || mode == "error") {
                 continue;
             }
             if (!failure.empty()) {
@@ -1053,13 +934,11 @@ void crossthink_session::control() {
     std::unique_lock<std::mutex> lock(mutex);
     while (!stopping) {
         changed.wait(lock, [&] { return stopping || busy; });
-        if (stopping) {
-            break;
-        }
-        changed.wait(lock, [&] { return stopping || (!peers[0].active && !peers[1].active); });
-        if (stopping) {
-            break;
-        }
+        if (stopping) { break; }
+        changed.wait(lock, [&] {
+            return stopping || (pending.target < 0 ? !peers[0].active && !peers[1].active : !peers[pending.target].active);
+        });
+        if (stopping) { break; }
         if ((options.telepathy || options.paragraph_splice) && mode == "error" && pending.action != "reset") {
             busy = false;
             pending = {};
@@ -1068,9 +947,8 @@ void crossthink_session::control() {
         }
         const auto command = pending;
         lock.unlock();
-        try {
-            apply(command);
-        } catch (const std::exception & exception) {
+        try { apply(command); }
+        catch (const std::exception & exception) {
             std::lock_guard<std::mutex> error_lock(mutex);
             fail(exception.what());
         }
@@ -1086,55 +964,57 @@ void crossthink_session::apply(const pending_command & command) {
     std::array<std::vector<llama_token>, 2> prepared;
     const bool reset = command.action == "reset";
     const bool message = command.action == "message" || (reset && !command.text.empty());
+    const auto targeted = [&](size_t index) { return command.target < 0 || command.target == static_cast<int>(index); };
     if (message) {
         for (size_t index = 0; index < peers.size(); ++index) {
+            if (!targeted(index)) { continue; }
             auto & peer = peers[index];
-            prepared[index] = reset || peer.tape.empty()
-                ? peer.transport->initial_prompt(command.text)
-                : peer.transport->next_user(command.text);
+            prepared[index] = reset || peer.tape.empty() ? peer.transport->initial_prompt(command.text) : peer.transport->next_user(command.text);
             const uint64_t retained = reset ? 0 : peer.tape.size() + peer.inbox.size() + (peer.thinking_open ? 1 : 0);
-            const uint64_t reserve = (options.telepathy ? std::max(options.link_quantum, options.private_quantum) + 128 :
-                (options.paragraph_splice ? 2 : 5) * options.chunk_tokens) + options.answer_tokens + 2 +
-                (native_tools(peer) ? std::max(options.tool_tokens, options.answer_tokens) : 0);
+            const uint64_t reserve = (options.telepathy ? 256 : (options.paragraph_splice ? 2 : 5) * options.chunk_tokens) +
+                options.answer_tokens + 2 + (native_tools(peer) ? std::max(options.tool_tokens, options.answer_tokens) : 0);
             if (prepared[index].empty() || retained + prepared[index].size() + reserve >= peer.context_size) {
                 throw std::runtime_error(std::string(peer_name(index)) + ": message does not fit with the reasoning/answer reserve; reset or use smaller budgets");
             }
         }
     }
     std::lock_guard<std::mutex> lock(mutex);
-    if (stopping) {
-        return;
-    }
+    if (stopping || (!reset && mode == "error")) { return; }
     error.clear();
     if (reset) {
         for (auto & peer : peers) {
             peer.tape.clear();
             peer.inbox.clear();
             peer.generated = 0;
+            peer.thinking_tokens = 0;
             peer.imported = 0;
             peer.sequence = 0;
             peer.thinking_open = false;
             peer.answer_done = false;
             peer.segment_done = false;
             peer.private_pending = false;
+            peer.force_answer = false;
+            peer.thought_scanner = {};
             peer.boundary.clear();
             peer.forced_splices = 0;
             peer.tool_calls = 0;
             peer.tool_rounds = 0;
             peer.tool_status.clear();
+            peer.thought_turn = 0;
+            peer.thought_text.clear();
+            peer.thought_tokens.clear();
+            peer.thought_visible_tokens = 0;
+            peer.peek_turn = 0;
+            peer.peek_tokens = peer.peek_bytes = 0;
+            peer.mailbox.clear();
+            peer.mailbox_bytes = 0;
+            peer.samples.clear();
+            peer.sampling_started = std::chrono::steady_clock::now();
         }
         round = 0;
         exchanges = 0;
+        next_message_id = 1;
         answer_requested = false;
-        link_enabled = false;
-        link_pending = false;
-        link_requested = false;
-        link_requester = -1;
-        link_speaker = -1;
-        link_next = 0;
-        private_owner = -1;
-        clear_link_wait();
-        clear_link_speech();
         mode = "idle";
         emit({{"type", "reset"}});
     }
@@ -1142,64 +1022,46 @@ void crossthink_session::apply(const pending_command & command) {
         answer_requested = false;
         ++round;
         for (size_t index = 0; index < peers.size(); ++index) {
+            if (!targeted(index)) { continue; }
             auto & peer = peers[index];
             drain(peer);
-            if (peer.thinking_open) {
-                peer.tape.push_back(peer.close_token);
-            }
+            if (peer.thinking_open) { peer.tape.push_back(peer.close_token); }
+            // next_user supplies EOG even if cancellation left a completed native tail on the tape.
+            if (!peer.tape.empty() && contains(peer.eog, peer.tape.back())) { peer.tape.pop_back(); }
             peer.tape.insert(peer.tape.end(), prepared[index].begin(), prepared[index].end());
             peer.thinking_open = true;
             peer.answer_done = false;
             peer.segment_done = false;
             peer.tool_rounds = 0;
             peer.private_pending = false;
+            peer.force_answer = false;
+            peer.tool_status.clear();
+            if (options.telepathy) { begin_thought(peer); }
         }
-        if (options.telepathy) { private_owner = -1; }
-        emit({{"type", "user"}, {"text", command.text}});
+        emit({{"type", "user"}, {"text", command.text}, {"target", command.target < 0 ? "both" : peer_name(command.target)}});
         mode = "thinking";
-        if (options.telepathy) {
-            clear_link_wait();
-            clear_link_speech();
-            link_speaker = -1;
-            link_next = 0;
-            if (link_enabled) { append_shared(link_markers[1]); }
-            apply_link();
-        }
     } else if (command.action == "answer") {
-        if (options.telepathy) { answer_requested = true; finish_link("answers requested"); }
+        if (options.telepathy) { answer_requested = true; }
         for (auto & peer : peers) {
-            if (peer.answer_done) { continue; }
+            if (peer.answer_done || peer.tape.empty()) { continue; }
             drain(peer);
-            if (peer.tape.size() + (native_tools(peer) ? std::max(options.tool_tokens, options.answer_tokens)
-                    : options.answer_tokens) + 2 >= peer.context_size) {
+            if (peer.tape.size() + (native_tools(peer) ? std::max(options.tool_tokens, options.answer_tokens) : options.answer_tokens) + 2 >= peer.context_size) {
                 throw std::runtime_error("context full for answers; reset or use a smaller answer budget");
             }
         }
         for (auto & peer : peers) {
-            if (peer.answer_done) { continue; }
-            if (peer.thinking_open) {
-                peer.tape.push_back(peer.close_token);
-                peer.thinking_open = false;
-            }
-            peer.answer_done = false;
+            if (peer.answer_done || peer.tape.empty()) { continue; }
+            if (peer.thinking_open) { peer.tape.push_back(peer.close_token); peer.thinking_open = false; }
+            peer.force_answer = true;
+            peer.thought_scanner = {};
             peer.segment_done = false;
         }
-        mode = peers[0].answer_done && peers[1].answer_done ? "answered" : "answering";
-    } else if (command.action == "link_on" || command.action == "link_off") {
-        // A final answer can arrive after command() validates the request but
-        // before this quiescent boundary. Reject that late enable nonfatally.
-        if (command.action == "link_on" && (peers[0].answer_done || peers[1].answer_done)) {
-            emit({{"type", "notice"}, {"message", "The linked stage ended before the link could be enabled."}});
-            mode = peers[0].answer_done && peers[1].answer_done ? "answered" : command.resume_mode;
-            return;
-        }
-        request_link(command.action == "link_on", -1);
-        apply_link();
-        mode = peers[0].answer_done && peers[1].answer_done ? "answered" : command.resume_mode;
+        mode = (peers[0].answer_done || peers[0].tape.empty()) && (peers[1].answer_done || peers[1].tape.empty()) ? "answered" : "answering";
     } else if (command.action == "resume") {
         rendezvous();
         mode = (options.telepathy ? answer_requested : peers[0].answer_done || peers[1].answer_done) ? "answering" : "thinking";
-    } else if (command.action == "pause" && peers[0].answer_done && peers[1].answer_done) {
+    } else if (command.action == "pause" &&
+            (peers[0].answer_done || peers[0].tape.empty()) && (peers[1].answer_done || peers[1].tape.empty())) {
         mode = "answered";
     }
 }

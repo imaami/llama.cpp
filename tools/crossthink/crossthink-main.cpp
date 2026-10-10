@@ -141,17 +141,17 @@ static bool parse(int argc, char ** argv, options & opts) {
             }
             case 'h':
                 std::cout << "Usage: " << argv[0] << " -a SOCKET -b SOCKET [options]\n"
-                    "Two agents with an optional shared reasoning channel and browser console.\n\n"
+                    "Two parallel agents with reasoning-only thought commands and a browser console.\n\n"
                     "  -a, --socket-a PATH       First llama-server socket\n"
                     "  -b, --socket-b PATH       Second llama-server socket\n"
                     "  -p, --prompt TEXT         Start thinking immediately (default: wait for browser)\n"
                     "  -f, --file PATH           Read initial prompt (- for stdin)\n"
                     "      --host HOST           Console address (default: 127.0.0.1)\n"
                     "      --port PORT           Console port (default: 8090)\n"
-                    "      --link-quantum N      Shared reasoning quantum, 1..4096 tokens (default: 64)\n"
-                    "      --private-quantum N   Private reasoning quantum, 1..4096 tokens (default: 256)\n"
-                    "      --link-wait-tokens N   Maximum voluntary yield, 1..65536 tokens (default: 512)\n"
-                    "      --legacy-splice       Restore covert reasoning exchange (default: explicit link)\n"
+                    "      --link-quantum N      Deprecated compatibility option (ignored)\n"
+                    "      --private-quantum N   Deprecated compatibility option (ignored)\n"
+                    "      --link-wait-tokens N   Deprecated compatibility option (ignored)\n"
+                    "      --legacy-splice       Restore covert exchange (default: parallel thought commands)\n"
                     "      --splice-mode MODE    Legacy paragraph rendezvous or fixed intervals (default: paragraph)\n"
                     "      --max-segment-tokens N Legacy segment ceiling, 1..4096 (default: 512)\n"
                     "      --chunk-tokens N      Alias for --max-segment-tokens\n"
@@ -216,7 +216,7 @@ static void routes(httplib::Server & http, crossthink_session & session) {
         response.set_header("Cache-Control", "no-store");
         response.set_content(session.state().dump(), "application/json");
     });
-    for (const std::string action : {"message", "pause", "resume", "answer", "reset", "link_on", "link_off"}) {
+    for (const std::string action : {"message", "pause", "resume", "answer", "reset"}) {
         http.Post("/" + action, [&, action](const httplib::Request & request, httplib::Response & response) {
             try {
                 const auto type = request.get_header_value("Content-Type");
@@ -227,7 +227,7 @@ static void routes(httplib::Server & http, crossthink_session & session) {
                 if (!body.is_object()) {
                     throw std::invalid_argument("expected a JSON object");
                 }
-                session.command(action, body.value("text", std::string()));
+                session.command(action, body.value("text", std::string()), body.value("target", std::string("both")));
                 response.status = 202;
                 response.set_content("{\"ok\":true}", "application/json");
             } catch (const std::exception & error) {

@@ -1,14 +1,14 @@
-# Crossthink with a telepathic link
+# Crossthink with parallel thought commands
 
-`llama-crossthink` runs two agents that can choose to share a labeled reasoning channel. Both receive a built-in `think_with_telepathic_link` tool; either can enable or disable the link. It starts off, with private reasoning. While linked, both see the same ordered stream of contributions, including explicit speaker and interruption labels. Tool calls, tool results, and final answers stay separate. A browser console shows the shared channel and the agents' private activity, and provides messages, link controls, pause/resume, answers, and reset.
+`llama-crossthink` runs two independent agents in parallel. Each agent can read its partner's reasoning, send it a message, and collect incoming messages by emitting short commands inside its own reasoning. Nothing is injected unsolicited, and neither agent has to enable a shared channel. The browser console shows separate reasoning and answers, plus a messaging view for sent and collected thoughts.
 
-The earlier covert paragraph/fixed exchange remains available with `--legacy-splice` for comparisons. This is a native C++ tool using the repository's HTTP/JSON dependencies.
+The earlier covert paragraph/fixed exchange remains available with `--legacy-splice` for comparisons. The former serialized `think_with_telepathic_link` mode has been replaced by thought commands. This is a native C++ coordinator using the repository's HTTP/JSON dependencies.
 
 The server's new `--socket PATH` adds a Unix HTTP listener while keeping `--host` and `--port` available for the ordinary web UI and API. `LLAMA_ARG_SOCKET` is the corresponding environment variable. Paths need not end in `.sock`; the old `--host *.sock` convention still works. The Unix listener uses plain HTTP even when TCP uses TLS. On clean shutdown, the server removes only the filesystem socket it bound, if its inode still matches; an existing path is never removed at startup.
 
 ## Build and launch
 
-From the `reasoning-swap` branch, retain your working Vulkan build configuration:
+Rebuild **both `llama-server` and `llama-crossthink`** from the `reasoning-swap` branch; the server needs the new `thought_commands` capability. Retain your working Vulkan build configuration:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
@@ -33,47 +33,83 @@ Once both servers are ready:
 build/bin/llama-crossthink \
     --socket-a /tmp/crossthink.XXXXXXXX/a.sock \
     --socket-b /tmp/crossthink.XXXXXXXX/b.sock \
-    --port 8090 --link-quantum 64 --private-quantum 256 --link-wait-tokens 512 \
-    --answer-tokens 1024
+    --port 8090 --answer-tokens 1024
 ```
 
 Open **http://127.0.0.1:8090/** and send a message to start. Alternatively supply `--prompt 'Your question'` or `--file prompt.txt` (`--file -` reads stdin). `--seed` defaults to 42 and `--temperature` to 1.0. If the model servers require the same bearer key, pass `--api-key KEY` to the coordinator. The console defaults to loopback and has no authentication of its own.
 
-The ordinary model web UIs remain at **http://127.0.0.1:8080/** and **http://127.0.0.1:8081/**. Those chats are separate from the coordinated conversation; use port 8090 to address the pair. Other requests can displace a server's prompt cache or delay crossthink. Each segment resubmits the authoritative token sequence, so cache displacement does not silently change the conversation.
+The ordinary model web UIs remain at **http://127.0.0.1:8080/** and **http://127.0.0.1:8081/**. Those chats are separate from the coordinated conversation; use port 8090 to address the pair. Other requests can displace a server's prompt cache or delay crossthink. Each continuation resubmits the authoritative token sequence, so cache displacement does not silently change the conversation.
 
-## Thinking with the link
+## Commands inside reasoning
 
-Both agents receive their own identity and the built-in tool schema through the native chat template. The tool is available without `--mcp-config`. Its arguments are:
+Both agents receive a default system prompt explaining their identity (A or B), their partner, and these three commands. They are available without an MCP configuration, native tool-call syntax, or an activation step. The model emits the literal command while its `<think>` block is open:
 
-```json
-{
-  "enabled": true,
-  "yield_until": "paragraph"
-}
+| Command | Effect |
+| --- | --- |
+| `<ct:peek/>` | Read the partner's latest reasoning up to the instant the command is handled. |
+| `<ct:send>message</ct:send>` | Queue the enclosed text in the partner's inbox. |
+| `<ct:inbox/>` | Collect messages waiting in the caller's inbox. |
+
+These commands only execute during reasoning. They are ordinary text in a final answer, native tool call, or tool result. The exact lowercase syntax matters. Emit one command at a time, outside quotes or code fences, and wait for its marked result before continuing. A thought command does not close `</think>` or start a native assistant/tool turn. For example, an agent can reason as follows:
+
+```text
+I should check whether B already found the missing assumption. <ct:peek/>
 ```
 
-`enabled` is required and controls the link for both agents. Set it to `false` to return to private reasoning. `yield_until` is optional: `fragment`, `sentence`, or `paragraph` lets the other agent continue to that boundary before the caller takes another turn. Calling with `enabled: true` while already linked can therefore yield the floor without changing the link state. Without a voluntary yield, the coordinator alternates short speaking quanta. A yield has a token ceiling, so a model that never completes a paragraph cannot monopolize the channel indefinitely.
+The coordinator appends the requested result to that agent's open reasoning, inside explicit markers, then the agent continues thinking. Only complete generated commands trigger an action; input prompts and imported thought text do not execute commands.
 
-Every linked contribution carries a coordinator-supplied speaker label in both models' contexts and in the shared console. A speaker change before a sentence or paragraph boundary is marked as an interruption. The other agent can then continue the same thought, challenge it, or introduce another one. Labels identify the actual source regardless of what names occur in generated prose. During linked reasoning, an eager sampling grammar reserves line-leading `[A` and `[B` prefixes for the coordinator, so a model cannot autocomplete another speaker label. The constraint follows partial prefixes across requests from the same speaker. Inline brackets remain available for ordinary reasoning. Native tool turns, private reasoning, and final answers do not use this constraint.
+### Reading thoughts
 
-Sharing uses short, serialized completion requests. Only one agent contributes at a time, and its committed token IDs enter both histories before the other generates. This gives both agents the same causal order: concurrent requests would each sample from a stale view of what the other is saying. Their complete histories still differ because identities, private reasoning, and tools are private. The shared subsequence is identical; this is not a shared KV cache.
+The first `<ct:peek/>` in a partner's current or most recent reasoning receives that reasoning from its beginning. Further peeks continue from the previous cut, returning only newly available text. When the partner begins another reasoning turn, the next peek starts at the beginning of that new turn. A new user turn or a continuation after a native tool result starts a new reasoning capture. If no text has appeared since the last peek, the result is an empty capture with a zero byte count.
 
-The default shared quantum is 64 tokens; a sentence or paragraph boundary with model-generated text can end the speaking turn earlier. Tokens stream to the browser as the server commits them, and the next speaker gets them when that quantum ends. A quantum can extend to finish an incomplete UTF-8 character. It does not wait for a paragraph. Fragments containing only whitespace, ASCII punctuation, or common Unicode dashes/bullets keep the same speaker instead of inserting another label and handing over an empty turn. After 64 generated tokens without substantive speech, the session pauses with an explicit error. No generated text or token IDs are silently removed. A voluntary yield still has its configured token ceiling. Reducing the quantum makes interruptions more immediate but adds more completion requests, label tokens, and prompt/cache work; increasing it gives longer uninterrupted turns. Speech remains interleaved, not simultaneous, and there is no claim of improved throughput or accuracy.
+A snapshot contains committed reasoning exactly as it stood when captured, up to the latest complete UTF-8 character. It can end mid-sentence or mid-word: the reader does not wait for a paragraph, sentence, or the partner's final answer. The capture contains only the partner's own generated reasoning, including any literal thought commands it wrote. Imported captures, inbox results, native tool calls/results, and final answers are excluded, so reading thoughts does not recursively copy earlier imports. Opening and closing markers distinguish the captured content from the reader's own thoughts. Peeking is passive; the partner keeps generating and does not need to approve it. Captures appear only in the receiver's reasoning panel, not in the messaging view.
+
+A result uses this structure; `turn`, `offset`, and `bytes` identify the source turn and byte range, and `active` reports whether that reasoning is still open:
+
+```text
+<ct:result command="peek">
+<ct:thought source="B" turn="1" offset="0" bytes="..." active="true">verbatim captured text</ct:thought>
+</ct:result>
+```
+
+The payload stays contiguous and unescaped. The byte count distinguishes payload text from the coordinator's closing marker even if the captured reasoning itself contains marker-like text. A capture that cannot fit is reported as an error; its read cursor does not advance.
+
+### Sending and collecting thoughts
+
+`<ct:send>...</ct:send>` queues a deliberate message for the other agent. It does not interrupt the recipient or insert anything into its live reasoning. Keep each message below 16 KiB. The sender receives an acknowledgment and continues. The recipient uses `<ct:inbox/>` to receive the queued messages together, with source markers, inside its own reasoning. Each delivered message uses a `<ct:message id="..." from="B" bytes="...">...</ct:message>` wrapper inside the inbox result. Reading an empty inbox also returns immediately. A mailbox holds at most 256 messages and 1 MiB of message text. A full mailbox or a result that cannot fit in the caller's remaining context produces an explicit error. Only successfully delivered inbox messages are removed; arrivals after the collection snapshot remain queued. The messaging view shows sent messages and their collection status so you can distinguish queued communication from text the recipient has actually received.
+
+The system prompt explains that reasoning commands are part of this experiment, despite the usual separation between reasoning and native tool calls. It encourages concise messages and checking for new information when useful. The agents still decide when to peek, send, collect, call MCP tools, and answer.
+
+### Parallel execution
+
+Both agents normally have a long-running, streaming completion in flight at the same time. There is no speaker token, rendezvous, shared-floor lock, periodic quantum cut, or automatic import in this mode. A thought command briefly ends **only the caller's** completion at the command boundary. The coordinator appends the result to its token history and starts a cached continuation of the same open reasoning block. The partner continues generating throughout.
+
+This is append-and-resume through the existing completion API, not in-place insertion into an actively decoding server slot. Command continuations still incur HTTP, prompt-suffix evaluation, and sampler setup work. Their cost depends on the amount of imported text and prompt-cache reuse. Independent requests allow both GPUs to work concurrently; this does not guarantee a throughput or reasoning-quality improvement.
+
+A model can close its reasoning naturally to call an MCP tool or answer. Its partner continues independently, including while that native tool call runs. Each model's final answer appears in its own panel. **Answer now** asks both to finish.
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `--link-quantum N` | `64` | Shared reasoning request quantum, `1..4096` generated tokens. A character may require a small extension. |
-| `--private-quantum N` | `256` | Private reasoning request quantum, `1..4096` generated tokens; independent of shared handoffs. |
-| `--link-wait-tokens N` | `512` | Voluntary yield ceiling, `1..65536` generated tokens, with up to eight extra tokens allowed to finish a UTF-8 character. |
-| `--max-segment-tokens N` | `512` | Legacy exchange ceiling, `1..4096`; does not change explicit telepathy quanta. |
 | `--answer-tokens N` | `1024` | Final answer budget, `1..65536`. |
-| `--legacy-splice` | Off | Restore the earlier covert exchange and omit the built-in link tool. |
+| `--link-quantum N` | Compatibility only | Accepted but ignored; thought commands have no shared generation quantum. |
+| `--private-quantum N` | Compatibility only | Accepted but ignored; independent reasoning no longer restarts periodically. |
+| `--link-wait-tokens N` | Compatibility only | Accepted but ignored; no shared floor or voluntary yield exists. |
+| `--max-segment-tokens N` | `512` | Legacy exchange ceiling, `1..4096`; does not limit thought-command reasoning. |
+| `--legacy-splice` | Off | Restore the earlier covert exchange; thought commands are unavailable. |
 
-With the link off, both agents use independent private requests of up to 256 tokens by default. Private requests do not stop at sentence boundaries; a paragraph or native reasoning closure can still end them earlier. This reduces repeated prompt evaluation and sampler setup. Output still streams token by token. Larger private quanta can delay manual controls or a pending link change until the current safe boundary.
+Old launch commands can retain the compatibility flags, but removing them makes the active configuration clearer. Start a new session after upgrading; earlier label-filled or shared-channel contexts describe a different protocol.
 
-A model can close its reasoning naturally to call a tool or answer. When one gives its final answer, the shared link ends. Its partner continues reasoning privately until its own answer; it is not forced to answer prematurely. The console keeps the answers in separate panels. **Answer now** explicitly asks both to finish instead.
+## Browser console
 
-The link begins off after reset. To encourage deliberate collaboration, ask, for example: "Use the telepathic link to discuss competing approaches. Yield until the other finishes a paragraph when useful, and answer separately when ready." Models can still decide not to enable the link; the console's **Enable link** and **Disable link** controls let you change it directly.
+Open the coordinator's port, normally **http://127.0.0.1:8090/**. The composer targets **Both**, **A**, or **B**. The individual panes show each agent's reasoning, imported thought captures, answer, and native tool activity. The third pane uses alternating message bubbles for deliberate messages between the agents; it is no longer a line-by-line shared reasoning transcript.
+
+**Follow** is an explicit checkbox. Scrolling up does not turn it off; disable it yourself to read older output without automatic following. Each output pane retains its own setting.
+
+Model output uses the upstream web UI's Markdown pipeline: GitHub-flavored Markdown, fenced code with syntax highlighting and raw copy, KaTeX math, Mermaid diagrams, and sandboxed HTML previews. This rendering applies to reasoning, answers, thought messages, and native tool activity. Rendered HTML and SVG are sanitized. Rendering assets are bundled with the console for offline use; there is no required CDN connection. These are presentation features: the model receives the original text, not the rendered HTML.
+
+Normal C++ builds use the checked-in generated UI header and do not require Node.js. To modify the UI sources, run `npm ci` followed by `npm run build` in `tools/crossthink/ui`, then rebuild `llama-crossthink`.
+
+Each agent has a generated-token count and a tokens-per-second meter over a rolling five-second window. Those per-agent counts include its generated reasoning, answers, and native tool-call text. The messaging pane shows A + B **reasoning** token totals and the sum of their reasoning rates. Counts accumulate until **New session**. Imported context tokens are reported separately and are not counted as newly generated tokens. The rates measure observed stream delivery over wall-clock time, including idle periods, rather than the model server's decode-only benchmark rate.
 
 ## MCP tools over HTTP
 
@@ -97,7 +133,7 @@ Create `mcp.json`, substituting the URLs of your running calculator and compiler
 }
 ```
 
-Remove `headers` if the endpoint needs no authentication. These example URLs do not start a service: the calculator/compiler tools must already be provided by external MCP servers. The telepathic link is built in and needs no MCP server. Calculator, compiler, and shell tools must come from the configured servers.
+Remove `headers` if the endpoint needs no authentication. These example URLs do not start a service: the calculator/compiler tools must already be provided by external MCP servers. The three thought commands are built in and need no MCP server. Calculator, compiler, and shell tools must come from the configured servers.
 
 ```bash
 build/bin/llama-crossthink \
@@ -107,34 +143,37 @@ build/bin/llama-crossthink \
     --mcp-timeout 60 --tool-turn-tokens 2048 --max-tool-rounds 8
 ```
 
-Both llama-server instances and the coordinator must be rebuilt for this update. Use `--jinja` on the model servers, as above. Tool calling uses the model's chat template and native output parser, including Qwen3.5's XML tool-call format; it does not rely on the model printing a separate crossthink command syntax. In legacy mode, MCP requires `--splice-mode paragraph`.
+Both llama-server instances and the coordinator must be rebuilt for this update. Use `--jinja` on the model servers, as above. MCP tool calling uses the model's chat template and native output parser, including Qwen3.5's XML tool-call format. These native tool calls are separate from the three reasoning-only thought commands. In legacy mode, MCP requires `--splice-mode paragraph`.
 
 | Option | Default | Behavior |
 | --- | --- | --- |
 | `--mcp-config FILE` | None | Read an `mcpServers` JSON object with HTTP/HTTPS `url` and optional string-valued `headers`. File size is limited to 1 MiB. |
 | `--mcp-timeout N` | `60` | HTTP timeout in seconds, `1..600`, for MCP requests. |
 | `--tool-turn-tokens N` | `2048` | Private native tool/answer turn budget, `1..16384`; the effective ceiling is the larger of this value and `--answer-tokens`. |
-| `--max-tool-rounds N` | `8` | Consecutive native tool round limit, `1..64`; a nonempty reasoning fragment resets the counter. In legacy mode, the paragraph rendezvous resets it. |
+| `--max-tool-rounds N` | `8` | Consecutive native tool round limit, `1..64`; generated reasoning resets the counter. In legacy mode, the paragraph rendezvous resets it. |
 
 This client supports MCP Streamable HTTP, including JSON and SSE responses to POST requests, session initialization, tool discovery, and tool calls. HTTPS requires a build with TLS support, normally `-DLLAMA_OPENSSL=ON`. The older HTTP+SSE transport, stdio commands, OAuth login, MCP resources/prompts, and server-initiated sampling are not supported. `--api-key` remains the bearer key for the model servers; MCP authentication is configured separately in each endpoint's `headers`.
 
 Configured tools are called automatically when either model requests them. Calls run with the permissions of the selected external MCP service. The console shows the number of available tools and each peer's call count/status; expand **Tool activity** to inspect arguments and results. A prompt such as "Use the calculator to check the arithmetic" or "Compile a small C program to verify this" can encourage a call, but the model decides whether to use a tool.
 
-Calls and their results stay in the calling model's conversation, with native assistant/tool roles. Shared speaking pauses during a private tool turn. When it completes, the agents can continue sharing reasoning about what they learned. Calls are never copied to the other agent or executed twice by the coordinator. Reset cancels current work and clears the displayed tool trace along with the conversation; it cannot undo effects of an external tool call that already ran.
+Calls and their results stay in the calling model's conversation, with native assistant/tool roles. The partner continues its own reasoning while a native tool turn runs. The caller can later send a summary or let the partner inspect its reasoning about the result. Native calls and tool results themselves are not copied to the other agent or executed twice by the coordinator. Reset cancels current work and clears the displayed tool trace along with the conversation; it cannot undo effects of an external tool call that already ran.
 
 ## Interaction and scheduling
 
 | Control | Behavior |
 | --- | --- |
-| Send message | Finish current work, close the current reasoning blocks, and append a real user turn to both histories. Both resume thinking. |
-| Enable / Disable link | Change the shared link after current work finishes; preserve whether the session was running or paused. Available in explicit telepathy mode. |
-| Pause / Resume | Pause after current work; retain histories and resume from them. |
-| Answer now | End sharing, close both reasoning blocks, and generate separate answers. A subsequent message starts the next thinking turn. |
-| New session | Cancel current requests, discard both histories, disable the link, and clear the displayed conversation. Late packets from the old session are ignored. |
+| Send to Both / A / B | Cancel the selected agents' current requests, append a real user turn to their histories, and resume their reasoning. A message to one agent leaves the other generating. |
+| Pause / Resume | Stop reasoning generation and retain histories; native tool/answer turns finish before pausing, so tool results are not lost or replayed. Resume continues from the retained histories. |
+| Answer now | Close both open reasoning blocks and generate separate answers. A subsequent message starts another thinking turn. |
+| New session | Cancel current requests, discard both histories, clear thought cursors and inboxes, and clear the displayed conversation. Late packets from the old session are ignored. |
 
-The HTTP control API mirrors these controls: `POST /message` with `{"text":"..."}`, and `POST /link_on`, `/link_off`, `/pause`, `/resume`, `/answer`, or `/reset` with `{}`. Requests use `Content-Type: application/json`. `GET /state` returns status and counters, including `telepathy`, `link_enabled`, `link_speaker`, and `link_wait`; `GET /events?after=ID` streams SSE trace events with resumable IDs. A `shared` event contains `peer` and `text`, with `label: true` for coordinator labels. Append that text as received to display the model-visible shared channel. Private `token` events and separate `answer` events must not be added to it. The console retains a bounded trace; reconnecting after old events expire produces an explicit gap notice.
+The HTTP control API mirrors these controls: `POST /message` with `{"text":"...","target":"both"}`, `"target":"A"`, or `"target":"B"`; an omitted target means both. `POST /pause`, `/resume`, `/answer`, or `/reset` accepts `{}`. Requests use `Content-Type: application/json`. The obsolete `/link_on` and `/link_off` controls are gone. `GET /state` returns status and counters; `GET /events?after=ID` streams SSE trace events with resumable IDs. The console retains a bounded trace; reconnecting after old events expire produces an explicit gap notice.
 
-Requests resubmit each agent's authoritative token sequence. Imported generated IDs are never retokenized or retransmitted; coordinator labels are tokenized separately and inserted into both histories. Each completion creates a fresh sampler with deterministic per-agent seeds, so results differ from one uninterrupted sampling call. Keep server-wide reverse prompts and other output constraints disabled. Near context capacity the session pauses and preserves room for final answers; it never silently deletes older context. Larger answer and tool budgets reserve more context.
+In the default mode, state reports `splice_mode: "independent"` and `thought_tools: 3`; `tools` counts only external native tools. Per-peer fields include `generated`, `imported`, `thinking_tokens`, `tokens_per_second`, `thinking_tokens_per_second`, `mailbox`, and `thought_turn`. Top-level `thinking_tokens` and rate fields sum both agents.
+
+A `thought_result` event contains the complete marked insertion for the named peer's reasoning display. A separate `thought_capture` event identifies the source and captured byte range; do not append it again or the display will duplicate the capture. A `thought_message` event has a stable `message_id`, `from`, `to`, `text`, and a status of `sent` or `received`. Update the matching message bubble when its status changes. Peeks never create message bubbles.
+
+Requests resubmit each agent's authoritative token sequence. Each resumed completion creates a fresh sampler with deterministic per-agent seeds, so results can differ from one uninterrupted sampling call. Keep server-wide reverse prompts and other output constraints disabled. Near context capacity, the affected agent uses its reserved space for a separate final answer while its partner continues. Legacy mode pauses the session at its context limit. Neither mode silently deletes older context. Larger answer and native tool budgets reserve more context.
 
 ## Legacy covert exchange
 
@@ -164,19 +203,17 @@ HTTP chunk boundaries are independent of envelope boundaries. The incremental de
 
 Binary completion requests may also set `"splice": {"sentence_after": 256}`. `n_predict` remains the hard segment ceiling. The server stops after a clean token boundary, and the terminal result adds `"splice_boundary": "paragraph"`, `"sentence"`, or `"limit"`. `stop_type` remains `"limit"`; use `splice_boundary` to distinguish a clean early stop from a forced cut. `/tokens/info` advertises `"splice": true`. Paragraph mode requires both servers to support this capability; rebuild both servers as well as the coordinator when upgrading.
 
-Explicit telepathy additionally requires the `"splice_quantum": true` capability. Set `splice.token_after` to a token count in `1..4096` to stop as soon as that count is reached and the output ends on a complete UTF-8 character. A clean paragraph or permitted sentence boundary can end the request earlier; otherwise the result reports `"splice_boundary": "quantum"`. `n_predict` remains the hard ceiling, and hitting it with an incomplete UTF-8 character produces an error. The coordinator reserves eight extra tokens for character completion and uses `sentence_after: 1` for telepathic quanta. Both servers and the coordinator must be rebuilt together.
+The earlier quantum extension remains available to binary API clients: `splice.token_after` in `1..4096` stops when that count is reached and the output ends on a complete UTF-8 character. A clean paragraph or permitted sentence boundary can stop earlier; otherwise the result reports `"splice_boundary": "quantum"`. `n_predict` remains the hard ceiling, and hitting it with an incomplete UTF-8 character produces an error. `/tokens/info` advertises `"splice_quantum": true`. The default parallel coordinator no longer uses quantum stops.
+
+Parallel thought commands require the new `"thought_commands": true` capability from `/tokens/info`. A request sets `"splice": {"thought_commands": true, "stop_on_think_close": true}` without a quantum or sentence threshold. Complete commands in newly generated reasoning end the caller's request with `"splice_boundary": "thought_command"`, `"thought_command": "peek"`, `"inbox"`, or `"send"`, and `"thought_payload"` for a send. `splice_reason` aliases the boundary. An oversized send body returns `thought_error`; the body limit is 16384 bytes, with a 32768-byte JSON-escaped limit to keep the binary response metadata bounded. In this mode, ordinary paragraph breaks do not stop generation.
+
+Stops occur at the token containing the command's closing marker. Tokens are indivisible: if that token also contains a suffix after the marker, the suffix stays in the raw history, before the inserted result. All committed token IDs remain intact. The optional bounded `thought_prefix` carries an incomplete, previously generated command across a pause or request limit; ordinary submitted prefixes and imported captures are not scanned for commands. Native reasoning closure remains `"splice_boundary": "tool"`. Rebuild both model servers and the coordinator when upgrading; an older server cannot support the new default mode.
 
 When native tools are enabled, `splice.stop_on_think_close` also stops at the single `</think>` token and reports `"splice_boundary": "tool"`. That token is retained in the calling model's raw tape. The coordinator then generates a private assistant tail through EOG. `/apply-template` accepts optional `parse_output` token IDs and returns a parsed `message` alongside its ordinary `prompt`, using the same native chat parser as chat completions. A terminal EOG is removed before parsing; tokens following EOG are rejected. `/tokens/info` advertises `"tool_parse": true` for this extension.
 
 ## Validation
 
-The `reasoning-swap` branch was rebased onto `imaami/llama.cpp`'s `bonsai` commit `5ada589b7811232c44d55dbf210329d98414fb4d`. All four preceding prototype commits replayed without conflicts or patch changes. Release CPU builds passed for `llama-server`, `llama-crossthink`, and the four test binaries below.
-
-Coordinator tests cover default-off private reasoning, built-in tool discovery without MCP, identical ordering of the shared transcript, speaker/interruption labels, enable/disable barriers, bounded fragment/sentence/paragraph yields, private MCP calls and results, and independent natural final answers. They also cover pause/reset cancellation, repeated deliberate yields, tool-loop limits, malformed completion records, and user controls racing with the last final answer. Whitespace, punctuation-only, and temporarily empty UTF-8 display fragments are tested separately from speech: empty turns do not alternate labels, and sustained output without speech pauses explicitly. The label constraint is tested across request boundaries, with ordinary inline brackets, Unicode text, and native reasoning closure. Earlier fixed/paragraph exchange tests remain enabled.
-
-The in-process binary endpoint tests passed with seeded tiny Qwen3.5 fixtures, both without speculation and with MTP enabled. They cover token framing, cached continuation, paragraph/sentence stops, UTF-8 completion across two-, three-, and four-byte characters, incomplete-character errors at the hard ceiling, boundary priority, cross-request separators, code fences and prefix resets, native reasoning closure, and tool output parsing. The random fixtures rejected every speculative draft, so these runs do not validate a splice inside an accepted multi-token batch.
-
-Native template tests passed for Qwen3.5 XML and Qwen JSON tool parsing, including boolean link arguments, identity preservation, and append-only result suffixes that reopen thinking. Fake HTTP MCP tests passed for initialization, sessions, JSON/SSE responses, pagination, protocol limits, cancellation, and ambiguous calls without retry. CLI bounds checks, extracted browser JavaScript syntax, and mocked DOM checks for the shared channel, controls, tool logs, separate answers, and reset also passed.
+The `reasoning-swap` branch is based on `imaami/llama.cpp`'s `bonsai` commit `5ada589b7811232c44d55dbf210329d98414fb4d`. Release CPU builds passed for llama-server and llama-crossthink. The coordinator suite passed 17 new independent-mode regressions plus the retained legacy tests, covering concurrent reasoning and MCP, incremental raw-token captures, opt-in inbox delivery, targeted user messages, independent answers, metrics, and pause/reset races. Binary route tests passed with MTP off and on, including split and resumed commands, inert imports, literal delimiters, bounded payloads, and cached continuation. Native chat-template and HTTP MCP suites also passed.
 
 Run the binaries from the repository root for the template files:
 
@@ -191,4 +228,6 @@ python3 tests/gen-tiny-qwen35-mtp.py --tool-tokens /tmp/tiny-qwen35-tools.gguf
 build/bin/test-server-token-wire /tmp/tiny-qwen35-mtp.gguf /tmp/tiny-qwen35-tools.gguf
 ```
 
-Unix-domain socket creation was denied (`EPERM`) in this build environment, so live coordinator-to-model HTTP integration could not be exercised. Live MCP services, TLS, and an actual browser session were not tested. No Bonsai weights or Radeon devices were available; dual-GPU behavior, accepted MTP batches, and conversational latency still need testing on your machine.
+Real Chromium tests passed against a mocked HTTP/SSE coordinator for formatting in every output pane, literal thought commands, sanitization, diagrams, stable streamed content, Follow behavior, targeted messages, inbox status, and rolling metrics. Desktop and mobile layouts were inspected. Run these checks with `npm test` in `tools/crossthink/ui` after installing its dependencies and Chromium.
+
+CPU fixtures do not establish Bonsai conversational behavior or dual-GPU throughput. The random MTP fixtures rejected their drafts, so accepted multi-token speculative batches remain unvalidated. Unix socket creation is denied in this test environment; live coordinator-to-model-server integration, real MCP services, TLS, and dual-GPU command latency still need verification on the intended setup.

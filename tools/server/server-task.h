@@ -11,6 +11,7 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 #include "server-splice.h"
+#include "server-thought.h"
 
 
 enum server_task_type {
@@ -59,6 +60,10 @@ struct task_params {
 
     int32_t splice_sentence_after = 0; // zero disables clean splice stopping
     int32_t splice_token_after = 0; // stop at this token count once UTF-8 is complete
+    bool splice_thought_commands = false;
+    server_thought_scanner splice_thought;
+    llama_token splice_think_open = LLAMA_TOKEN_NULL;
+    llama_token splice_thought_close = LLAMA_TOKEN_NULL;
     llama_token splice_think_close = LLAMA_TOKEN_NULL;
     server_splice_scanner splice_prompt;
 
@@ -380,6 +385,10 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
     std::string splice_boundary;
+    std::string thought_command;
+    std::string thought_payload;
+    std::string thought_error;
+    std::string thought_prefix;
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark">
+<title>llama.cpp crossthink</title><style>/* STYLE */</style></head>
+<body>
+<header><h1>llama.cpp <span style="font-weight:400;color:#aeb9cd">/ crossthink</span></h1><span id="connection" class="connection" role="status">Connecting...</span></header>
+<p class="muted" id="description">Two independent minds. Read thoughts, send a message, check the inbox.</p>
+<div class="toolbar"><div id="mode" class="mode"><span class="status-dot"></span><span id="mode-text">Loading...</span></div>
+<div class="actions"><button type="button" id="pause" disabled>Pause</button><button type="button" id="resume" disabled>Resume</button><button type="button" id="answer" disabled>Answer now</button><button type="button" id="reset" disabled>New session</button></div></div>
+<p id="tools-status" class="muted" role="status"></p>
+<div id="error" class="notice error" role="alert" hidden></div><div id="warning" class="notice" role="status" hidden></div>
+<main class="dashboard">
+<section class="peer peer-a" aria-label="Model A">
+ <div class="peer-header">
+  <h2>Model A</h2>
+  <div class="metrics"><strong id="count-A">0</strong><span>tokens</span><strong class="speed" id="speed-A">0.0</strong><span>tok/s</span></div>
+  <div class="stats" id="stats-A">Waiting for status</div>
+ </div>
+ <div class="panel-head"><h3>Reasoning</h3><div class="panel-actions"><button class="copy-all" data-copy="thought-A">Copy raw</button><label class="follow"><input id="follow-A" type="checkbox" checked>Follow</label></div></div>
+ <div class="clipped" id="clipped-A" hidden>Older displayed text was trimmed. Model context is unchanged.</div>
+ <div id="thought-A" class="output thought empty" data-empty="Send a message to begin."></div>
+ <div class="answer-wrap">
+  <div class="panel-head"><h3>Answer</h3><div class="panel-actions"><button class="copy-all" data-copy="answer-A">Copy raw</button><label class="follow"><input id="follow-answer-A" type="checkbox" checked>Follow</label></div></div>
+  <div id="answer-A" class="output answer empty" data-empty="Answers appear when this model finishes or you choose Answer now."></div>
+ </div>
+ <details class="tools-wrap"><summary>Tool activity <span id="tool-status-A">No calls</span></summary>
+  <div class="panel-head"><button class="copy-all" data-copy="tools-A">Copy raw</button><label class="follow"><input id="follow-tools-A" type="checkbox" checked>Follow</label></div>
+  <div id="tools-clipped-A" class="clipped" hidden>Older displayed tool activity was trimmed.</div>
+  <div id="tools-A" class="output tools empty" data-empty="External tool calls and results appear here."></div>
+ </details>
+</section>
+<section class="peer peer-b" aria-label="Model B">
+ <div class="peer-header">
+  <h2>Model B</h2>
+  <div class="metrics"><strong id="count-B">0</strong><span>tokens</span><strong class="speed" id="speed-B">0.0</strong><span>tok/s</span></div>
+  <div class="stats" id="stats-B">Waiting for status</div>
+ </div>
+ <div class="panel-head"><h3>Reasoning</h3><div class="panel-actions"><button class="copy-all" data-copy="thought-B">Copy raw</button><label class="follow"><input id="follow-B" type="checkbox" checked>Follow</label></div></div>
+ <div class="clipped" id="clipped-B" hidden>Older displayed text was trimmed. Model context is unchanged.</div>
+ <div id="thought-B" class="output thought empty" data-empty="Send a message to begin."></div>
+ <div class="answer-wrap">
+  <div class="panel-head"><h3>Answer</h3><div class="panel-actions"><button class="copy-all" data-copy="answer-B">Copy raw</button><label class="follow"><input id="follow-answer-B" type="checkbox" checked>Follow</label></div></div>
+  <div id="answer-B" class="output answer empty" data-empty="Answers appear when this model finishes or you choose Answer now."></div>
+ </div>
+ <details class="tools-wrap"><summary>Tool activity <span id="tool-status-B">No calls</span></summary>
+  <div class="panel-head"><button class="copy-all" data-copy="tools-B">Copy raw</button><label class="follow"><input id="follow-tools-B" type="checkbox" checked>Follow</label></div>
+  <div id="tools-clipped-B" class="clipped" hidden>Older displayed tool activity was trimmed.</div>
+  <div id="tools-B" class="output tools empty" data-empty="External tool calls and results appear here."></div>
+ </details>
+</section>
+<section class="peer mailbox" aria-label="Thought messages">
+ <div class="peer-header"><div class="panel-head" style="padding:0"><h2>Thought messages</h2><label class="follow"><input id="follow-messages" type="checkbox" checked>Follow</label></div>
+ <div class="metrics"><strong id="count-total">0</strong><span>A + B thought tokens</span><strong class="speed" id="speed-total">0.0</strong><span>tok/s</span></div>
+ <p class="muted">Messages wait until the other agent checks its inbox.</p>
+ </div>
+ <div id="thread" class="thread empty" data-empty="Thoughts can be sent without interrupting either agent. Their messages and delivery status appear here."></div>
+</section>
+</main>
+<div id="messages" class="messages" aria-label="Your messages"></div>
+<form id="message-form"><div class="send-label"><label for="message" class="muted">Message</label><select id="target" aria-label="Message recipient"><option value="both">Both agents</option><option value="A">Only Model A</option><option value="B">Only Model B</option></select></div>
+<textarea id="message" name="message" placeholder="Ask a question, add a constraint, or redirect the discussion." required></textarea>
+<div class="send-row"><span class="muted">Ctrl+Enter or Cmd+Enter sends. Follow stays on until you uncheck it.</span><button id="send" class="primary" type="submit" disabled>Send to both</button></div></form>
+<footer>Reasoning, answers and tool results support Markdown, code, math and diagrams. Copy raw preserves the original text. Token rates use a rolling five-second window; imported thoughts do not count as generated tokens. The ordinary llama-server interfaces are separate conversations.</footer>
+<script>/* SCRIPT */</script></body></html>
