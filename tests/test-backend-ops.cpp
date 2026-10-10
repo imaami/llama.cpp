@@ -11156,6 +11156,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, a, b, true, true));
     }
 
+    for (int64_t d_conv : {3, 9}) {
+        const std::array<int64_t, 4> a = {d_conv + 1, 65, 3, 1};
+        const std::array<int64_t, 4> b = {d_conv, 65, 1, 1};
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, a, b));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, a, b, false));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, a, b, true));
+    }
+
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 16, 8, 300, 2, false, /*K=*/1, /*weak_decay=*/true)); // d_state=96 SSD multi-chunk (partial 2nd chunk, 2 seqs)
