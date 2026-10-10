@@ -179,7 +179,7 @@ def compare(args):
             raise ValueError(f"{record['label']}: incomparable fields: {', '.join(changed)}")
     baseline_rate = statistics.median(sample["timings"]["predicted_per_second"] for sample in baseline["samples"])
     baseline_hashes = {sample["output_tokens_sha256"] for sample in baseline["samples"]}
-    print("label\tmedian tok/s\tmin..max\tchange\tacceptance\tmean len\toutput")
+    print("label\tmedian tok/s\tmin..max\tchange\tacceptance\tmean len\tms/verification\toutput")
     for record in records:
         samples = record["samples"]
         rates = [sample["timings"]["predicted_per_second"] for sample in samples]
@@ -191,10 +191,13 @@ def compare(args):
         output = "same" if len(hashes) == len(baseline_hashes) == 1 and hashes == baseline_hashes else "DIFFERS"
         acceptance = f"{accepted / drafted:.4f}" if drafted else "n/a"
         mean_len = f"{1 + accepted / steps:.3f}" if steps else "n/a"
-        print(f"{record['label']}\t{rate:.2f}\t{min(rates):.2f}..{max(rates):.2f}\t{100 * (rate / baseline_rate - 1):+.2f}%\t{acceptance}\t{mean_len}\t{output}")
+        round_times = [sample["timings"]["predicted_ms"] / sample["verification_steps"] for sample in samples if sample["verification_steps"] > 0]
+        round_time = f"{statistics.median(round_times):.3f}" if len(round_times) == len(samples) else "n/a"
+        print(f"{record['label']}\t{rate:.2f}\t{min(rates):.2f}..{max(rates):.2f}\t{100 * (rate / baseline_rate - 1):+.2f}%\t{acceptance}\t{mean_len}\t{round_time}\t{output}")
         if Path(record["server"].get("model_path") or "").name != Path(baseline["server"].get("model_path") or "").name:
             print(f"warning: {record['label']} has a different model filename; verify identical GGUF bytes", file=sys.stderr)
     print("Different output or acceptance means the decode workload changed; this alone does not isolate kernel performance.")
+    print("ms/verification includes drafting and all generation overhead; it is not GPU kernel time. Compare at the same draft limit and context.")
 
 
 def positive(value):
