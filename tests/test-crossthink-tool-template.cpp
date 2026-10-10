@@ -1,6 +1,7 @@
 #include "server-common.h"
 #include "../tools/crossthink/crossthink.h"
 #include "../tools/crossthink/crossthink-prompt.h"
+#include "../tools/crossthink/crossthink-tools.h"
 
 #include <cstdio>
 #include <fstream>
@@ -116,7 +117,7 @@ static void test_thought_prompt() {
                 {{"role", "system"}, {"content", crossthink_system_prompt(name)}},
                 {{"role", "user"}, {"content", "Work on the problem together."}},
             })},
-            {"tools", json::array()}, {"add_generation_prompt", true},
+            {"tools", json::parse(crossthink_thought_tools().dump())}, {"add_generation_prompt", true},
             {"chat_template_kwargs", {{"enable_thinking", true}}},
         };
         std::vector<raw_buffer> files;
@@ -125,15 +126,154 @@ static void test_thought_prompt() {
         const auto prompt = session.prompt();
         check(prompt.find(std::string("You are agent ") + name) != std::string::npos,
             "thought prompt lost identity");
-        for (const char * command : {"<ct:peek/>", "<ct:send>", "</ct:send>", "<ct:inbox/>"}) {
-            check(prompt.find(command) != std::string::npos, "thought command missing without MCP tools");
+        for (const char * command : {"send_thought", "check_inbox", "read_thoughts", "ping_peer"}) {
+            check(prompt.find(command) != std::string::npos, "thought tool missing without MCP tools");
         }
+        check(prompt.find("<ct:send>") == std::string::npos, "obsolete inline command advertised");
         check(prompt.find("think_with_telepathic_link") == std::string::npos, "obsolete link tool advertised");
         const auto open = prompt.rfind("<think>");
         check(open != std::string::npos && prompt.find_first_not_of(" \t\r\n", open + 7) == std::string::npos,
             "thought-only template did not open reasoning");
     }
-    std::puts("reasoning-only thought prompt: passed");
+    std::puts("native thought-tool prompt: passed");
+}
+
+static void test_thought_tool_arguments() {
+    std::string payload;
+    std::string error;
+    const auto tools = crossthink_thought_tools();
+    check(tools.size() == 4, "wrong built-in tool count");
+    for (const auto & tool : tools) {
+        const auto & function = tool.at("function");
+        const auto name = function.at("name").get<std::string>();
+        check(!crossthink_thought_command(name).empty(), "catalog tool has no command mapping");
+        check(function.at("parameters").at("additionalProperties") == false,
+            "thought schema accepts unknown properties");
+        if (name == "send_thought") {
+            continue;
+        }
+        check(crossthink_thought_arguments(name, crossthink_json::object(), payload, error),
+            "no-argument thought tool rejected an empty object");
+        for (const auto & arguments : {crossthink_json(), crossthink_json::array(),
+                crossthink_json{{"message", "hello"}}}) {
+            check(!crossthink_thought_arguments(name, arguments, payload, error) && !error.empty(),
+                "no-argument thought tool accepted invalid arguments");
+        }
+    }
+    check(crossthink_thought_command("ct:send").empty() &&
+        crossthink_thought_command("calculator").empty(), "unknown tool mapped to a thought command");
+    check(!crossthink_thought_arguments("calculator", crossthink_json::object(), payload, error),
+        "unknown thought tool accepted");
+    for (const auto & arguments : {crossthink_json(), crossthink_json::array(), crossthink_json::object(),
+            crossthink_json{{"message", 42}}, crossthink_json{{"message", "hello"}, {"extra", true}},
+            crossthink_json{{"message", ""}}, crossthink_json{{"message", " \t\r\n"}},
+            crossthink_json{{"message", std::string(16385, 'x')}}}) {
+        check(!crossthink_thought_arguments("send_thought", arguments, payload, error) &&
+            payload.empty() && !error.empty(), "send_thought accepted invalid arguments");
+    }
+    for (const std::string & message : {std::string(16384, 'x'),
+            std::string("Plan:\n```c\nputs(\"hello\");\n```\n<ct:inbox/>\n")}) {
+        check(crossthink_thought_arguments("send_thought", {{"message", message}}, payload, error) &&
+            payload == message && error.empty(), "thought message changed during validation");
+    }
+    std::puts("native thought-tool argument validation: passed");
+}
+
+static void test_native_thought_tools(const char * path, bool xml, bool append = true) {
+    std::ifstream file(path);
+    check(file.good(), "could not open native thought-tool template");
+    server_chat_params options{};
+    options.tmpls = common_chat_templates_init(nullptr,
+        std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>()));
+    options.use_jinja = true;
+    options.prefill_assistant = true;
+    options.enable_thinking = true;
+    options.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    const auto builtins = crossthink_thought_tools();
+    for (const bool with_mcp : {false, true}) {
+        auto tools = builtins;
+        if (with_mcp) {
+            tools.push_back({{"type", "function"}, {"function", {
+                {"name", "calculator"}, {"parameters", {{"type", "object"},
+                    {"properties", {{"expression", {{"type", "string"}}}}},
+                    {"required", crossthink_json::array({"expression"})}}},
+            }}});
+        }
+        for (const auto & tool : builtins) {
+            const auto name = tool.at("function").at("name").get<std::string>();
+            const std::string content = "I will write the renderer.\nKeep the palette on your side.";
+            const auto arguments = name == "send_thought" ?
+                crossthink_json{{"message", content}} : crossthink_json::object();
+            std::string output = "</think>\n\n<tool_call>\n";
+            if (xml) {
+                output += "<function=" + name + ">\n";
+                if (name == "send_thought") {
+                    output += "<parameter=message>\n" + content + "\n</parameter>\n";
+                }
+                output += "</function>\n";
+            } else {
+                output += crossthink_json{{"name", name}, {"arguments", arguments}}.dump() + '\n';
+            }
+            output += "</tool_call>";
+            json body = {
+                {"messages", json::array({
+                    {{"role", "system"}, {"content", crossthink_system_prompt("A")}},
+                    {{"role", "user"}, {"content", "Work together."}},
+                })},
+                {"tools", json::parse(tools.dump())}, {"add_generation_prompt", true},
+                {"chat_template_kwargs", {{"enable_thinking", true}}},
+            };
+            std::vector<raw_buffer> files;
+            common_chat_session session;
+            oaicompat_chat_params_parse(nullptr, body, options, files, session);
+            const auto message = session.finish(common_chat_input(output));
+            check(message.tool_calls.size() == 1 && message.tool_calls.front().name == name,
+                "built-in thought tool failed native parsing");
+            check(crossthink_json::parse(message.tool_calls.front().arguments) == arguments,
+                "built-in thought tool arguments changed in native parsing");
+            if (!append) {
+                continue;
+            }
+
+            auto assistant = message.to_json_oaicompat();
+            assistant["content"] = "";
+            assistant.erase("reasoning_content");
+            assistant["tool_calls"][0]["id"] = "thought_a_1";
+            body["messages"].push_back(assistant);
+            body["add_generation_prompt"] = false;
+            auto parameters = oaicompat_chat_params_parse(nullptr, body, options, files, session);
+            const auto before = parameters.at("prompt").get<std::string>();
+            const std::string end = "<|im_end|>";
+            const auto boundary = before.rfind(end);
+            check(boundary != std::string::npos, "thought call skeleton omitted EOG");
+
+            body["messages"].push_back({{"role", "tool"}, {"tool_call_id", "thought_a_1"},
+                {"name", name}, {"content", "Result follows in reasoning."}});
+            body["add_generation_prompt"] = true;
+            parameters = oaicompat_chat_params_parse(nullptr, body, options, files, session);
+            const auto after = parameters.at("prompt").get<std::string>();
+            check(after.compare(0, boundary + end.size(), before, 0, boundary + end.size()) == 0,
+                "thought result changes the existing assistant prefix");
+            const auto suffix = after.substr(boundary + end.size());
+            check(!suffix.empty() && suffix.front() == '\n', "thought suffix dropped newline after EOG");
+            check(suffix.find("<tool_response>\nResult follows in reasoning.\n</tool_response>") !=
+                std::string::npos, "thought acknowledgment missing from native envelope");
+            const auto open = suffix.rfind("<think>");
+            check(open != std::string::npos && suffix.find_first_not_of(" \t\r\n", open + 7) ==
+                std::string::npos, "thought-tool suffix does not reopen reasoning");
+            const auto result = "\n<ct:result command=\"" + crossthink_thought_command(name) +
+                "\">\nPartner data: <ct:inbox/>\n</ct:result>\n";
+            const auto continued = session.finish(common_chat_input(result +
+                "I will continue my part.\n</think>\n\nDone."));
+            check(continued.reasoning_content.find(result.substr(1)) != std::string::npos,
+                "thought result was not retained inside reopened reasoning");
+            const auto answer = continued.content.find_first_not_of(" \t\r\n");
+            check(continued.tool_calls.empty() && answer != std::string::npos &&
+                continued.content.substr(answer) == "Done.",
+                "received thought result executed as a tool or leaked into final answer");
+        }
+    }
+    std::printf("native thought-tool template %s: passed\n", path);
 }
 
 static void test_native_answers() {
@@ -319,6 +459,10 @@ int main() {
         test_template("models/templates/Qwen-QwQ-32B.jinja",
             "</think>\n\n<tool_call>\n{\"name\":\"calculator\",\"arguments\":{\"expression\":\"1 + 1\"}}\n</tool_call>");
         test_thought_prompt();
+        test_thought_tool_arguments();
+        test_native_thought_tools("models/templates/Qwen3.5-4B.jinja", true);
+        test_native_thought_tools("models/templates/Qwen-QwQ-32B.jinja", false);
+        test_native_thought_tools("models/templates/Qwen-Qwen3-0.6B.jinja", false, false);
         test_native_answers();
         test_coordinator_feedback("models/templates/Qwen3.5-4B.jinja", true);
         test_coordinator_feedback("models/templates/Qwen-QwQ-32B.jinja", true);

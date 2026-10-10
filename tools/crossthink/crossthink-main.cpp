@@ -44,7 +44,7 @@ static bool parse(int argc, char ** argv, options & opts) {
         OPT_HOST = 256, OPT_PORT, OPT_CHUNK, OPT_SPLICE_MODE, OPT_SENTENCE_AFTER,
         OPT_ANSWER, OPT_SEED, OPT_TEMPERATURE, OPT_KEY, OPT_MCP_CONFIG, OPT_MCP_TIMEOUT,
         OPT_TOOL_TOKENS, OPT_TOOL_ROUNDS, OPT_LEGACY_SPLICE, OPT_LINK_QUANTUM, OPT_LINK_WAIT, OPT_PRIVATE_QUANTUM,
-        OPT_PROTOCOL_RETRIES, OPT_STRICT_THOUGHT_PROTOCOL,
+        OPT_PROTOCOL_RETRIES, OPT_STRICT_THOUGHT_PROTOCOL, OPT_LEGACY_THOUGHT_COMMANDS,
     };
     const struct option names[] = {
         {"socket-a", required_argument, nullptr, 'a'},
@@ -71,6 +71,7 @@ static bool parse(int argc, char ** argv, options & opts) {
         {"max-tool-rounds", required_argument, nullptr, OPT_TOOL_ROUNDS},
         {"protocol-retries", required_argument, nullptr, OPT_PROTOCOL_RETRIES},
         {"strict-thought-protocol", no_argument, nullptr, OPT_STRICT_THOUGHT_PROTOCOL},
+        {"legacy-thought-commands", no_argument, nullptr, OPT_LEGACY_THOUGHT_COMMANDS},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
@@ -138,6 +139,7 @@ static bool parse(int argc, char ** argv, options & opts) {
                     static_cast<int32_t>(number(optarg, INT32_MAX));
                 break;
             case OPT_STRICT_THOUGHT_PROTOCOL: opts.session.strict_thought_protocol = true; break;
+            case OPT_LEGACY_THOUGHT_COMMANDS: opts.session.legacy_thought_commands = true; break;
             case OPT_TEMPERATURE: {
                 char * end = nullptr;
                 errno = 0;
@@ -149,7 +151,7 @@ static bool parse(int argc, char ** argv, options & opts) {
             }
             case 'h':
                 std::cout << "Usage: " << argv[0] << " -a SOCKET -b SOCKET [options]\n"
-                    "Two parallel agents with reasoning-only thought commands and a browser console.\n\n"
+                    "Two parallel agents with native thought tools and a browser console.\n\n"
                     "  -a, --socket-a PATH       First llama-server socket\n"
                     "  -b, --socket-b PATH       Second llama-server socket\n"
                     "  -p, --prompt TEXT         Start thinking immediately (default: wait for browser)\n"
@@ -174,7 +176,8 @@ static bool parse(int argc, char ** argv, options & opts) {
                     "                           Effective budget is max(N, --answer-tokens)\n"
                     "      --max-tool-rounds N   Consecutive tool round limit, 1..64 (default: 8)\n"
                     "      --protocol-retries N  Feedback retries per user message (-1: unlimited, default; 0: disabled)\n"
-                    "      --strict-thought-protocol  Disable repair of wrapped/final thought commands\n"
+                    "      --legacy-thought-commands  Restore obsolete inline reasoning commands\n"
+                    "      --strict-thought-protocol  Disable legacy wrapped/final command repair\n"
                     "  -h, --help                Show help\n";
                 return false;
             default: throw std::invalid_argument("unknown option; use --help");

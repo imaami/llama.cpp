@@ -99,6 +99,9 @@ select { padding: 7px 12px; border: 1px solid #4d596c; border-radius: 6px; backg
 .bubble-meta { color: #9aa9c0; font-size: 10px; padding: 3px 6px; display: flex; justify-content: space-between; gap: 14px; }
 .from-B .bubble-meta { text-align: right; }
 .bubble-state.received { color: #c3dfaa; }
+.attention-row { align-self: center; display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 10px; padding: 4px 8px; color: #aeb8ca; font-size: 11px; text-align: center; }
+.attention-status { color: #e7b77d; }
+.attention-row[data-status="delivered"] .attention-status { color: #c3dfaa; }
 .tool-record { border-bottom: 1px solid #343b48; padding: 9px 0; }
 .tool-label { color: #9eafd0; font: 11px ui-monospace, monospace; margin-bottom: 7px; overflow-wrap: anywhere; }
 .tool-body { font: 13px/1.55 system-ui, sans-serif; }

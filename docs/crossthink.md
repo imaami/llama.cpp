@@ -1,14 +1,14 @@
-# Crossthink with parallel thought commands
+# Crossthink with parallel thought tools
 
-`llama-crossthink` runs two independent agents in parallel. Each agent can read its partner's reasoning, send it a message, and collect incoming messages by emitting short commands inside its own reasoning. Nothing is injected unsolicited, and neither agent has to enable a shared channel. The browser console shows separate reasoning and answers, plus a messaging view for sent and collected thoughts.
+`llama-crossthink` runs two independent agents in parallel. Four built-in native tools let each agent send thought mail, collect its inbox, read its partner's reasoning, and request its attention. Tool requests use the model's normal tool-call format; their marked results appear inside the caller's next open reasoning block. Mail waits until collected. Only an explicit ping notifies the recipient. The browser console shows separate reasoning and answers, plus a messaging view for sent and collected thoughts.
 
-The earlier covert paragraph/fixed exchange remains available with `--legacy-splice` for comparisons. The former serialized `think_with_telepathic_link` mode has been replaced by thought commands. This is a native C++ coordinator using the repository's HTTP/JSON dependencies.
+The earlier covert paragraph/fixed exchange remains available with `--legacy-splice` for comparisons. `--legacy-thought-commands` additionally enables the former inline-command protocol in independent mode. The serialized `think_with_telepathic_link` mode is no longer used. This is a native C++ coordinator using the repository's HTTP/JSON dependencies.
 
 The server's new `--socket PATH` adds a Unix HTTP listener while keeping `--host` and `--port` available for the ordinary web UI and API. `LLAMA_ARG_SOCKET` is the corresponding environment variable. Paths need not end in `.sock`; the old `--host *.sock` convention still works. The Unix listener uses plain HTTP even when TCP uses TLS. On clean shutdown, the server removes only the filesystem socket it bound, if its inode still matches; an existing path is never removed at startup.
 
 ## Build and launch
 
-Rebuild **both `llama-server` and `llama-crossthink`** from the `reasoning-swap` branch; the server needs the `thought_commands` and `thought_command_lines` capabilities. Retain your working Vulkan build configuration:
+Build **both `llama-server` and `llama-crossthink`** from the `reasoning-swap` branch for the binary streaming, native parser, and reasoning-boundary extensions. Updating an installation that already has those server extensions requires rebuilding and restarting the coordinator; the legacy inline protocol additionally requires the server's `thought_commands` and `thought_command_lines` capabilities. Retain your working Vulkan build configuration:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
@@ -42,32 +42,28 @@ After an update, restart the rebuilt coordinator and reload any open console tab
 
 The ordinary model web UIs remain at **http://127.0.0.1:8080/** and **http://127.0.0.1:8081/**. Those chats are separate from the coordinated conversation; use port 8090 to address the pair. Other requests can displace a server's prompt cache or delay crossthink. Each continuation resubmits the authoritative token sequence, so cache displacement does not silently change the conversation.
 
-## Commands inside reasoning
+## Native thought tools
 
-Both agents receive a default system prompt explaining their identity (A or B), their partner, and these three commands. They are available without an MCP configuration, native tool-call syntax, or an activation step. The model emits the literal command while its `<think>` block is open:
+Both agents receive a default system prompt explaining their identity (A or B), their partner, and the four built-in tools. They require no MCP configuration or activation step. The same native tool catalog contains any configured external MCP tools; a collision with a built-in name is rejected at startup.
 
-| Command | Effect |
-| --- | --- |
-| `<ct:peek/>` | Read the partner's latest reasoning up to the instant the command is handled. |
-| `<ct:send>message</ct:send>` | Queue the enclosed text in the partner's inbox. |
-| `<ct:inbox/>` | Collect messages waiting in the caller's inbox. |
+| Tool | Arguments | Effect |
+| --- | --- | --- |
+| `send_thought` | `{"message":"Your update"}` | Queue the message in the partner's inbox without interrupting it. |
+| `check_inbox` | `{}` | Collect messages waiting in the caller's inbox immediately. |
+| `read_thoughts` | `{}` | Read the partner's current or most recent reasoning up to the instant the request is handled. |
+| `ping_peer` | `{}` | Send a fixed attention notice to the partner, carrying no message payload. |
 
-The normal command path executes during reasoning, with the opening tag at **column zero of a new line**, outside a fenced code block. The start of a reasoning turn also counts as a line start. Inline mentions, indented tags, bullet/quote-prefixed tags, and examples in backtick or tilde fences are inert. Commands in imported thoughts, user messages, and tool results never execute. The default compatibility path also accepts certain unambiguous command-only responses after reasoning has closed, as described below; `--strict-thought-protocol` disables that exception. The exact lowercase syntax matters. Emit one command at a time and wait for its marked result before continuing. A thought command does not close `</think>` or start a native assistant/tool turn. For example, an agent can reason as follows:
+The model closes its reasoning and makes a normal native tool call, using its chat template's usual wrappers. It does not write command tags into its reasoning. The coordinator supplies a minimal native tool response such as `Result follows in reasoning.`, opens the next reasoning block through the template, and inserts the actual result with explicit start/end markers. This gives the model the normal outgoing tool-call path while keeping received thoughts inside reasoning.
 
-```text
-I should check whether B already found the missing assumption.
-<ct:peek/>
-```
-
-The coordinator appends the requested result to that agent's open reasoning, inside explicit markers, then the agent continues thinking. Only complete generated commands trigger an action; input prompts and imported thought text do not execute commands.
+Plain text such as `<ct:send>...</ct:send>`, whether in reasoning, a final answer, or an imported result, is inert by default. Merely describing a tool call does not execute it. The model must emit a valid native call to a listed tool. A batch of calls is handled in its listed order; the coordinator does not ask the partner to pause or alternate turns.
 
 ### Reading thoughts
 
-The first `<ct:peek/>` in a partner's current or most recent reasoning receives that reasoning from its beginning. Further peeks continue from the previous cut, returning only newly available text. When the partner begins another reasoning turn, the next peek starts at the beginning of that new turn. A new user turn or a continuation after a native tool result starts a new reasoning capture. If no text has appeared since the last peek, the result is an empty capture with a zero byte count.
+The first `read_thoughts` call receives the partner's available reasoning from the beginning of its current task. Further reads continue from the previous cut, returning only newly available text. Native tool continuations preserve that capture and its read cursor; a real user message starts a new capture for its recipients. If no new text has appeared, the result is an empty capture with a zero byte count.
 
-A snapshot contains committed reasoning exactly as it stood when captured, up to the latest complete UTF-8 character. It can end mid-sentence or mid-word: the reader does not wait for a paragraph, sentence, or the partner's final answer. The capture contains only the partner's own generated reasoning, including any literal thought commands it wrote. Imported captures, inbox results, native tool calls/results, and final answers are excluded, so reading thoughts does not recursively copy earlier imports. Opening and closing markers distinguish the captured content from the reader's own thoughts. Peeking is passive; the partner keeps generating and does not need to approve it. Captures appear only in the receiver's reasoning panel, not in the messaging view.
+A snapshot contains committed reasoning exactly as it stood when captured, up to the latest complete UTF-8 character. It can end mid-sentence or mid-word: the reader does not wait for a paragraph, sentence, or the partner's final answer. The capture contains only the partner's own generated reasoning. Imported captures, inbox results, native tool calls/results, and final answers are excluded, so reading thoughts does not recursively copy earlier imports. Reading is passive; the partner keeps generating and does not need to approve it. Captures appear only in the receiver's reasoning panel, not in the messaging view.
 
-A result uses this structure; `turn`, `offset`, and `bytes` identify the source turn and byte range, and `active` reports whether that reasoning is still open:
+Results retain the existing internal marker names. `turn`, `offset`, and `bytes` identify the source capture and byte range, and `active` reports whether that reasoning is still open:
 
 ```text
 <ct:result command="peek">
@@ -75,36 +71,45 @@ A result uses this structure; `turn`, `offset`, and `bytes` identify the source 
 </ct:result>
 ```
 
-The payload stays contiguous and unescaped. The byte count distinguishes payload text from the coordinator's closing marker even if the captured reasoning itself contains marker-like text. A capture that cannot fit is reported as an error; its read cursor does not advance.
+These are coordinator-produced result markers, not commands for the model to generate. The payload stays contiguous and unescaped. The byte count distinguishes payload text from the closing marker even if the captured reasoning contains marker-like text. A capture that cannot fit is reported as an error; its read cursor does not advance.
 
 ### Sending and collecting thoughts
 
-`<ct:send>...</ct:send>` queues a deliberate message for the other agent. It does not interrupt the recipient or insert anything into its live reasoning. Keep each message below 16 KiB. The sender receives an acknowledgment and continues. The recipient uses `<ct:inbox/>` to receive the queued messages together, with source markers, inside its own reasoning. Each delivered message uses a `<ct:message id="..." from="B" bytes="...">...</ct:message>` wrapper inside the inbox result. Reading an empty inbox also returns immediately. A mailbox holds at most 256 messages and 1 MiB of message text. A full mailbox or a result that cannot fit in the caller's remaining context produces an explicit error. Only successfully delivered inbox messages are removed; arrivals after the collection snapshot remain queued. The messaging view shows sent messages and their collection status so you can distinguish queued communication from text the recipient has actually received.
+`send_thought` queues a deliberate message for the other agent. It does not interrupt the recipient, wake a finished agent, or insert anything into its live reasoning. Messages are limited to 16 KiB. The sender receives an acknowledgment and continues. `check_inbox` receives queued messages together, with source markers, inside the caller's reasoning. Each delivered message uses a `<ct:message id="..." from="B" bytes="...">...</ct:message>` wrapper inside the inbox result.
 
-The system prompt explains that reasoning commands are part of this experiment, despite the usual separation between reasoning and native tool calls. It asks each agent to send a brief planning message at the start of a new user task, then keep working without waiting for a reply. It encourages concise updates and inbox/peek checks at useful milestones, and explicitly says to continue after an empty inbox result. The prompt also discourages placeholder sends and repeated protocol debugging. These are instructions to the models; the coordinator does not manufacture commands or force communication. The agents still decide when to peek, send, collect, call MCP tools, and answer.
+An empty inbox returns immediately; there is no wait for the partner to reply. A mailbox holds at most 256 messages and 1 MiB of message text. A full mailbox or a result that cannot fit produces an explicit error. Only successfully delivered inbox messages are removed; arrivals after the collection snapshot remain queued. Inbox consumption and thought-read cursors commit when the result tokens enter reasoning, so a later failure in a mixed native/MCP batch cannot discard unread data. The messaging view shows both the sent message and its collection status.
 
-The names `ct:send`, `ct:peek`, and `ct:inbox` are not part of the external native tool catalog. Emit their literal reasoning syntax instead of a native wrapper. The compatibility path can normalize supported Qwen-style wrappers containing exactly one thought operation, but does not accept arbitrary native calls. A send has succeeded only when its coordinator acknowledgment appears. To request early contact, ask the model to make a send its first reasoning action.
+The system prompt asks each agent to send a brief planning message at the start of a new user task, then keep working without waiting for a reply. It encourages concise updates, inbox checks at useful milestones, and thought reads when useful. These are instructions to the models; the coordinator does not manufacture calls or force communication. A send succeeds only when its coordinator acknowledgment appears.
+
+### Requesting attention
+
+`ping_peer` sends a fixed, content-free attention notice. Put the actual plan or question in `send_thought`; ping only asks the recipient to attend to its partner. It does not drain the inbox or deliver the queued mail automatically.
+
+If the recipient is actively reasoning, the coordinator cancels only that reasoning completion, appends a marked attention notice inside its open reasoning, and resumes from its retained token history. Native answer/tool-call generation, MCP execution, and result preparation finish before a queued notice is delivered. The sender keeps working throughout. This is a one-shot notification, not a conversation barrier or a request for the recipient to yield control.
+
+Pending pings coalesce. A two-second cooldown suppresses repeated notifications without making either agent wait. A ping can wake a finished recipient with a fixed notification turn; its earlier answer remains visible. Paused sessions retain pending pings until resumed. **Answer now** clears them and prevents renewed reasoning. A real user message clears pending pings for its selected recipients, and **New session** clears both.
 
 ### Parallel execution
 
-Both agents normally have a long-running, streaming completion in flight at the same time. There is no speaker token, rendezvous, shared-floor lock, periodic quantum cut, or automatic import in this mode. A thought command briefly ends **only the caller's** completion at the command boundary. The coordinator appends the result to its token history and starts a cached continuation of the same open reasoning block. The partner continues generating throughout.
+Both agents normally have a long-running streaming completion in flight at the same time. There is no speaker token, rendezvous, shared-floor lock, or periodic quantum cut. A native call ends only the caller's reasoning block. After the call, the coordinator appends the template continuation and marked result, then starts its next cached completion. The partner continues generating unless explicitly pinged.
 
-This is append-and-resume through the existing completion API, not in-place insertion into an actively decoding server slot. Command continuations still incur HTTP, prompt-suffix evaluation, and sampler setup work. Their cost depends on the amount of imported text and prompt-cache reuse. Independent requests allow both GPUs to work concurrently; this does not guarantee a throughput or reasoning-quality improvement.
+This is append-and-resume through the existing completion API, not in-place insertion into an actively decoding server slot. Tool continuations and pings still incur HTTP, prompt-suffix evaluation, and sampler setup work. Their cost depends on the amount of imported text and prompt-cache reuse. Independent requests allow both GPUs to work concurrently; this does not guarantee a throughput or reasoning-quality improvement.
 
-A model can close its reasoning naturally to call an MCP tool or answer. Its partner continues independently, including while that native tool call runs. Each model's final answer appears in its own panel. **Answer now** asks both to finish.
+Each model's final answer appears in its own panel. Its partner can continue independently. **Answer now** asks both to finish.
 
 | Option | Default | Behavior |
 | --- | --- | --- |
 | `--answer-tokens N` | `1024` | Final answer budget, `1..65536`. |
-| `--protocol-retries N` | `-1` | Corrective feedback retries per agent per real user message: `-1` has no fixed retry limit, `0` disables feedback retries, and `1..2147483647` caps them. Successful command normalization does not consume retries. |
-| `--strict-thought-protocol` | Off | Disable normalization of commands emitted after reasoning closes; only the reasoning scanner may execute thought commands. Feedback retries remain separately configurable. |
-| `--link-quantum N` | Compatibility only | Accepted but ignored; thought commands have no shared generation quantum. |
+| `--protocol-retries N` | `-1` | Corrective feedback retries for known native-format rejections per agent per real user message: `-1` has no fixed limit, `0` disables feedback retries, and positive values cap them. Executed tools are never automatically repeated. |
+| `--legacy-thought-commands` | Off | Also enable the former inline commands and their compatibility normalization. Native thought tools remain available. |
+| `--strict-thought-protocol` | Off | Deprecated compatibility switch; disables normalization only when legacy thought commands are enabled. |
+| `--link-quantum N` | Compatibility only | Accepted but ignored; there is no shared generation quantum. |
 | `--private-quantum N` | Compatibility only | Accepted but ignored; independent reasoning no longer restarts periodically. |
 | `--link-wait-tokens N` | Compatibility only | Accepted but ignored; no shared floor or voluntary yield exists. |
-| `--max-segment-tokens N` | `512` | Legacy exchange ceiling, `1..4096`; does not limit thought-command reasoning. |
-| `--legacy-splice` | Off | Restore the earlier covert exchange; thought commands are unavailable. |
+| `--max-segment-tokens N` | `512` | Legacy exchange ceiling, `1..4096`; does not limit independent reasoning. |
+| `--legacy-splice` | Off | Restore the earlier covert exchange; native thought tools are unavailable. |
 
-Old launch commands can retain the compatibility flags, but removing them makes the active configuration clearer. Start a new session after upgrading; earlier label-filled or shared-channel contexts describe a different protocol.
+Start a new session after upgrading. Existing contexts describe the old protocol and can continue steering the models toward obsolete command syntax.
 
 ## Browser console
 
@@ -124,15 +129,11 @@ Per-agent status also shows the current phase, tokens received for the current r
 
 Expand **Native response** to inspect or copy the text generated after reasoning closed, before native parsing. This includes malformed calls that cannot be parsed. Parsed `reasoning_content` is displayed separately in the individual reasoning pane, but commands found there are not executed retroactively. A native turn with no non-whitespace answer and no tool calls is reported as **Finished without an answer**. That agent stops while its partner continues. Once both finish, the session is **Incomplete** if either failed to produce an answer. Send a follow-up message to the affected agent to continue.
 
-In independent mode, the default compatibility path normalizes an unambiguous response consisting of exactly one complete thought command, either in its literal syntax or a supported Qwen-style native wrapper. It does not recover commands from prose, quoted/fenced examples, multiple or mixed calls, external tool calls, or a send with missing payload. The existing send limits still apply: 16 KiB of payload and 32 KiB after JSON escaping. A bare command-only response could be an intentional syntax example; use `--strict-thought-protocol` when that distinction matters.
+A known native parser format rejection receives marked **Coordinator feedback** and a new open reasoning block. Nothing from that rejected response executes; the model must retry using the listed native tool names and its normal tool-call format. `--protocol-retries -1` removes the fixed retry cutoff. Set `0` to disable feedback retries, or a positive value to cap them per agent per real user message. Native tool turns do not replenish a finite retry budget; a targeted user message resets only its recipient's budget.
 
-Normalization retains the original native response and end-of-generation token in the history. A marked coordinator notice and template suffix open a new reasoning block, then the pending operation executes through the existing thought-command handler before further decoding. Its ordinary marked result follows. The coordinator does not rewrite the old response, invent generated reasoning, or ask the model to reproduce a command it already recognized. Successful normalization is counted separately from feedback retries. The partner keeps generating throughout.
+Retry-budget exhaustion, unsupported template continuations, insufficient context, or unrecoverable native-call errors stop only the affected agent as **Finished without an answer**. Its partner continues. Unlimited format retries remain constrained by available context and user controls. Generic HTTP/transport failures and already-executed tool calls are never automatically retried: a failed connection can occur after a side effect has happened.
 
-A native parser format rejection or misplaced command response that cannot be normalized instead receives marked **Coordinator feedback** and a new open reasoning block. Nothing from that rejected response executes; the model must correct it. `--protocol-retries -1` is the default and removes the fixed retry cutoff. Set `0` to disable feedback retries, or a positive value to cap them per agent per real user message. This option does not disable compatibility normalization. Native tool turns and successful thought commands do not replenish a finite retry budget; a targeted user message resets only its recipient's budget.
-
-**Pause** retains a normalized operation awaiting execution so **Resume** can perform it once. **Answer now** suppresses repair and discards pending thought operations; a new user message clears pending operations for its selected recipients, and **New session** clears both. An operation that already completed is not undone. Retry-budget exhaustion, unsupported template continuations, or insufficient context stop only the affected agent as **Finished without an answer**. Unlimited retries remain constrained by available context and user controls. Generic HTTP/transport failures and already-executed MCP calls are never automatically retried.
-
-The Qwen3-coder parser used by Qwen3.5 now requires complete consumption of a native response. Previously its optional tool-call branch could accept zero calls and silently discard an unknown or malformed `<tool_call>`, even one following valid prose or a valid call. Crossthink then incorrectly treated the resulting empty message as an answer. Rejected responses now retain their generated text for inspection. No external call from a rejected response executes; the coordinator may separately normalize a recognized thought-only operation as described above.
+The Qwen3-coder parser used by Qwen3.5 requires complete consumption of a native response. Previously its optional tool-call branch could accept zero calls and silently discard an unknown or malformed `<tool_call>`, even one following valid prose or a valid call. Rejected responses now retain their generated text for inspection, and no call from the rejected response executes by default.
 
 ## MCP tools over HTTP
 
@@ -156,7 +157,7 @@ Create `mcp.json`, substituting the URLs of your running calculator and compiler
 }
 ```
 
-Remove `headers` if the endpoint needs no authentication. These example URLs do not start a service: the calculator/compiler tools must already be provided by external MCP servers. The three thought commands are built in and need no MCP server. Calculator, compiler, and shell tools must come from the configured servers.
+Remove `headers` if the endpoint needs no authentication. These example URLs do not start a service: the calculator/compiler tools must already be provided by external MCP servers. The four thought tools are built in and need no MCP server. Calculator, compiler, and shell tools must come from the configured servers.
 
 ```bash
 build/bin/llama-crossthink \
@@ -166,7 +167,7 @@ build/bin/llama-crossthink \
     --mcp-timeout 60 --tool-turn-tokens 2048 --max-tool-rounds 8
 ```
 
-Both llama-server instances and the coordinator must be rebuilt for this update. Use `--jinja` on the model servers, as above. MCP tool calling uses the model's chat template and native output parser, including Qwen3.5's XML tool-call format. These native tool calls are separate from the three thought commands and their optional compatibility normalization. In legacy mode, MCP requires `--splice-mode paragraph`.
+Both llama-server instances and the coordinator must be rebuilt for this update. Use `--jinja` on the model servers, as above. MCP tool calling uses the model's chat template and native output parser, including Qwen3.5's XML tool-call format. The four built-in thought tools use the same native call syntax as MCP tools. Their actual results are inserted into reasoning; ordinary MCP results retain their normal tool-role representation. In legacy mode, MCP requires `--splice-mode paragraph`.
 
 | Option | Default | Behavior |
 | --- | --- | --- |
@@ -179,7 +180,7 @@ This client supports MCP Streamable HTTP, including JSON and SSE responses to PO
 
 Configured tools are called automatically when either model requests them. Calls run with the permissions of the selected external MCP service. The console shows the number of available tools and each peer's call count/status; expand **Tool activity** to inspect arguments and results. A prompt such as "Use the calculator to check the arithmetic" or "Compile a small C program to verify this" can encourage a call, but the model decides whether to use a tool.
 
-Calls and their results stay in the calling model's conversation, with native assistant/tool roles. The partner continues its own reasoning while a native tool turn runs. The caller can later send a summary or let the partner inspect its reasoning about the result. Native calls and tool results themselves are not copied to the other agent or executed twice by the coordinator. Reset cancels current work and clears the displayed tool trace along with the conversation; it cannot undo effects of an external tool call that already ran.
+External calls and their results stay in the calling model's conversation, with native assistant/tool roles. The partner continues its own reasoning while a native tool turn runs. The caller can later send a summary or let the partner inspect its reasoning about the result. Native calls and tool results themselves are not copied to the other agent or executed twice by the coordinator. Reset cancels current work and clears the displayed tool trace along with the conversation; it cannot undo effects of an external tool call that already ran.
 
 ## Interaction and scheduling
 
@@ -192,15 +193,15 @@ Calls and their results stay in the calling model's conversation, with native as
 
 The HTTP control API mirrors these controls: `POST /message` with `{"text":"...","target":"both"}`, `"target":"A"`, or `"target":"B"`; an omitted target means both. `POST /pause`, `/resume`, `/answer`, or `/reset` accepts `{}`. Requests use `Content-Type: application/json`. The obsolete `/link_on` and `/link_off` controls are gone. `GET /state` returns status and counters; `GET /events?after=ID` streams SSE trace events with resumable IDs. The console retains a bounded trace; reconnecting after old events expire produces an explicit gap notice.
 
-In the default mode, state reports `splice_mode: "independent"` and `thought_tools: 3`; `tools` counts only external native tools. Per-peer fields include `generated`, `imported`, `thinking_tokens`, `tokens_per_second`, `thinking_tokens_per_second`, `mailbox`, and `thought_turn`. Top-level `thinking_tokens` and rate fields sum both agents.
+In the default mode, state reports `splice_mode: "independent"` and `thought_tools: 4`; `tools` counts only external MCP tools. Per-peer fields include `generated`, `imported`, `thinking_tokens`, `tokens_per_second`, `thinking_tokens_per_second`, `mailbox`, `thought_turn`, `attention_pending`, and `attention_received`. `attention_received` counts delivered notices; pending or suppressed requests do not increment it. Top-level `thinking_tokens` and rate fields sum both agents.
 
-Per-peer `phase` reports `waiting_reasoning`, `reasoning`, `waiting_native`, `native_output`, `parsing_native`, `repairing_protocol`, `recovering_protocol`, `thought_result`, `mcp`, or `tool_result` while active, and `idle`, `ready`, `paused`, `done`, or `error` otherwise. Legacy answer streaming uses `answer`. `request_generated` resets for each completion request. `request_elapsed_seconds` is null before the first request, and `last_token_age_seconds` is null until the current request delivers tokens. These ages are wall-clock diagnostics, not server decode timings.
+Per-peer `phase` reports `waiting_reasoning`, `reasoning`, `waiting_native`, `native_output`, `parsing_native`, `repairing_protocol`, `recovering_protocol`, `thought_tool`, `thought_result`, `attention`, `mcp`, or `tool_result` while active, and `idle`, `ready`, `paused`, `done`, or `error` otherwise. Legacy answer streaming uses `answer`. `request_generated` resets for each completion request. `request_elapsed_seconds` is null before the first request, and `last_token_age_seconds` is null until the current request delivers tokens. These ages are wall-clock diagnostics, not server decode timings.
 
-`empty_response: true` and `phase: "empty_response"` identify a stopped native turn that did not produce a usable answer or tool call. `answer_done` means that peer's generation has ended; use `empty_response` to distinguish failure from a completed answer. The aggregate terminal mode is `incomplete` rather than `answered` when any participating peer has this condition. A `native_output` event carries the raw tail in `text`; `native_reasoning` carries reasoning returned by the native parser. Neither event is a thought-command input or a delivered thought message.
+`empty_response: true` and `phase: "empty_response"` identify a stopped native turn that did not produce a usable answer or tool call. `answer_done` means that peer's generation has ended; use `empty_response` to distinguish failure from a completed answer. The aggregate terminal mode is `incomplete` rather than `answered` when any participating peer has this condition. A `native_output` event carries the raw tail in `text`; `native_reasoning` carries reasoning returned by the native parser. Neither event executes thought tools or represents a delivered thought message.
 
-`protocol_retries` counts committed feedback retries for that peer's current user message. A `protocol_feedback` event carries `peer`, `text`, `attempt`, and `limit`; `limit: -1` means no fixed retry cap. It is coordinator feedback, not a tool execution or thought message. `protocol_repairs` counts successful command normalizations for the session, and resets only with **New session**. A separate `protocol_repair` event carries `peer`, `command`, and `text` for the coordinator's normalization notice. The operation's actual result and delivery still use the normal `thought_result` and `thought_message` events.
+`protocol_retries` counts committed feedback retries for that peer's current user message. A `protocol_feedback` event carries `peer`, `text`, `attempt`, and `limit`; `limit: -1` means no fixed retry cap. It is coordinator feedback, not a tool execution or thought message. With `--legacy-thought-commands`, `protocol_repairs` counts successful command normalizations for the session, and resets only with **New session**. A separate `protocol_repair` event carries `peer`, `command`, and `text` for the coordinator's normalization notice. The operation's actual result and delivery still use the normal `thought_result` and `thought_message` events.
 
-A `thought_result` event contains the complete marked insertion for the named peer's reasoning display. A separate `thought_capture` event identifies the source and captured byte range; do not append it again or the display will duplicate the capture. A `thought_message` event has a stable `message_id`, `from`, `to`, `text`, and a status of `sent` or `received`. Update the matching message bubble when its status changes. Peeks never create message bubbles.
+A `thought_result` event contains the complete marked insertion for the named peer's reasoning display. A separate `thought_capture` event identifies the source and captured byte range; do not append it again or the display will duplicate the capture. A `thought_message` event has a stable `message_id`, `from`, `to`, `text`, and a status of `sent` or `received`. Update the matching message bubble when its status changes. Thought reads never create message bubbles. An `attention` event carries `from`, `to`, and `status` (`queued`, `coalesced`, or `delivered`) for the messaging view. An `attention_result` event carries the recipient `peer` and exact marked `text` inserted into its reasoning. Attention notifications are separate from inbox mail and do not change a message's sent/received status.
 
 Requests resubmit each agent's authoritative token sequence. Each resumed completion creates a fresh sampler with deterministic per-agent seeds, so results can differ from one uninterrupted sampling call. Keep server-wide reverse prompts and other output constraints disabled. Near context capacity, the affected agent uses its reserved space for a separate final answer while its partner continues. Legacy mode pauses the session at its context limit. Neither mode silently deletes older context. Larger answer and native tool budgets reserve more context.
 
@@ -209,6 +210,24 @@ Requests resubmit each agent's authoritative token sequence. Each resumed comple
 Identical GGUF files do not make A and B identical sampling runs. Their system prompts name different agents, and the coordinator seeds each request with `base_seed + peer_index + 2 * sequence`, modulo `UINT32_MAX`. With the default seed, A starts at 42 and B at 43; their request counters advance independently as they issue commands and continue. Reset starts those same sequences again, so a repeated B-specific mistake can follow its identity and seed even on identical hardware.
 
 The coordinator overrides temperature and seed but leaves sampling options such as `top_k`, `top_p`, `min_p`, and penalties to each model server's defaults. Compare both servers' `/props` responses under `default_generation_settings.params` when investigating asymmetric behavior. The tokenizer-compatibility check does not verify identical model weights, templates, or sampling defaults. To distinguish a role/seed effect from an endpoint effect, start fresh sessions after swapping `--socket-a` and `--socket-b`. Behavior following an endpoint still needs its full configuration checked before attributing it to GPU architecture.
+
+## Legacy inline thought commands
+
+`--legacy-thought-commands` adds the earlier inline protocol to independent mode for comparisons. It is off by default and is separate from `--legacy-splice`. Only this compatibility mode scans generated reasoning for these literal commands:
+
+| Command | Native equivalent |
+| --- | --- |
+| `<ct:peek/>` | `read_thoughts({})` |
+| `<ct:send>message</ct:send>` | `send_thought({"message":"message"})` |
+| `<ct:inbox/>` | `check_inbox({})` |
+
+The opening tag must be at column zero of a new line, outside backtick or tilde code fences. Inline mentions, indented or quoted examples, and tags in imported captures, user messages, or results do not execute. A complete generated command briefly ends only its caller's completion; its marked result is appended before cached reasoning resumes.
+
+Legacy compatibility normalization also recognizes a response consisting entirely of one complete thought operation in literal syntax or a supported Qwen-style wrapper. It excludes prose, quoted/fenced examples, multiple or mixed calls, external calls, and missing send payloads. `--strict-thought-protocol` disables this normalization while leaving the inline reasoning scanner active. Send limits are 16 KiB of payload and 32 KiB after JSON escaping.
+
+Normalization preserves the original native response, appends a coordinator notice, and opens a new reasoning block. The pending operation executes once through the legacy handler before decoding continues. Successful normalization does not consume feedback retries. **Pause** retains the pending operation; **Answer now** discards it. A new user message clears it for the selected recipients, and **New session** clears both. Completed operations are not undone.
+
+Existing scanner and normalization regression tests retain this mode explicitly. The default native-tool path does not reinterpret plain final-answer tags as calls.
 
 ## Legacy covert exchange
 
@@ -240,19 +259,17 @@ Binary completion requests may also set `"splice": {"sentence_after": 256}`. `n_
 
 The earlier quantum extension remains available to binary API clients: `splice.token_after` in `1..4096` stops when that count is reached and the output ends on a complete UTF-8 character. A clean paragraph or permitted sentence boundary can stop earlier; otherwise the result reports `"splice_boundary": "quantum"`. `n_predict` remains the hard ceiling, and hitting it with an incomplete UTF-8 character produces an error. `/tokens/info` advertises `"splice_quantum": true`. The default parallel coordinator no longer uses quantum stops.
 
-Parallel thought commands require `"thought_commands": true` and `"thought_command_lines": true` from `/tokens/info`. A request sets `"splice": {"thought_commands": true, "stop_on_think_close": true}` without a quantum or sentence threshold. Complete commands at column zero outside fenced blocks in newly generated reasoning end the caller's request with `"splice_boundary": "thought_command"`, `"thought_command": "peek"`, `"inbox"`, or `"send"`, and `"thought_payload"` for a send. `splice_reason` aliases the boundary. An oversized send body returns `thought_error`; the body limit is 16384 bytes, with a 32768-byte JSON-escaped limit to keep the binary response metadata bounded. In this mode, ordinary paragraph breaks do not stop generation.
+The optional legacy inline protocol requires `"thought_commands": true` and `"thought_command_lines": true` from `/tokens/info`. A request sets `"splice": {"thought_commands": true, "stop_on_think_close": true}` without a quantum or sentence threshold. Complete commands at column zero outside fenced blocks in newly generated reasoning end the caller's request with `"splice_boundary": "thought_command"`, `"thought_command": "peek"`, `"inbox"`, or `"send"`, and `"thought_payload"` for a send. `splice_reason` aliases the boundary. An oversized send body returns `thought_error`; the body limit is 16384 bytes, with a 32768-byte JSON-escaped limit to keep the binary response metadata bounded. In this mode, ordinary paragraph breaks do not stop generation.
 
-Stops occur at the token containing the command's closing marker. Tokens are indivisible: if that token also contains a suffix after the marker, the suffix stays in the raw history, before the inserted result. All committed token IDs remain intact. The optional bounded `thought_prefix` carries an incomplete, previously generated command across a pause or request limit; ordinary submitted prefixes and imported captures are not scanned for commands. The accompanying `thought_state` checkpoint carries line and fence state from before that prefix. A continuing client must pass both values back under `splice`, including `thought_state` when the prefix is empty, so a pause inside prose or a fence does not turn a later example into a command. The coordinator uses the same scanner locally to retain state when cancellation prevents a terminal response. Native reasoning closure remains `"splice_boundary": "tool"`. Rebuild both model servers and the coordinator when upgrading; an older server cannot support the new default mode.
+Stops occur at the token containing the command's closing marker. Tokens are indivisible: if that token also contains a suffix after the marker, the suffix stays in the raw history, before the inserted result. All committed token IDs remain intact. The optional bounded `thought_prefix` carries an incomplete, previously generated command across a pause or request limit; ordinary submitted prefixes and imported captures are not scanned for commands. The accompanying `thought_state` checkpoint carries line and fence state from before that prefix. A continuing client must pass both values back under `splice`, including `thought_state` when the prefix is empty, so a pause inside prose or a fence does not turn a later example into a command. The legacy inline coordinator uses the same scanner locally to retain state when cancellation prevents a terminal response. The default native-tool mode leaves `thought_commands` disabled and uses only `stop_on_think_close`; literal tags cannot stop its reasoning stream. Native reasoning closure remains `"splice_boundary": "tool"`.
 
 When native tools are enabled, `splice.stop_on_think_close` also stops at the single `</think>` token and reports `"splice_boundary": "tool"`. That token is retained in the calling model's raw tape. The coordinator then generates a private assistant tail through EOG. `/apply-template` accepts optional `parse_output` token IDs and returns a parsed `message` alongside its ordinary `prompt`, using the same native chat parser as chat completions. A terminal EOG is removed before parsing; tokens following EOG are rejected. `/tokens/info` advertises `"tool_parse": true` for this extension.
 
 ## Validation
 
-The `reasoning-swap` branch is based on `imaami/llama.cpp`'s `bonsai` commit `5ada589b7811232c44d55dbf210329d98414fb4d`. Release CPU builds passed for llama-server and llama-crossthink. The coordinator suite covers concurrent reasoning and MCP, incremental raw-token captures, opt-in inbox delivery, targeted user messages, independent answers, metrics, and pause/reset races. Additional regressions cover inert inline/fenced commands, line/fence state across requests, exactly-once deliberate commands after resuming, and empty-inbox continuation through reasoning and buffered native output. Binary route tests exercise MTP off and on, including split and resumed commands, inert imports and code examples, literal delimiters, bounded payloads, malformed checkpoints, and cached continuation. Native chat-template and HTTP MCP suites also passed.
+The `reasoning-swap` branch is based on `imaami/llama.cpp`'s `bonsai` commit `5ada589b7811232c44d55dbf210329d98414fb4d`. The coordinator suite covers independent reasoning, incremental captures, inbox delivery, targeted messages, MCP, separate answers, metrics, and control races. The former inline scanner and normalization tests explicitly enable `--legacy-thought-commands`; those tests do not establish behavior of the new default native tools.
 
-Native completion regressions cover ordinary answers and literal thought-tag text with and without external tools, malformed and unknown calls, valid bytewise streaming calls, empty/reasoning-only responses, raw diagnostics, independent partner progress after parse failure, and targeted recovery. The broader `test-chat` and `test-chat-peg-parser` suites validate the full-consumption parser change.
-
-Protocol-feedback regressions cover command-only recognition, strict classification of native parser rejections, finite retry limits, explicit reissue inside reasoning, template suffixes, context exhaustion, independent partner progress, and pause/answer/reset/targeted-message races. Compatibility-normalization tests also pass for direct and supported wrapped commands, exact payload preservation, rejection of ambiguous/mixed output, delivery once across pause/resume, stale-result cancellation, unlimited feedback past the former two-attempt limit, and unchanged native MCP execution. Release CPU builds, coordinator, recognizer, template, MCP, CLI-option, and Chromium UI checks pass. Browser tests cover separate repair/feedback labels, unlimited retry status, raw copying, and preservation of the other agent's view. Live model compliance and GPU behavior still require evaluation on the user's setup.
+Native-tool regressions cover all four built-ins without MCP, reserved-name collisions, inert command-looking reasoning/final text, capture continuity through calls, result insertion after an open reasoning suffix, exactly-once side effects, native/MCP call ordering, and retained unread data after failed mixed batches. Ping regressions cover active reasoning, deferred native/MCP work, finished peers, pause/resume, coalescing/cooldown, and Answer now/reset/targeted-message precedence. Release CPU builds, the coordinator/protocol/template/MCP suites, CLI help, and Chromium UI regressions passed for this change.
 
 Run the binaries from the repository root for the template files:
 
@@ -268,6 +285,6 @@ python3 tests/gen-tiny-qwen35-mtp.py --tool-tokens /tmp/tiny-qwen35-tools.gguf
 build/bin/test-server-token-wire /tmp/tiny-qwen35-mtp.gguf /tmp/tiny-qwen35-tools.gguf
 ```
 
-Real Chromium tests passed against a mocked HTTP/SSE coordinator for formatting in every output pane, literal thought commands, sanitization, diagrams, stable streamed content, Follow behavior, targeted messages, inbox status, and rolling metrics. Regressions also reproduce an interrupted C fence followed by a new user turn, thought import, or native tool continuation; verify faithful raw copying and bounded clipping; and check waiting/native-output status indicators. Desktop and mobile layouts were inspected. Run these checks with `npm test` in `tools/crossthink/ui` after installing its dependencies and Chromium.
+The Chromium suite runs against a mocked HTTP/SSE coordinator for formatting in every output pane, literal thought commands, sanitization, diagrams, stable streamed content, Follow behavior, targeted messages, inbox status, and rolling metrics. Regressions also reproduce an interrupted C fence followed by a new user turn, thought import, or native tool continuation; verify faithful raw copying and bounded clipping; and check waiting/native-output status indicators. Run these checks with `npm test` in `tools/crossthink/ui` after installing its dependencies and Chromium.
 
 CPU fixtures do not establish Bonsai conversational behavior or dual-GPU throughput. The random MTP fixtures rejected their drafts, so accepted multi-token speculative batches remain unvalidated. Unix socket creation is denied in this test environment; live coordinator-to-model-server integration, real MCP services, TLS, and dual-GPU command latency still need verification on the intended setup.

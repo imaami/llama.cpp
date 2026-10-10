@@ -11,7 +11,7 @@ const clients = new Set();
 const posts = [];
 let id = 0;
 let polls = 0;
-const state = { mode: 'thinking', busy: false, tools: 1, last_event_id: 0,
+const state = { mode: 'thinking', busy: false, tools: 1, thought_tools: 4, last_event_id: 0,
     peers: ['A', 'B'].map(name => ({ name, tokens: 3200, context_size: 32000,
         generated: 110, thinking_tokens: 100, imported: 14,
         tokens_per_second: 22, thinking_tokens_per_second: 20 })) };
@@ -55,6 +55,7 @@ try {
     assert.equal(await page.locator('#count-A').textContent(), '110');
     assert.equal(await page.locator('#count-total').textContent(), '200');
     assert.equal(await page.locator('#speed-total').textContent(), '40.0');
+    assert.equal(await page.locator('#tools-status').textContent(), '4 built-in thought tools / 1 MCP tools');
     emit({ type: 'token', peer: 'A', text: '# A considers the problem\n\nA **stable paragraph**, with $x^2$ and \\(y+1\\).\n\n' });
     emit({ type: 'token', peer: 'B', text: '## B checks independently\n\n| Value | Result |\n| --- | --- |\n| 2 + 2 | **4** |\n\n~~~cpp\nint answer = 42;\n~~~\n\n' });
     await page.waitForSelector('#thought-A .katex');
@@ -275,6 +276,61 @@ try {
     await page.locator('[data-copy="thought-A"]').click();
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()).then(text => text.endsWith(unlimitedFeedback + repair + '**Thinking continues.**\n')), true);
 
+    // Pings are lightweight status rows; their delivered notice affects only the recipient.
+    const senderBeforePing = await page.locator('#thought-A').textContent();
+    const toolRecordsBeforePing = await page.locator('#tools-A .output-segment').count();
+    const postsBeforePing = posts.length;
+    state.peers[1].phase = 'attention';
+    state.peers[1].attention_pending = true;
+    emit({ type: 'state', state });
+    emit({ type: 'attention', from: 'A', to: 'B', status: 'queued', text: 'Your partner requested attention.' });
+    await page.waitForFunction(() => document.querySelector('#thread .attention-status')?.textContent === 'Queued');
+    assert.equal(await page.locator('#thread .attention-row').textContent(), 'A nudged BQueued');
+    assert.equal(await page.locator('#stats-B .peer-phase').textContent(), 'Applying partner attention');
+    assert.match(await page.locator('#stats-B').textContent(), /Attention pending/);
+    emit({ type: 'attention', from: 'A', to: 'B', status: 'coalesced', text: 'Your partner requested attention.' });
+    await page.waitForFunction(() => document.querySelector('#thread .attention-status')?.textContent === 'Duplicate ping suppressed');
+    assert.equal(await page.locator('#thread .attention-row').count(), 1);
+    assert.equal(await page.locator('#thread .bubble').count(), 0);
+    emit({ type: 'token', peer: 'B', text: '\n```cpp\nint unfinished =' });
+    await page.waitForFunction(() => document.querySelector('#thought-B pre')?.textContent.includes('unfinished'));
+    const attention = '<ct:attention>\nYour partner requested attention.\n</ct:attention>\n';
+    emit({ type: 'attention', from: 'A', to: 'B', status: 'delivered', text: 'Your partner requested attention.' });
+    emit({ type: 'attention_result', peer: 'B', text: attention });
+    state.peers[1].attention_pending = false;
+    state.peers[1].attention_received = 1;
+    emit({ type: 'state', state });
+    await page.waitForFunction(() => document.querySelector('#thread .attention-status')?.textContent === 'Delivered');
+    await page.waitForFunction(() => document.querySelector('#thought-B .output-segment:last-child')?.textContent.includes('</ct:attention>'));
+    assert.equal(await page.locator('#thought-B .output-segment:last-child .output-boundary').textContent(), 'Partner attention');
+    assert.equal(await page.locator('#thought-B .output-segment:last-child pre').count(), 0);
+    assert.match(await page.locator('#stats-B').textContent(), /Pings received 1/);
+    assert.doesNotMatch(await page.locator('#stats-B').textContent(), /Attention pending/);
+    emit({ type: 'token', peer: 'B', text: '**I can continue independently.**\n' });
+    await page.waitForFunction(() => document.querySelector('#thought-B .output-segment:last-child strong')?.textContent === 'I can continue independently.');
+    assert.equal(await page.locator('#thought-B .output-segment:last-child .output-boundary').textContent(), 'After attention notice');
+    assert.equal(await page.locator('#thought-A').textContent(), senderBeforePing);
+    assert.equal(await page.locator('#tools-A .output-segment').count(), toolRecordsBeforePing);
+    assert.equal(posts.length, postsBeforePing);
+    emit({ type: 'attention', from: 'A', to: 'B', status: 'coalesced', text: 'Your partner requested attention.' });
+    await page.waitForFunction(() => document.querySelectorAll('#thread .attention-row').length === 2);
+    assert.equal(await page.locator('#thread .attention-status').last().textContent(), 'Duplicate ping suppressed');
+    emit({ type: 'attention', from: 'A', to: 'B', status: 'queued', text: 'Your partner requested attention.' });
+    await page.waitForFunction(() => document.querySelectorAll('#thread .attention-row').length === 3);
+    assert.equal(await page.locator('#thread .attention-status').last().textContent(), 'Queued');
+
+    // Native thought tools show their acknowledgement; the actual payload stays in reasoning.
+    emit({ type: 'tool_call', peer: 'B', name: 'check_inbox', call_id: 'inbox-1', arguments: '{}' });
+    emit({ type: 'tool_result', peer: 'B', name: 'check_inbox', call_id: 'inbox-1', result: { content: [{ type: 'text', text: 'Inbox result supplied in reasoning.' }] } });
+    const nativeInbox = '<ct:result command="inbox">\n**Private thought payload.**\n</ct:result>\n';
+    emit({ type: 'thought_result', peer: 'B', command: 'inbox', text: nativeInbox });
+    await page.waitForFunction(() => document.querySelector('#thought-B .output-segment:last-child strong')?.textContent === 'Private thought payload.');
+    assert.equal(await page.locator('#tools-B .output-segment').count(), 2);
+    assert.match(await page.locator('#tools-B').textContent(), /check_inbox/);
+    assert.doesNotMatch(await page.locator('#tools-B').textContent(), /Private thought payload/);
+    await page.locator('[data-copy="thought-B"]').click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()).then(text => text.endsWith(attention + '**I can continue independently.**\n' + nativeInbox)), true);
+
     await page.screenshot({ path: join(root, 'test-desktop.png'), fullPage: true });
     await page.setViewportSize({ width: 700, height: 950 });
     await page.screenshot({ path: join(root, 'test-mobile.png'), fullPage: true });
@@ -296,8 +352,9 @@ try {
     emit({ type: 'reset' });
     await page.waitForFunction(() => !document.querySelector('#native-A .output-segment'));
     assert.equal(await page.locator('#native-B .output-segment').count(), 0);
+    assert.equal(await page.locator('#thread .attention-row').count(), 0);
     assert.deepEqual(errors, []);
-    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, inbox, metrics, turn/result isolation, native response diagnostics, coordinator feedback and repair isolation, unlimited retries, verbatim copy, clipping.');
+    console.log('UI browser regressions passed: rich output, sanitization, diagrams, streaming, follow, targeting, native thought tools, attention pings, inbox, metrics, turn/result isolation, native response diagnostics, coordinator feedback and repair isolation, unlimited retries, verbatim copy, clipping.');
 } finally {
     await browser.close();
     for (const client of clients) client.end();

@@ -335,6 +335,7 @@ struct fake_tool_call {
 
 class fake_tool_service final : public crossthink_tool_service {
 public:
+    std::string tool_name = "calculator";
     std::mutex mutex;
     std::condition_variable changed;
     std::vector<std::shared_ptr<fake_tool_call>> calls;
@@ -342,7 +343,7 @@ public:
     crossthink_json tools() const override {
         return crossthink_json::array({{
             {"type", "function"}, {"function", {
-                {"name", "calculator"}, {"description", "Evaluate an expression"},
+                {"name", tool_name}, {"description", "Evaluate an expression"},
                 {"parameters", {{"type", "object"}, {"properties", {
                     {"expression", {{"type", "string"}}}}}, {"required", {"expression"}}}},
             }},
@@ -397,7 +398,8 @@ struct fixture {
 
     fixture(int32_t chunk = 2, uint64_t context = 256, bool paragraph_splice = false,
             bool enable_tools = false, bool telepathy = false, int32_t max_tool_rounds = 8,
-            int32_t protocol_retries = 2, bool strict_thought_protocol = true) {
+            int32_t protocol_retries = 2, bool strict_thought_protocol = true,
+            bool legacy_thought_commands = true) {
         std::array<std::unique_ptr<crossthink_transport>, 2> transports;
         std::array<std::unique_ptr<crossthink_tool_service>, 2> services;
         for (size_t i = 0; i < peers.size(); ++i) {
@@ -431,6 +433,7 @@ struct fixture {
         options.max_tool_rounds = max_tool_rounds;
         options.protocol_retries = protocol_retries;
         options.strict_thought_protocol = strict_thought_protocol;
+        options.legacy_thought_commands = legacy_thought_commands;
         session = std::make_unique<crossthink_session>(std::move(transports), options, std::move(services));
     }
 
@@ -1051,7 +1054,10 @@ static void test_thought_mode_parallel_and_catalogue() {
     fixture f(4, 32768, true, false, true);
     for (size_t index = 0; index < f.peers.size(); ++index) {
         std::lock_guard<std::mutex> lock(f.peers[index]->mutex);
-        check(f.peers[index]->configured_tools.empty(), "obsolete native link tool remained in the tool catalogue");
+        check(f.peers[index]->configured_tools.size() == 4 &&
+                std::none_of(f.peers[index]->configured_tools.begin(), f.peers[index]->configured_tools.end(),
+                    [](const crossthink_json & tool) { return tool.at("function").at("name") == "think_with_telepathic_link"; }),
+                "native thought catalogue is missing or retains the obsolete link tool");
         check(f.peers[index]->configured_peer == (index ? "B" : "A"), "agent identity was not configured");
     }
     f.start();
@@ -1888,6 +1894,453 @@ static void test_thought_normalization_result_controls() {
     }
 }
 
+static crossthink_json native_call(const std::string & name,
+        const crossthink_json & arguments = crossthink_json::object(), const std::string & id = "call_builtin") {
+    return {{"id", id}, {"type", "function"}, {"function", {
+        {"name", name}, {"arguments", arguments.dump()},
+    }}};
+}
+
+static std::shared_ptr<fake_request> begin_native_calls(fixture & f, size_t index,
+        size_t request_index, const crossthink_json & calls) {
+    {
+        std::lock_guard<std::mutex> lock(f.peers[index]->mutex);
+        f.peers[index]->parsed_assistant = {{"role", "assistant"}, {"content", ""}, {"tool_calls", calls}};
+        f.peers[index]->parse_error.clear();
+    }
+    auto reasoning = f.peers[index]->request(request_index);
+    reasoning->send({2}, "</think>");
+    reasoning->finish("limit", "tool");
+    return f.peers[index]->request(request_index + 1);
+}
+
+static void finish_native_calls(fixture & f, size_t index, size_t request_index,
+        const crossthink_json & calls) {
+    auto native = begin_native_calls(f, index, request_index, calls);
+    native->send({static_cast<llama_token>(501 + index), 3}, "<tool_call>native call</tool_call>");
+    native->finish("eos", "");
+}
+
+static void test_native_thought_catalogue_and_literal_legacy_tags() {
+    check(!crossthink_options{}.legacy_thought_commands, "reasoning syntax remained the default thought-tool interface");
+    for (bool mcp : {false, true}) {
+        fixture f(4, 32768, true, mcp, true, 8, 2, false, false);
+        for (auto * peer : f.peers) {
+            std::lock_guard<std::mutex> lock(peer->mutex);
+            check(peer->configured_tools.size() == (mcp ? 5 : 4), "native thought tools did not merge with the MCP catalogue");
+            for (const char * name : {"send_thought", "check_inbox", "read_thoughts", "ping_peer"}) {
+                check(std::count_if(peer->configured_tools.begin(), peer->configured_tools.end(), [&](const crossthink_json & tool) {
+                    return tool.at("function").at("name") == name;
+                }) == 1, "builtin native thought tool missing or duplicated");
+            }
+        }
+        f.start();
+        auto a0 = f.peers[0]->request(0);
+        f.peers[1]->request(0);
+        check(!a0->parameters.at("splice").value("thought_commands", false),
+                "native thought mode still enabled reasoning tag execution");
+        a0->send({101}, "<ct:inbox/>\n<ct:send>literal example</ct:send>");
+        a0->wait_consumed(1);
+        f.pause();
+        f.session->command("resume");
+        f.wait_mode("thinking");
+        f.peers[0]->request(1);
+        f.peers[1]->request(1);
+        check(events_of(f, "thought_result").empty() && events_of(f, "thought_message").empty(),
+                "legacy tags executed when native thought mode resumed");
+        finish_native_response(f, 0, 1, "<ct:inbox/>");
+        f.peers[0]->request(3);
+        check(events_of(f, "protocol_repair").empty() && events_of(f, "thought_result").empty() &&
+                events_of(f, "protocol_feedback", "A").size() == 1,
+                "native mode executed a legacy final command instead of explaining the native interface");
+        finish_thought_answer(f, 0, 3, "An actual final answer");
+        f.pause();
+    }
+}
+
+static void test_native_thought_mail_is_deferred_and_nonintrusive() {
+    fixture f(4, 32768, true, false, true, 8, 2, false, false);
+    f.start();
+    auto b0 = f.peers[1]->request(0);
+    const std::string message = "The useful payload belongs in the partner's reasoning.";
+    finish_native_calls(f, 0, 0, crossthink_json::array({
+        native_call("send_thought", {{"message", message}}, "call_send"),
+        native_call("check_inbox", crossthink_json::object(), "call_inbox"),
+    }));
+    auto a2 = f.peers[0]->request(2);
+    const auto own_results = events_of(f, "thought_result", "A");
+    check(own_results.size() == 2 && own_results[0].at("command") == "send" &&
+            own_results[1].at("command") == "inbox" &&
+            own_results[1].at("text").get<std::string>().find("Inbox empty.") != std::string::npos,
+            "native builtin batch changed order or waited for a partner reply");
+    check(request_is_active(b0) && f.peers[1]->request_count() == 1 &&
+            f.session->state().at("peers").at(1).at("mailbox") == 1 && events_of(f, "thought_result", "B").empty(),
+            "native send interrupted the recipient or delivered mail before an inbox call");
+    check(count(a2->prompt, 501) == 1 && count(a2->prompt, 3) == 1 && count(a2->prompt, 40) == 1 &&
+            events_of(f, "tool_result", "A").size() == 2, "builtin batch lost its native boundaries or tool results");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+        const auto & responses = f.peers[0]->result_messages.back();
+        check(responses.size() == 2, "builtin batch did not acknowledge both native calls");
+        for (const auto & response : responses) {
+            check(response.at("content") == "Result follows in reasoning.", "thought data leaked into a native tool acknowledgement");
+        }
+    }
+    finish_native_calls(f, 1, 0, crossthink_json::array({native_call("check_inbox")}));
+    auto b2 = f.peers[1]->request(2);
+    const auto inbox = events_of(f, "thought_result", "B");
+    check(inbox.size() == 1 && inbox[0].at("text").get<std::string>().find(message) != std::string::npos &&
+            f.session->state().at("peers").at(1).at("mailbox") == 0 && request_is_active(a2),
+            "native inbox did not receive the queued message while the sender kept working");
+    const auto encoded = f.peers[1]->text_tokens(inbox[0].at("text").get<std::string>());
+    const auto bridge = std::find(b2->prompt.begin(), b2->prompt.end(), 40);
+    check(bridge != b2->prompt.end() && std::search(bridge + 1, b2->prompt.end(), encoded.begin(), encoded.end()) != b2->prompt.end(),
+            "actual inbox payload was not injected after the native suffix reopened reasoning");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+        check(f.peers[1]->result_messages.back()[0].at("content") == "Result follows in reasoning.",
+                "received mail was put in the native acknowledgement instead of reasoning");
+    }
+    check(events_of(f, "thought_message").size() == 2 && events_of(f, "thought_message").back().at("status") == "received",
+            "native inbox failed to acknowledge receipt or delivered the same message twice");
+    f.pause();
+}
+
+static void test_native_thought_rejects_reserved_mcp_names() {
+    for (const char * name : {"send_thought", "check_inbox", "read_thoughts", "ping_peer"}) {
+        std::array<std::unique_ptr<crossthink_transport>, 2> transports;
+        std::array<std::unique_ptr<crossthink_tool_service>, 2> services;
+        for (size_t index = 0; index < 2; ++index) {
+            auto transport = std::make_unique<fake_transport>();
+            transport->context_size = 32768;
+            transports[index] = std::move(transport);
+            auto service = std::make_unique<fake_tool_service>();
+            service->tool_name = name;
+            services[index] = std::move(service);
+        }
+        bool rejected = false;
+        try { crossthink_session session(std::move(transports), crossthink_options{}, std::move(services)); }
+        catch (const std::runtime_error &) { rejected = true; }
+        check(rejected, "MCP tool silently shadowed a reserved native thought tool");
+    }
+}
+
+static void test_native_thought_invalid_arguments_have_no_effects() {
+    fixture f(4, 32768, true, false, true, 8, 2, false, false);
+    auto malformed = native_call("send_thought", crossthink_json::object(), "bad_json");
+    malformed["function"]["arguments"] = "{broken";
+    const auto calls = crossthink_json::array({
+        malformed,
+        native_call("send_thought", {{"message", 42}}, "bad_type"),
+        native_call("send_thought", {{"message", std::string(16385, 'x')}}, "oversized"),
+        native_call("check_inbox", {{"extra", true}}, "bad_inbox"),
+        native_call("read_thoughts", {{"extra", true}}, "bad_read"),
+        native_call("ping_peer", {{"message", "must not become an attention payload"}}, "bad_ping"),
+    });
+    f.start();
+    auto b0 = f.peers[1]->request(0);
+    finish_native_calls(f, 0, 0, calls);
+    f.peers[0]->request(2);
+    const auto results = events_of(f, "thought_result", "A");
+    check(results.size() == calls.size() && std::all_of(results.begin(), results.end(), [](const crossthink_json & result) {
+                return result.at("success") == false;
+            }), "invalid native thought arguments did not each return a marked error");
+    check(events_of(f, "thought_message").empty() && events_of(f, "thought_capture").empty() &&
+            events_of(f, "attention").empty() && request_is_active(b0),
+            "invalid arguments sent mail, consumed a capture, pinged, or interrupted the partner");
+    f.pause();
+}
+
+static void test_native_thought_preflight_precedes_effects() {
+    for (bool unsupported : {false, true}) {
+        fixture f(4, 4096, true, false, true, 8, 2, false, false);
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            if (unsupported) { f.peers[0]->results_error = "template cannot append a native result"; }
+            else { f.peers[0]->results_tokens.assign(4096, 40); }
+        }
+        f.start();
+        auto b0 = f.peers[1]->request(0);
+        finish_native_calls(f, 0, 0, crossthink_json::array({
+            native_call("send_thought", {{"message", "must not be queued"}}, "preflight_send"),
+            native_call("ping_peer", crossthink_json::object(), "preflight_ping"),
+        }));
+        f.wait_state([](const crossthink_json & state) {
+            const auto & peer = state.at("peers").at(0);
+            return peer.at("phase") == "empty_response" && !peer.at("active").get<bool>();
+        }, "failed native thought preflight stops only caller");
+        check(events_of(f, "thought_message").empty() && events_of(f, "thought_result").empty() &&
+                events_of(f, "attention").empty() && events_of(f, "tool_call").empty() &&
+                f.peers[0]->request_count() == 2 && request_is_active(b0),
+                "failed native result preflight executed an effect or stopped the partner");
+        f.pause();
+    }
+}
+
+static void test_native_thought_reads_preserve_incremental_capture() {
+    fixture f(4, 32768, true, false, true, 8, 2, false, false);
+    f.start();
+    auto b0 = f.peers[1]->request(0);
+    b0->send({201}, "alpha");
+    b0->wait_consumed(1);
+    finish_native_calls(f, 0, 0, crossthink_json::array({native_call("read_thoughts")}));
+    f.peers[0]->request(2);
+    auto captured = events_of(f, "thought_capture", "A");
+    check(captured.size() == 1 && captured[0].at("text") == "alpha", "first native thought read missed the current capture");
+    finish_native_calls(f, 1, 0, crossthink_json::array({native_call("check_inbox")}));
+    auto b2 = f.peers[1]->request(2);
+    b2->send({202}, " beta");
+    b2->wait_consumed(1);
+    finish_native_calls(f, 0, 2, crossthink_json::array({native_call("read_thoughts")}));
+    auto a4 = f.peers[0]->request(4);
+    captured = events_of(f, "thought_capture", "A");
+    check(captured.size() == 2 && captured[1].at("text") == " beta" && captured[1].at("offset") == 5 &&
+            captured[1].at("turn") == captured[0].at("turn"),
+            "native builtin continuation reset the source capture or receiver cursor");
+    check(count(a4->prompt, 201) == 1 && count(a4->prompt, 202) == 1 && request_is_active(b2),
+            "incremental native reads duplicated captured tokens or interrupted the source");
+    f.pause();
+}
+
+static void test_native_thought_reads_survive_failed_mixed_suffix() {
+    for (bool overflow : {false, true}) {
+        fixture f(4, 32768, true, true, true, 8, 2, false, false);
+        const std::string mail = "Unread mail must survive a failed native bridge.";
+        const std::string thought = "The complete thought capture must remain readable.";
+        f.start();
+        finish_native_calls(f, 1, 0, crossthink_json::array({native_call("send_thought", {{"message", mail}})}));
+        auto b2 = f.peers[1]->request(2);
+        b2->send({201}, thought);
+        b2->wait_consumed(1);
+        finish_native_calls(f, 0, 0, crossthink_json::array({
+            native_call("check_inbox", crossthink_json::object(), "read_mail"),
+            native_call("read_thoughts", crossthink_json::object(), "read_capture"),
+            native_call("calculator", {{"expression", "6*7"}}, "external_call"),
+        }));
+        auto call = f.tools[0]->request(0);
+        check(f.session->state().at("peers").at(0).at("mailbox") == 1 &&
+                events_of(f, "thought_capture", "A").empty(),
+                "native read committed before its final mixed-tool continuation existed");
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            if (overflow) { f.peers[0]->results_tokens.assign(32768, 40); }
+            else { f.peers[0]->results_error = "final mixed-tool suffix failed"; }
+        }
+        call->finish({{"content", {{{"type", "text"}, {"text", "42"}}}}});
+        f.wait_state([](const crossthink_json & state) {
+            const auto & peer = state.at("peers").at(0);
+            return peer.at("phase") == "empty_response" && !peer.at("active").get<bool>();
+        }, "mixed read continuation fails without consuming reads");
+        const auto messages = events_of(f, "thought_message");
+        check(f.session->state().at("peers").at(0).at("mailbox") == 1 &&
+                std::none_of(messages.begin(), messages.end(), [](const crossthink_json & event) {
+                    return event.at("status") == "received";
+                }) && events_of(f, "thought_capture", "A").empty() && request_is_active(b2),
+                "failed mixed-tool suffix consumed mail, advanced a capture, or stopped its partner");
+        {
+            std::lock_guard<std::mutex> lock(f.peers[0]->mutex);
+            f.peers[0]->results_error.clear();
+            f.peers[0]->results_tokens = {40, 1};
+        }
+        f.session->command("message", "Continue and read the pending data", "A");
+        f.wait_mode("thinking");
+        f.peers[0]->request(2);
+        finish_native_calls(f, 0, 2, crossthink_json::array({
+            native_call("check_inbox", crossthink_json::object(), "retry_mail"),
+            native_call("read_thoughts", crossthink_json::object(), "retry_capture"),
+        }));
+        auto a4 = f.peers[0]->request(4);
+        const auto results = events_of(f, "thought_result", "A");
+        check(std::any_of(results.begin(), results.end(), [&](const crossthink_json & event) {
+                    return event.at("command") == "inbox" && event.at("text").get<std::string>().find(mail) != std::string::npos;
+                }) && f.session->state().at("peers").at(0).at("mailbox") == 0,
+                "the subsequent inbox call could not receive mail retained after suffix failure");
+        const auto captures = events_of(f, "thought_capture", "A");
+        check(captures.size() == 1 && captures[0].at("text") == thought && captures[0].at("offset") == 0 &&
+                count(a4->prompt, 201) == 1, "failed mixed-tool read advanced or duplicated the thought cursor");
+        check(f.tools[0]->call_count() == 1 && request_is_active(b2),
+                "recovering reads replayed the completed external call or restarted the partner");
+        f.pause();
+    }
+}
+
+static void test_native_thought_batch_reads_do_not_duplicate_data() {
+    fixture f(4, 32768, true, false, true, 8, 2, false, false);
+    const std::string mail = "One queued message for two inbox checks.";
+    const std::string thought = "One capture for two thought reads.";
+    f.start();
+    finish_native_calls(f, 1, 0, crossthink_json::array({native_call("send_thought", {{"message", mail}})}));
+    auto b2 = f.peers[1]->request(2);
+    b2->send({201}, thought);
+    b2->wait_consumed(1);
+    finish_native_calls(f, 0, 0, crossthink_json::array({
+        native_call("check_inbox", crossthink_json::object(), "inbox_one"),
+        native_call("check_inbox", crossthink_json::object(), "inbox_two"),
+        native_call("read_thoughts", crossthink_json::object(), "capture_one"),
+        native_call("read_thoughts", crossthink_json::object(), "capture_two"),
+    }));
+    auto a2 = f.peers[0]->request(2);
+    const auto results = events_of(f, "thought_result", "A");
+    check(results.size() == 4 && results[0].at("text").get<std::string>().find(mail) != std::string::npos &&
+            results[1].at("text").get<std::string>().find("Inbox empty.") != std::string::npos &&
+            results[1].at("text").get<std::string>().find(mail) == std::string::npos,
+            "two reads in the same native batch received the same inbox contents");
+    const auto captures = events_of(f, "thought_capture", "A");
+    check(captures.size() == 2 && captures[0].at("text") == thought && captures[1].at("text") == "" &&
+            captures[1].at("offset") == thought.size() && count(a2->prompt, 201) == 1,
+            "two native reads in one batch duplicated the captured reasoning");
+    const auto messages = events_of(f, "thought_message");
+    check(std::count_if(messages.begin(), messages.end(), [](const crossthink_json & event) {
+                return event.at("status") == "received";
+            }) == 1 && f.session->state().at("peers").at(0).at("mailbox") == 0 && request_is_active(b2),
+            "native batch did not atomically acknowledge each queued message once");
+    f.pause();
+}
+
+static void test_native_ping_interrupts_only_peer_reasoning() {
+    fixture f(4, 32768, true, false, true, 8, 2, false, false);
+    f.start();
+    auto b0 = f.peers[1]->request(0);
+    b0->send({201}, "reasoning before the attention notice");
+    b0->wait_consumed(1);
+    finish_native_calls(f, 0, 0, crossthink_json::array({native_call("ping_peer")}));
+    auto a2 = f.peers[0]->request(2);
+    auto b1 = f.peers[1]->request(1);
+    check(!request_is_active(b0) && request_is_active(a2) && count(b1->prompt, 201) == 1 && !count(b1->prompt, 3),
+            "ping lost peer reasoning, opened a new user turn, or stopped its sender");
+    const auto attention = events_of(f, "attention_result", "B");
+    check(attention.size() == 1 && !attention[0].at("text").get<std::string>().empty() &&
+            f.session->state().at("peers").at(1).at("attention_received") == 1 &&
+            f.session->state().at("peers").at(1).at("attention_pending") == false,
+            "ping did not deliver exactly one fixed attention notice");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+        check(f.peers[1]->user_texts.empty(), "ping inserted a frontend user message into an active reasoning turn");
+    }
+    check(events_of(f, "user").size() == 1 && events_of(f, "thought_message").empty(),
+            "bodyless ping invented a user turn or a mail payload");
+    f.pause();
+}
+
+static void test_native_ping_waits_through_native_or_mcp_and_coalesces() {
+    for (bool mcp : {false, true}) {
+        fixture f(4, 32768, true, mcp, true, 8, 2, false, false);
+        f.start();
+        auto b1 = begin_native_calls(f, 1, 0, crossthink_json::array({mcp
+            ? native_call("calculator", {{"expression", "6*7"}}) : native_call("check_inbox")}));
+        std::shared_ptr<fake_tool_call> call;
+        if (mcp) {
+            b1->send({502, 3}, "calculator call");
+            b1->finish("eos", "");
+            call = f.tools[1]->request(0);
+        }
+        finish_native_calls(f, 0, 0, crossthink_json::array({
+            native_call("ping_peer", crossthink_json::object(), "ping_one"),
+            native_call("ping_peer", crossthink_json::object(), "ping_two"),
+        }));
+        auto a2 = f.peers[0]->request(2);
+        check(f.peers[1]->request_count() == 2 && events_of(f, "attention_result", "B").empty() &&
+                f.session->state().at("peers").at(1).at("attention_pending") == true,
+                "ping interrupted native/MCP work instead of waiting for reasoning");
+        const auto notifications = events_of(f, "attention");
+        check(std::count_if(notifications.begin(), notifications.end(), [](const crossthink_json & event) {
+                    return event.at("status") == "queued";
+                }) == 1 && std::count_if(notifications.begin(), notifications.end(), [](const crossthink_json & event) {
+                    return event.at("status") == "coalesced";
+                }) == 1, "repeated pending ping was not coalesced");
+        if (mcp) {
+            {
+                std::lock_guard<std::mutex> lock(call->mutex);
+                check(!call->cancelled, "ping cancelled an in-flight MCP operation");
+            }
+            call->finish({{"content", {{{"type", "text"}, {"text", "42"}}}}});
+        } else {
+            check(request_is_active(b1), "ping cancelled an in-flight native generation");
+            b1->send({502, 3}, "check inbox call");
+            b1->finish("eos", "");
+        }
+        f.peers[1]->request(2);
+        check(events_of(f, "attention_result", "B").size() == 1 && request_is_active(a2),
+                "native/MCP completion lost the queued attention notice or blocked its sender");
+        if (mcp) { check(f.tools[1]->call_count() == 1, "deferred ping replayed the native MCP call"); }
+        f.pause();
+    }
+}
+
+static void test_native_ping_pending_controls() {
+    for (const std::string action : {"pause", "answer", "reset", "message"}) {
+        fixture f(4, 32768, true, false, true, 8, 2, false, false);
+        f.start();
+        auto b1 = begin_native_calls(f, 1, 0, crossthink_json::array({native_call("check_inbox")}));
+        finish_native_calls(f, 0, 0, crossthink_json::array({native_call("ping_peer")}));
+        auto a2 = f.peers[0]->request(2);
+        check(f.session->state().at("peers").at(1).at("attention_pending") == true,
+                "test did not queue attention during native generation");
+        f.session->command(action, action == "message" ? "User replaces the pending ping" : "", action == "message" ? "B" : "both");
+        if (action == "reset" || action == "message") {
+            f.wait_mode(action == "reset" ? "idle" : "thinking");
+            check(events_of(f, "attention_result", "B").empty() &&
+                    f.session->state().at("peers").at(1).at("attention_pending") == false,
+                    "replacement/reset delivered a stale queued attention notice");
+            if (action == "message") {
+                f.peers[1]->request(2);
+                check(request_is_active(a2), "targeted ping replacement interrupted the sender");
+                f.pause();
+            }
+            continue;
+        }
+        b1->send({502, 3}, "check inbox call");
+        b1->finish("eos", "");
+        if (action == "pause") {
+            f.wait_mode("paused");
+            check(events_of(f, "attention_result", "B").empty() &&
+                    f.session->state().at("peers").at(1).at("attention_pending") == true,
+                    "pause delivered or discarded pending attention");
+            f.session->command("resume");
+            f.wait_mode("thinking");
+            f.peers[0]->request(3);
+            f.peers[1]->request(2);
+            check(events_of(f, "attention_result", "B").size() == 1, "resume did not deliver pending attention once");
+            f.pause();
+        } else {
+            f.wait_mode("answering");
+            for (size_t index = 0; index < 2; ++index) {
+                auto answer = f.peers[index]->request(index ? 2 : 3);
+                {
+                    std::lock_guard<std::mutex> lock(f.peers[index]->mutex);
+                    f.peers[index]->parsed_assistant = {{"role", "assistant"}, {"content", "Forced final answer"}};
+                }
+                answer->send({static_cast<llama_token>(601 + index), 3}, "Forced final answer");
+                answer->finish("eos", "");
+            }
+            f.wait_mode("answered");
+            check(events_of(f, "attention_result", "B").empty() &&
+                    f.session->state().at("peers").at(1).at("attention_pending") == false,
+                    "Answer now delivered or retained pending attention");
+        }
+    }
+}
+
+static void test_native_ping_wakes_finished_recipient() {
+    fixture f(4, 32768, true, false, true, 8, 2, false, false);
+    f.start();
+    finish_thought_answer(f, 1, 0, "B completed its first answer");
+    finish_native_calls(f, 0, 0, crossthink_json::array({native_call("ping_peer")}));
+    auto a2 = f.peers[0]->request(2);
+    f.peers[1]->request(2);
+    const auto state = f.session->state();
+    check(state.at("peers").at(1).at("answer_done") == false &&
+            state.at("peers").at(1).at("attention_received") == 1 && request_is_active(a2),
+            "ping failed to wake its naturally finished peer while the sender continued");
+    {
+        std::lock_guard<std::mutex> lock(f.peers[1]->mutex);
+        check(f.peers[1]->user_texts.size() == 1 && !f.peers[1]->user_texts[0].empty(),
+                "finished recipient did not receive a fixed wake-up template turn");
+    }
+    check(events_of(f, "user").size() == 1, "finished-peer ping masqueraded as a new frontend user message");
+    f.pause();
+}
+
 static void test_thought_reset_discards_stale_streams_and_mail() {
     fixture f(4, 32768, true, false, true);
     f.start();
@@ -2388,6 +2841,30 @@ int main() {
         test_thought_normalization_bridge_controls();
         current_test = "test_thought_normalization_result_controls";
         test_thought_normalization_result_controls();
+        current_test = "test_native_thought_catalogue_and_literal_legacy_tags";
+        test_native_thought_catalogue_and_literal_legacy_tags();
+        current_test = "test_native_thought_mail_is_deferred_and_nonintrusive";
+        test_native_thought_mail_is_deferred_and_nonintrusive();
+        current_test = "test_native_thought_rejects_reserved_mcp_names";
+        test_native_thought_rejects_reserved_mcp_names();
+        current_test = "test_native_thought_invalid_arguments_have_no_effects";
+        test_native_thought_invalid_arguments_have_no_effects();
+        current_test = "test_native_thought_preflight_precedes_effects";
+        test_native_thought_preflight_precedes_effects();
+        current_test = "test_native_thought_reads_preserve_incremental_capture";
+        test_native_thought_reads_preserve_incremental_capture();
+        current_test = "test_native_thought_reads_survive_failed_mixed_suffix";
+        test_native_thought_reads_survive_failed_mixed_suffix();
+        current_test = "test_native_thought_batch_reads_do_not_duplicate_data";
+        test_native_thought_batch_reads_do_not_duplicate_data();
+        current_test = "test_native_ping_interrupts_only_peer_reasoning";
+        test_native_ping_interrupts_only_peer_reasoning();
+        current_test = "test_native_ping_waits_through_native_or_mcp_and_coalesces";
+        test_native_ping_waits_through_native_or_mcp_and_coalesces();
+        current_test = "test_native_ping_pending_controls";
+        test_native_ping_pending_controls();
+        current_test = "test_native_ping_wakes_finished_recipient";
+        test_native_ping_wakes_finished_recipient();
         current_test = "test_thought_reset_discards_stale_streams_and_mail";
         test_thought_reset_discards_stale_streams_and_mail();
         test_thought_peek_defers_incomplete_utf8_packets();

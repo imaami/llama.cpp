@@ -25,7 +25,7 @@
  <details class="tools-wrap"><summary>Tool activity <span id="tool-status-A">No calls</span></summary>
   <div class="panel-head"><button class="copy-all" data-copy="tools-A">Copy raw</button><label class="follow"><input id="follow-tools-A" type="checkbox" checked>Follow</label></div>
   <div id="tools-clipped-A" class="clipped" hidden>Older displayed tool activity was trimmed.</div>
-  <div id="tools-A" class="output tools empty" data-empty="External tool calls and results appear here."></div>
+  <div id="tools-A" class="output tools empty" data-empty="Built-in and MCP tool calls and results appear here."></div>
  </details>
  <details class="tools-wrap native-wrap"><summary>Native response</summary>
   <div class="panel-head"><button class="copy-all" data-copy="native-A">Copy raw</button><label class="follow"><input id="follow-native-A" type="checkbox" checked>Follow</label></div>
@@ -49,7 +49,7 @@
  <details class="tools-wrap"><summary>Tool activity <span id="tool-status-B">No calls</span></summary>
   <div class="panel-head"><button class="copy-all" data-copy="tools-B">Copy raw</button><label class="follow"><input id="follow-tools-B" type="checkbox" checked>Follow</label></div>
   <div id="tools-clipped-B" class="clipped" hidden>Older displayed tool activity was trimmed.</div>
-  <div id="tools-B" class="output tools empty" data-empty="External tool calls and results appear here."></div>
+  <div id="tools-B" class="output tools empty" data-empty="Built-in and MCP tool calls and results appear here."></div>
  </details>
  <details class="tools-wrap native-wrap"><summary>Native response</summary>
   <div class="panel-head"><button class="copy-all" data-copy="native-B">Copy raw</button><label class="follow"><input id="follow-native-B" type="checkbox" checked>Follow</label></div>
@@ -60,9 +60,9 @@
 <section class="peer mailbox" aria-label="Thought messages">
  <div class="peer-header"><div class="panel-head" style="padding:0"><h2>Thought messages</h2><label class="follow"><input id="follow-messages" type="checkbox" checked>Follow</label></div>
  <div class="metrics"><strong id="count-total">0</strong><span>A + B thought tokens</span><strong class="speed" id="speed-total">0.0</strong><span>tok/s</span></div>
- <p class="muted">Messages wait until the other agent checks its inbox.</p>
+ <p class="muted">Thoughts wait for an inbox check. Pings request attention.</p>
  </div>
- <div id="thread" class="thread empty" data-empty="Thoughts can be sent without interrupting either agent. Their messages and delivery status appear here."></div>
+ <div id="thread" class="thread empty" data-empty="Thought messages, attention pings, and delivery status appear here."></div>
 </section>
 </main>
 <div id="messages" class="messages" aria-label="Your messages"></div>

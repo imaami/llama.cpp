@@ -6,6 +6,8 @@ const textLimit = 512 * 1024;
 const segmentLimit = 512;
 const outputs = {};
 const bubbles = new Map();
+const pendingAttention = new Map();
+const attentionRows = [];
 let state = null;
 let source = null;
 let lastEvent = 0;
@@ -137,7 +139,8 @@ const phaseLabels = {
     waiting_reasoning: 'Waiting for server (reasoning)', reasoning: 'Thinking',
     waiting_native: 'Waiting for server (answer/tool call)',
     native_output: 'Generating answer/tool call (buffered)', parsing_native: 'Parsing answer/tool call',
-    thought_result: 'Applying thought result', mcp: 'Waiting for MCP tool', tool_result: 'Applying tool result',
+    thought_tool: 'Preparing thought result', thought_result: 'Applying thought result', attention: 'Applying partner attention',
+    mcp: 'Waiting for MCP tool', tool_result: 'Applying tool result',
     recovering_protocol: 'Repairing response format', repairing_protocol: 'Preparing thought command'
 };
 function applyState(next) {
@@ -150,9 +153,9 @@ function applyState(next) {
     for (const option of byId('target').options) option.disabled = legacy && option.value !== 'both';
     if (legacy) byId('target').value = 'both';
     byId('description').textContent = legacy ? 'Two reasoning streams with legacy covert peer imports.' :
-        'Two independent minds. Read thoughts, send a message, check the inbox.';
-    byId('tools-status').textContent = (legacy ? 'Legacy splice mode' : 'Reasoning commands: read thoughts · send thought · check inbox') +
-        (state.tools ? ' / ' + number(state.tools) + ' native tools' : '');
+        'Two independent minds. Read thoughts, send a message, check the inbox, or request attention.';
+    byId('tools-status').textContent = (legacy ? 'Legacy splice mode / ' : '') + number(state.thought_tools) + ' built-in thought tools' +
+        (state.tools ? ' / ' + number(state.tools) + ' MCP tools' : '');
     let total = 0;
     let speed = 0;
     for (const peer of state.peers || []) {
@@ -183,6 +186,8 @@ function applyState(next) {
             'Imported ' + number(peer.imported),
             ...(peer.protocol_retries ? ['Protocol retries ' + number(peer.protocol_retries)] : []),
             ...(peer.protocol_repairs ? ['Protocol repairs ' + number(peer.protocol_repairs)] : []),
+            ...(peer.attention_pending ? ['Attention pending'] : []),
+            ...(peer.attention_received ? ['Pings received ' + number(peer.attention_received)] : []),
             ...(peer.queued ? ['Queued ' + number(peer.queued)] : [])
         ]) {
             const item = document.createElement('span');
@@ -205,6 +210,8 @@ function resetDisplay() {
     byId('thread').replaceChildren();
     byId('thread').classList.add('empty');
     bubbles.clear();
+    pendingAttention.clear();
+    attentionRows.length = 0;
     notice('error', '');
     notice('warning', '');
 }
@@ -265,6 +272,36 @@ function showThought(record) {
     follow(byId('thread'), byId('follow-messages'));
 }
 
+function showAttention(record) {
+    if (!peers.includes(record.from) || !peers.includes(record.to) || record.from === record.to ||
+        !['queued', 'delivered', 'coalesced'].includes(record.status)) return;
+    const key = record.from + ':' + record.to;
+    let row = pendingAttention.get(key);
+    if (!row) {
+        const element = document.createElement('div');
+        element.className = 'attention-row';
+        const label = document.createElement('span');
+        label.textContent = record.from + ' nudged ' + record.to;
+        const status = document.createElement('span');
+        status.className = 'attention-status';
+        element.append(label, status);
+        byId('thread').append(element);
+        byId('thread').classList.remove('empty');
+        row = { key, element, status };
+        if (record.status === 'queued') pendingAttention.set(key, row);
+        attentionRows.push(row);
+        while (attentionRows.length > 100) {
+            const first = attentionRows.shift();
+            first.element.remove();
+            if (pendingAttention.get(first.key) === first) pendingAttention.delete(first.key);
+        }
+    }
+    row.status.textContent = { queued: 'Queued', coalesced: 'Duplicate ping suppressed', delivered: 'Delivered' }[record.status];
+    row.element.dataset.status = record.status;
+    if (record.status === 'delivered') pendingAttention.delete(key);
+    follow(byId('thread'), byId('follow-messages'));
+}
+
 function fence(text, language) {
     const marks = String.fromCharCode(96);
     const runs = text.match(/\x60+/g) || [];
@@ -319,6 +356,12 @@ function handleEvent(event) {
         case 'thought_result':
             if (peer) appendOutput('thought-' + peer, record.text, true);
             break;
+        case 'attention_result':
+            if (peer) {
+                appendOutput('thought-' + peer, record.text, true, 'Partner attention');
+                outputBoundary('thought-' + peer, 'After attention notice');
+            }
+            break;
         case 'protocol_feedback':
             if (peer) {
                 const attempt = Number.isInteger(record.attempt) ?
@@ -346,6 +389,7 @@ function handleEvent(event) {
             }
             break;
         case 'thought_message': showThought(record); break;
+        case 'attention': showAttention(record); break;
         // thought_capture is metadata; thought_result already has its verbatim
         // content and framing. Showing both would duplicate imported thoughts.
         case 'answer_start': if (peer) clearOutput('answer-' + peer); break;

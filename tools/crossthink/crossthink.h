@@ -51,6 +51,7 @@ struct crossthink_options {
     int32_t max_tool_rounds = 8;
     int32_t protocol_retries = -1;
     bool strict_thought_protocol = false;
+    bool legacy_thought_commands = false;
     bool telepathy = true;
     int32_t link_quantum = 64;
     int32_t private_quantum = 256;
@@ -101,6 +102,16 @@ private:
         size_t sender;
         std::string text;
     };
+    struct thought_delivery {
+        std::vector<llama_token> tokens;
+        std::vector<crossthink_json> events;
+        std::vector<thought_message> inbox;
+        uint64_t exchanges = 0;
+        uint64_t peek_turn = 0;
+        size_t peek_tokens = 0;
+        size_t peek_bytes = 0;
+        bool peeked = false;
+    };
     struct token_sample {
         std::chrono::steady_clock::time_point time;
         uint64_t generated;
@@ -123,6 +134,9 @@ private:
         int32_t tool_rounds = 0;
         uint64_t protocol_retries = 0;
         uint64_t protocol_repairs = 0;
+        uint64_t attention_received = 0;
+        bool attention_pending = false;
+        std::chrono::steady_clock::time_point last_attention;
         uint32_t generation_limit = 0;
         server_thought_scanner thought_scanner;
         uint64_t revision = 1;
@@ -190,8 +204,11 @@ private:
     void begin_request(peer_state & peer, const char * phase);
     void count_tokens(peer_state & peer, uint64_t generated, uint64_t thinking);
     bool thought_command(size_t index, uint64_t generation_epoch, const crossthink_json & result,
-            std::unique_lock<std::mutex> & lock);
+            std::unique_lock<std::mutex> & lock, thought_delivery * deferred = nullptr,
+            crossthink_json * response = nullptr, size_t bridge_reserve = 0);
     void telepathy_worker(size_t index);
+    crossthink_json queue_attention(size_t sender);
+    bool deliver_attention(size_t index, uint64_t generation_epoch, std::unique_lock<std::mutex> & lock);
 
     crossthink_json state_locked() const;
     void emit(crossthink_json event);

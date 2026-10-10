@@ -1,5 +1,6 @@
 #include "crossthink.h"
 #include "crossthink-protocol.h"
+#include "crossthink-tools.h"
 
 #include <algorithm>
 #include <chrono>
@@ -51,7 +52,20 @@ crossthink_session::crossthink_session(
             if (!peer.info.value("tool_parse", false) || (peer.tools && peer.tools->tools().empty())) {
                 throw std::runtime_error("native tools require updated model servers and a nonempty MCP catalogue when configured");
             }
-            json definitions = peer.tools ? peer.tools->tools() : json::array();
+            json definitions = options.telepathy ? crossthink_thought_tools() : json::array();
+            std::set<std::string> names;
+            for (const auto & definition : definitions) {
+                names.insert(definition.at("function").at("name").get<std::string>());
+            }
+            if (peer.tools) {
+                for (const auto & definition : peer.tools->tools()) {
+                    const auto name = definition.at("function").at("name").get<std::string>();
+                    if (!names.insert(name).second) {
+                        throw std::runtime_error("duplicate or reserved tool name: " + name);
+                    }
+                    definitions.push_back(definition);
+                }
+            }
             if (options.telepathy) {
                 peer.transport->configure_peer(peer_name(index));
             }
@@ -60,7 +74,7 @@ crossthink_session::crossthink_session(
         if ((options.paragraph_splice || options.telepathy) && !peer.info.value("splice", false)) {
             throw std::runtime_error("paragraph splicing requires updated model servers with splice support");
         }
-        if (options.telepathy && (!peer.info.value("thought_commands", false) ||
+        if (options.telepathy && options.legacy_thought_commands && (!peer.info.value("thought_commands", false) ||
                 !peer.info.value("thought_command_lines", false))) {
             throw std::runtime_error("thought commands require updated model servers with line-anchored reasoning-command support");
         }
@@ -137,7 +151,7 @@ json crossthink_session::state_locked() const {
         {"error", error}, {"last_event_id", next_event_id - 1}, {"peers", json::array()},
         {"splice_mode", options.telepathy ? "independent" : options.paragraph_splice ? "paragraph" : "fixed"},
         {"exchanges", exchanges}, {"tools", peers[0].tools ? peers[0].tools->tools().size() : 0},
-        {"telepathy", options.telepathy}, {"thought_tools", options.telepathy ? 3 : 0},
+        {"telepathy", options.telepathy}, {"thought_tools", options.telepathy ? 4 : 0},
         {"thinking_tokens", 0}, {"tokens_per_second", 0.0}, {"thinking_tokens_per_second", 0.0},
     };
     const auto now = std::chrono::steady_clock::now();
@@ -175,6 +189,7 @@ json crossthink_session::state_locked() const {
             {"empty_response", peer.empty_response},
             {"protocol_retries", peer.protocol_retries},
             {"protocol_repairs", peer.protocol_repairs},
+            {"attention_pending", peer.attention_pending}, {"attention_received", peer.attention_received},
             {"mailbox", peer.mailbox.size()}, {"thought_turn", peer.thought_turn},
             {"phase", phase}, {"request_generated", peer.request_generated},
             {"request_elapsed_seconds", elapsed(peer.request_started)}, {"last_token_age_seconds", elapsed(peer.last_token)},
@@ -285,7 +300,8 @@ void crossthink_session::command(const std::string & action, const std::string &
             if (mode != "thinking") { throw std::logic_error("only an active thinking session can be paused"); }
         } else if (action == "resume") {
             if (mode != "paused" || !error.empty() || (peers[0].tape.empty() && peers[1].tape.empty()) ||
-                    (peers[0].answer_done && peers[1].answer_done)) {
+                    (peers[0].answer_done && peers[1].answer_done &&
+                        !peers[0].attention_pending && !peers[1].attention_pending)) {
                 throw std::logic_error("there is no paused reasoning session to resume");
             }
         } else if (action == "answer") {
@@ -408,7 +424,7 @@ bool crossthink_session::receive(size_t index, uint64_t generation_epoch, bool a
     if (options.telepathy && !answer && !content.empty()) {
         peer.thought_text += content;
         peer.thought_visible_tokens = peer.thought_tokens.size();
-        peer.thought_scanner.feed(content);
+        if (options.legacy_thought_commands) { peer.thought_scanner.feed(content); }
     }
     if (closed) { peer.thought_scanner = {}; }
     if (!content.empty()) { emit({{"type", answer ? "answer" : "token"}, {"peer", peer_name(index)}, {"text", content}}); }
@@ -516,7 +532,8 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
         if (calls.empty()) {
             const auto content = parse_error.empty() ? assistant.value("content", std::string()) : std::string();
             crossthink_repaired_command repaired;
-            const bool repairable = options.telepathy && !options.strict_thought_protocol &&
+            const bool repairable = options.telepathy && options.legacy_thought_commands &&
+                !options.strict_thought_protocol &&
                 (parse_error.empty() || parse_rejected) &&
                 crossthink_repair_thought_command(parse_rejected ? raw_output : content, repaired);
             const bool protocol_error = options.telepathy && (parse_rejected ||
@@ -541,9 +558,12 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
                         (parse_rejected
                             ? "Your previous response did not match the native output format and was rejected before any tool execution. "
                             : "Your previous final response contained only a thought command after reasoning had closed. ") +
-                        "Nothing from that response was executed. Continue the user task in this open reasoning block. "
-                        "If a thought command is needed, emit its complete literal syntax on its own line with real content, "
-                        "outside code fences. Do not analyze, demonstrate, or repeatedly test the protocol. "
+                        "Nothing from that response was executed. Continue the user task in this open reasoning block. " +
+                        (options.legacy_thought_commands
+                            ? "If a thought command is needed, emit its complete literal syntax on its own line with real content, outside code fences. "
+                            : "Use the registered native tools send_thought, check_inbox, read_thoughts, or ping_peer when communication is useful. "
+                              "Do not emit ct command tags. Tool results will appear inside your next reasoning block. ") +
+                        "Do not analyze, demonstrate, or repeatedly test the protocol. "
                         "An empty inbox is not a reason to stop.\n</ct:protocol_error>";
                     peer.phase = repairable ? "repairing_protocol" : "recovering_protocol";
                     peer.tool_status = repairable ? "preparing thought command" : "repairing response protocol";
@@ -573,7 +593,8 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
                     if (repair_failure.empty()) {
                         peer.tape.insert(peer.tape.end(), suffix.begin(), suffix.end());
                         peer.thinking_open = true;
-                        begin_thought(peer);
+                        if (options.legacy_thought_commands) { begin_thought(peer); }
+                        else { peer.thought_scanner = {}; peer.thought_scanner.thinking = true; }
                         peer.tool_status.clear();
                         if (repairable) {
                             ++peer.protocol_repairs;
@@ -635,64 +656,128 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
                 throw std::runtime_error("duplicate tool call ID in assistant turn");
             }
         }
+        const bool native_thoughts = options.telepathy;
+        const uint64_t reserve = (options.telepathy ? 256 : 2 * options.chunk_tokens) +
+            budget + options.answer_tokens + 2;
         json results = json::array();
+        bool has_thought_calls = false;
+        bool has_external_calls = false;
+        for (const auto & call : assistant["tool_calls"]) {
+            const auto name = call.at("function").at("name").get<std::string>();
+            const bool builtin = native_thoughts && !crossthink_thought_command(name).empty();
+            has_thought_calls = has_thought_calls || builtin;
+            has_external_calls = has_external_calls || !builtin;
+            results.push_back({{"role", "tool"}, {"tool_call_id", call.at("id")}, {"name", name},
+                {"content", builtin ? "Result follows in reasoning." : "External tool result pending."}});
+        }
+        std::vector<llama_token> suffix;
+        thought_delivery deferred;
+        const auto prepare_suffix = [&] {
+            lock.unlock();
+            try { suffix = peer.transport->tool_results(assistant, results); }
+            catch (...) { lock.lock(); throw; }
+            lock.lock();
+            if (stopping || generation_id(index) != generation_epoch || mode == "error") { return false; }
+            if (suffix.empty() || peer.tape.size() + suffix.size() + deferred.tokens.size() + reserve >= peer.context_size) {
+                throw std::runtime_error("tool results do not fit the remaining context; reset or reduce token budgets");
+            }
+            return true;
+        };
+        // Validate the bridge before sending anything. Builtin-only turns reuse this
+        // exact suffix; read cursors and inbox consumption commit with the injected tokens.
+        if (has_thought_calls && !prepare_suffix()) { return false; }
+        bool suffix_current = has_thought_calls;
         for (size_t i = 0; i < calls.size(); ++i) {
             auto & call = assistant["tool_calls"][i];
             const auto name = call.at("function").at("name").get<std::string>();
             const auto call_id = call.at("id").get<std::string>();
+            const auto thought = native_thoughts ? crossthink_thought_command(name) : std::string();
             ++peer.tool_calls;
             const auto arguments = call.at("function").at("arguments");
             peer.tool_status = name;
-            peer.phase = "mcp";
+            peer.phase = thought.empty() ? "mcp" : "thought_tool";
             emit({{"type", "tool_call"}, {"peer", peer_name(index)}, {"name", name},
                 {"call_id", call_id}, {"arguments", arguments}});
             emit_state();
             json response;
-            try {
-                const auto parsed = arguments.is_string() ? json::parse(arguments.get<std::string>()) : arguments;
-                if (!parsed.is_object()) {
-                    throw std::runtime_error("tool arguments must be a JSON object");
+            if (!thought.empty()) {
+                if (!suffix_current && !prepare_suffix()) { return false; }
+                suffix_current = true;
+                std::string payload, argument_error;
+                try {
+                    const auto parsed = arguments.is_string() ? json::parse(arguments.get<std::string>()) : arguments;
+                    crossthink_thought_arguments(name, parsed, payload, argument_error);
+                } catch (const std::exception & exception) {
+                    argument_error = std::string("Invalid thought tool arguments: ") + exception.what();
                 }
-                if (!peer.tools) { throw std::runtime_error("unknown tool: " + name); }
-                lock.unlock();
-                response = peer.tools->call(name, parsed);
-                lock.lock();
-            } catch (const std::exception & exception) {
-                if (!lock.owns_lock()) { lock.lock(); }
-                response = {{"isError", true}, {"content", json::array({{
-                    {"type", "text"}, {"text", std::string("Tool request failed: ") + exception.what() +
-                        ". A transport failure may occur after execution; do not blindly repeat a side effect."},
-                }})}};
+                if (!thought_command(index, generation_epoch,
+                        {{"thought_command", thought}, {"thought_payload", payload}, {"thought_error", argument_error}},
+                        lock, &deferred, &response, suffix.size() + reserve)) {
+                    return false;
+                }
+            } else {
+                try {
+                    const auto parsed = arguments.is_string() ? json::parse(arguments.get<std::string>()) : arguments;
+                    if (!parsed.is_object()) {
+                        throw std::runtime_error("tool arguments must be a JSON object");
+                    }
+                    if (!peer.tools) { throw std::runtime_error("unknown tool: " + name); }
+                    lock.unlock();
+                    response = peer.tools->call(name, parsed);
+                    lock.lock();
+                } catch (const std::exception & exception) {
+                    if (!lock.owns_lock()) { lock.lock(); }
+                    response = {{"isError", true}, {"content", json::array({{
+                        {"type", "text"}, {"text", std::string("Tool request failed: ") + exception.what() +
+                            ". A transport failure may occur after execution; do not blindly repeat a side effect."},
+                    }})}};
+                }
             }
             if (stopping || generation_id(index) != generation_epoch || mode == "error") {
                 return false;
             }
-            emit({{"type", "tool_result"}, {"peer", peer_name(index)}, {"name", name},
-                {"call_id", call_id}, {"result", response}});
-            std::string content = response.dump();
-            if (content.size() > 65536) {
-                size_t length = 65536;
-                while (length && (static_cast<unsigned char>(content[length]) & 0xc0) == 0x80) { --length; }
-                content.resize(length);
-                content += "\n[Tool result truncated at 64 KiB]";
+            json result_event = {{"type", "tool_result"}, {"peer", peer_name(index)}, {"name", name},
+                {"call_id", call_id}, {"result", response}};
+            if (thought == "inbox" || thought == "peek") { deferred.events.push_back(std::move(result_event)); }
+            else { emit(std::move(result_event)); }
+            if (thought.empty()) {
+                std::string content = response.dump();
+                if (content.size() > 65536) {
+                    size_t length = 65536;
+                    while (length && (static_cast<unsigned char>(content[length]) & 0xc0) == 0x80) { --length; }
+                    content.resize(length);
+                    content += "\n[Tool result truncated at 64 KiB]";
+                }
+                results[i]["content"] = std::move(content);
+                suffix_current = false;
             }
-            results.push_back({{"role", "tool"}, {"tool_call_id", call_id}, {"name", name}, {"content", content}});
         }
         peer.phase = "tool_result";
-        lock.unlock();
-        const auto suffix = peer.transport->tool_results(assistant, results);
-        lock.lock();
-        if (stopping || generation_id(index) != generation_epoch || mode == "error") {
-            return false;
+        if (has_external_calls && !suffix_current && !prepare_suffix()) { return false; }
+        if (deferred.inbox.size() > peer.mailbox.size()) { throw std::runtime_error("inbox changed before delivery"); }
+        for (size_t i = 0; i < deferred.inbox.size(); ++i) {
+            if (peer.mailbox[i].id != deferred.inbox[i].id) { throw std::runtime_error("inbox changed before delivery"); }
         }
-        const uint64_t reserve = (options.telepathy ? 256 : 2 * options.chunk_tokens) +
-            budget + options.answer_tokens + 2;
-        if (suffix.empty() || peer.tape.size() + suffix.size() + reserve >= peer.context_size) {
-            throw std::runtime_error("tool results do not fit the remaining context; reset or reduce token budgets");
-        }
+        peer.tape.reserve(peer.tape.size() + suffix.size() + deferred.tokens.size());
         peer.tape.insert(peer.tape.end(), suffix.begin(), suffix.end());
+        peer.tape.insert(peer.tape.end(), deferred.tokens.begin(), deferred.tokens.end());
+        peer.imported += deferred.tokens.size();
+        if (deferred.peeked) {
+            peer.peek_turn = deferred.peek_turn;
+            peer.peek_tokens = deferred.peek_tokens;
+            peer.peek_bytes = deferred.peek_bytes;
+        }
+        for (const auto & message : deferred.inbox) {
+            peer.mailbox_bytes -= message.text.size();
+            peer.mailbox.pop_front();
+        }
+        exchanges += deferred.exchanges;
+        for (auto & event : deferred.events) { emit(std::move(event)); }
         peer.thinking_open = true;
-        if (options.telepathy) { begin_thought(peer); }
+        if (options.telepathy) {
+            if (options.legacy_thought_commands) { begin_thought(peer); }
+            else { peer.thought_scanner = {}; peer.thought_scanner.thinking = true; }
+        }
         peer.tool_status.clear();
         return true;
     } catch (...) {
@@ -705,18 +790,21 @@ bool crossthink_session::tool_turn(size_t index, uint64_t generation_epoch, std:
 }
 
 bool crossthink_session::thought_command(size_t index, uint64_t generation_epoch, const json & result,
-        std::unique_lock<std::mutex> & lock) {
+        std::unique_lock<std::mutex> & lock, thought_delivery * deferred, json * response,
+        size_t bridge_reserve) {
     auto & peer = peers[index];
     auto & other = peers[1 - index];
     peer.phase = "thought_result";
     const std::string command = result.value("thought_command", std::string());
     const std::string failure = result.value("thought_error", std::string());
-    if (command != "peek" && command != "send" && command != "inbox") {
+    if (command != "peek" && command != "send" && command != "inbox" && command != "ping") {
         throw std::runtime_error("server returned an unknown thought command");
     }
     const uint64_t captured_turn = other.thought_turn;
-    const size_t start_tokens = peer.peek_turn == captured_turn ? peer.peek_tokens : 0;
-    const size_t start_bytes = peer.peek_turn == captured_turn ? peer.peek_bytes : 0;
+    const bool staged_cursor = deferred && deferred->peeked;
+    const uint64_t peek_turn = staged_cursor ? deferred->peek_turn : peer.peek_turn;
+    const size_t start_tokens = peek_turn == captured_turn ? (staged_cursor ? deferred->peek_tokens : peer.peek_tokens) : 0;
+    const size_t start_bytes = peek_turn == captured_turn ? (staged_cursor ? deferred->peek_bytes : peer.peek_bytes) : 0;
     const size_t end_tokens = other.thought_visible_tokens, end_bytes = other.thought_text.size();
     const bool source_active = other.active && other.thinking_open && !other.answer_done;
     const uint64_t outgoing_id = command == "send" ? next_message_id++ : 0;
@@ -742,8 +830,18 @@ bool crossthink_session::thought_command(size_t index, uint64_t generation_epoch
             detail = "Queued message " + std::to_string(outgoing_id) + " for " + peer_name(1 - index) +
                 ". It will be delivered when they check their inbox.";
         }
+    } else if (successful && command == "ping") {
+        detail = "Attention requested from your partner. Continue your work without waiting.";
     } else if (successful && command == "inbox") {
         messages = peer.mailbox;
+        if (deferred) {
+            for (const auto & message : deferred->inbox) {
+                if (messages.empty() || messages.front().id != message.id) {
+                    throw std::runtime_error("inbox changed during staged delivery");
+                }
+                messages.pop_front();
+            }
+        }
         if (messages.empty()) { detail = "Inbox empty."; }
         for (const auto & message : messages) {
             detail += "<ct:message id=\"" + std::to_string(message.id) + "\" from=\"" + peer_name(message.sender) +
@@ -767,11 +865,12 @@ bool crossthink_session::thought_command(size_t index, uint64_t generation_epoch
     } catch (...) { lock.lock(); throw; }
     lock.lock();
     if (stopping || generation_id(index) != generation_epoch || mode == "error") { return false; }
-    const size_t reserve = std::max(options.tool_tokens, options.answer_tokens) + options.answer_tokens + 128;
+    const size_t reserve = deferred ? bridge_reserve + deferred->tokens.size() :
+        std::max(options.tool_tokens, options.answer_tokens) + options.answer_tokens + 128;
     if (peer.tape.size() + injected.size() + reserve >= peer.context_size) {
         successful = false;
         text = "\n<ct:result command=\"" + command + "\" error=\"context_full\">Requested data does not fit the remaining context. "
-            "No cursor was advanced, message sent, or inbox drained. Finish your answer or request a new user turn.</ct:result>\n";
+            "No cursor was advanced, message sent, attention requested, or inbox drained. Finish your answer or request a new user turn.</ct:result>\n";
         lock.unlock();
         try { injected = peer.transport->literal_tokens(text); }
         catch (...) { lock.lock(); throw; }
@@ -786,15 +885,33 @@ bool crossthink_session::thought_command(size_t index, uint64_t generation_epoch
             throw std::runtime_error("thought data tokenization produced a control token");
         }
     }
-    peer.tape.insert(peer.tape.end(), injected.begin(), injected.end());
-    peer.imported += injected.size();
-    ++exchanges;
-    emit({{"type", "thought_result"}, {"peer", peer_name(index)}, {"command", command}, {"text", text}, {"success", successful}});
+    if (successful && command == "ping") { queue_attention(index); }
+    if (deferred) {
+        deferred->tokens.insert(deferred->tokens.end(), injected.begin(), injected.end());
+    } else {
+        peer.tape.insert(peer.tape.end(), injected.begin(), injected.end());
+        peer.imported += injected.size();
+    }
+    if (response) { *response = {{"success", successful}, {"text", text}}; }
+    const auto delivery_event = [&](json event) {
+        if (deferred) { deferred->events.push_back(std::move(event)); }
+        else { emit(std::move(event)); }
+    };
+    if (deferred) { ++deferred->exchanges; }
+    else { ++exchanges; }
+    delivery_event({{"type", "thought_result"}, {"peer", peer_name(index)}, {"command", command}, {"text", text}, {"success", successful}});
     if (successful && command == "peek") {
-        peer.peek_turn = captured_turn;
-        peer.peek_tokens = end_tokens;
-        peer.peek_bytes = end_bytes;
-        emit({{"type", "thought_capture"}, {"peer", peer_name(index)}, {"source", peer_name(1 - index)},
+        if (deferred) {
+            deferred->peeked = true;
+            deferred->peek_turn = captured_turn;
+            deferred->peek_tokens = end_tokens;
+            deferred->peek_bytes = end_bytes;
+        } else {
+            peer.peek_turn = captured_turn;
+            peer.peek_tokens = end_tokens;
+            peer.peek_bytes = end_bytes;
+        }
+        delivery_event({{"type", "thought_capture"}, {"peer", peer_name(index)}, {"source", peer_name(1 - index)},
             {"turn", captured_turn}, {"offset", start_bytes}, {"end", end_bytes}, {"text", payload}});
     } else if (successful && command == "send") {
         const uint64_t id = outgoing_id;
@@ -804,10 +921,14 @@ bool crossthink_session::thought_command(size_t index, uint64_t generation_epoch
             {"to", peer_name(1 - index)}, {"text", payload}, {"status", "sent"}});
     } else if (successful && command == "inbox") {
         for (const auto & message : messages) {
-            if (peer.mailbox.empty() || peer.mailbox.front().id != message.id) { throw std::runtime_error("inbox changed during delivery"); }
-            peer.mailbox_bytes -= message.text.size();
-            peer.mailbox.pop_front();
-            emit({{"type", "thought_message"}, {"message_id", message.id}, {"from", peer_name(message.sender)},
+            if (deferred) {
+                deferred->inbox.push_back(message);
+            } else {
+                if (peer.mailbox.empty() || peer.mailbox.front().id != message.id) { throw std::runtime_error("inbox changed during delivery"); }
+                peer.mailbox_bytes -= message.text.size();
+                peer.mailbox.pop_front();
+            }
+            delivery_event({{"type", "thought_message"}, {"message_id", message.id}, {"from", peer_name(message.sender)},
                 {"to", peer_name(index)}, {"text", message.text}, {"status", "received"}});
         }
     }
@@ -819,13 +940,23 @@ void crossthink_session::telepathy_worker(size_t index) {
     std::unique_lock<std::mutex> lock(mutex);
     while (!stopping) {
         changed.wait(lock, [&] {
-            return stopping || (!blocked(index) && (mode == "thinking" || mode == "answering") &&
-                !peer.answer_done && !peer.tape.empty());
+            const bool attention = peer.attention_pending && !peer.force_answer && !answer_requested &&
+                (mode == "thinking" || mode == "answered" || mode == "incomplete");
+            return stopping || (!blocked(index) && !peer.tape.empty() && (attention ||
+                ((mode == "thinking" || mode == "answering") && !peer.answer_done)));
         });
         if (stopping) { break; }
         const uint64_t generation_epoch = generation_id(index);
         try {
             peer.active = true;
+            if (peer.attention_pending && !peer.force_answer && !answer_requested &&
+                    (peer.thinking_open || peer.answer_done)) {
+                deliver_attention(index, generation_epoch, lock);
+                peer.active = false;
+                emit_state();
+                changed.notify_all();
+                continue;
+            }
             if (peer.force_answer || peer.private_pending || !peer.thinking_open) {
                 if (peer.thinking_open) { peer.tape.push_back(peer.close_token); peer.thinking_open = false; }
                 peer.private_pending = false;
@@ -835,7 +966,7 @@ void crossthink_session::telepathy_worker(size_t index) {
                 changed.notify_all();
                 continue;
             }
-            if (!peer.thought_scanner.command.empty()) {
+            if (options.legacy_thought_commands && !peer.thought_scanner.command.empty()) {
                 const json result = {{"thought_command", peer.thought_scanner.command},
                     {"thought_payload", peer.thought_scanner.payload}, {"thought_error", peer.thought_scanner.error}};
                 if (thought_command(index, generation_epoch, result, lock)) {
@@ -869,11 +1000,14 @@ void crossthink_session::telepathy_worker(size_t index) {
                 {"cache_prompt", true}, {"stream", true}, {"return_content", true},
                 {"reasoning_budget_tokens", -1}, {"logit_bias", std::move(bias)}, {"stop", json::array()},
                 {"preserved_tokens", json::array({"</think>"})},
-                {"splice", {{"thought_commands", true}, {"stop_on_think_close", true}}},
+                {"splice", {{"stop_on_think_close", true}}},
             };
-            parameters["splice"]["thought_state"] = peer.thought_scanner.continuation_state();
-            const auto continuation = peer.thought_scanner.continuation();
-            if (!continuation.empty()) { parameters["splice"]["thought_prefix"] = continuation; }
+            if (options.legacy_thought_commands) {
+                parameters["splice"]["thought_commands"] = true;
+                parameters["splice"]["thought_state"] = peer.thought_scanner.continuation_state();
+                const auto continuation = peer.thought_scanner.continuation();
+                if (!continuation.empty()) { parameters["splice"]["thought_prefix"] = continuation; }
+            }
             begin_request(peer, "waiting_reasoning");
             lock.unlock();
             size_t received = 0;
@@ -907,7 +1041,7 @@ void crossthink_session::telepathy_worker(size_t index) {
                     throw std::runtime_error("private tool boundary did not end with the reasoning terminator");
                 }
                 peer.private_pending = true;
-            } else if (boundary == "thought_command") {
+            } else if (boundary == "thought_command" && options.legacy_thought_commands) {
                 if (!peer.thinking_open) { throw std::runtime_error("thought command outside reasoning"); }
                 if (thought_command(index, generation_epoch, result, lock)) {
                     peer.thought_scanner = {};
@@ -926,7 +1060,21 @@ void crossthink_session::telepathy_worker(size_t index) {
                 changed.notify_all();
                 continue;
             }
-            fail(std::string(peer_name(index)) + ": " + exception.what());
+            if (options.legacy_thought_commands) {
+                fail(std::string(peer_name(index)) + ": " + exception.what());
+            } else {
+                peer.answer_done = true;
+                peer.empty_response = true;
+                peer.tool_status.clear();
+                emit({{"type", "notice"}, {"message", std::string(peer_name(index)) + ": " + exception.what() +
+                    "; this agent stopped without an answer. Completed tool effects will not be replayed."}});
+                if (!blocked(index)) {
+                    mode = (peers[1 - index].answer_done || peers[1 - index].tape.empty()) ? completed_mode() :
+                        (peers[1 - index].force_answer ? "answering" : "thinking");
+                }
+                emit_state();
+                changed.notify_all();
+            }
         }
     }
 }
@@ -1157,6 +1305,9 @@ void crossthink_session::apply(const pending_command & command) {
             peer.tool_rounds = 0;
             peer.protocol_retries = 0;
             peer.protocol_repairs = 0;
+            peer.attention_received = 0;
+            peer.attention_pending = false;
+            peer.last_attention = {};
             peer.tool_status.clear();
             peer.thought_turn = 0;
             peer.thought_text.clear();
@@ -1198,6 +1349,8 @@ void crossthink_session::apply(const pending_command & command) {
             peer.tool_rounds = 0;
             peer.protocol_retries = 0;
             peer.private_pending = false;
+            peer.attention_pending = false;
+            peer.last_attention = {};
             peer.force_answer = false;
             peer.tool_status.clear();
             if (options.telepathy) { begin_thought(peer); }
@@ -1206,6 +1359,7 @@ void crossthink_session::apply(const pending_command & command) {
         mode = "thinking";
     } else if (command.action == "answer") {
         if (options.telepathy) { answer_requested = true; }
+        for (auto & peer : peers) { peer.attention_pending = false; }
         for (auto & peer : peers) {
             if (peer.answer_done || peer.tape.empty()) { continue; }
             drain(peer);
@@ -1225,6 +1379,7 @@ void crossthink_session::apply(const pending_command & command) {
         rendezvous();
         mode = (options.telepathy ? answer_requested : peers[0].answer_done || peers[1].answer_done) ? "answering" : "thinking";
     } else if (command.action == "pause" &&
+            !peers[0].attention_pending && !peers[1].attention_pending &&
             (peers[0].answer_done || peers[0].tape.empty()) && (peers[1].answer_done || peers[1].tape.empty())) {
         mode = completed_mode();
     }
