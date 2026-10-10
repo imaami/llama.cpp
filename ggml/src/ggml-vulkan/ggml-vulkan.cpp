@@ -3872,9 +3872,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t channels = i == 0 ? 32 : 64;
         const uint32_t tokens = i == 0 ? 16 : i;
         const std::string suffix = i == 0 ? "" : "_n" + std::to_string(i);
-        ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32[i],           "ssm_conv_f32" + suffix,           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 0}, 1);
-        ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32[i],      "ssm_conv_silu_f32" + suffix,      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 1}, 1);
-        ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32[i], "ssm_conv_bias_silu_f32" + suffix, ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 1, 1}, 1);
+        ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_f32[i],           "ssm_conv_f32" + suffix,           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 0}, 1);
+        ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_silu_f32[i],      "ssm_conv_silu_f32" + suffix,      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 1}, 1);
+        ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_bias_silu_f32[i], "ssm_conv_bias_silu_f32" + suffix, ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 1, 1}, 1);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
