@@ -2568,21 +2568,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
-            if (can_defer() && !batch_in.has_embd() && n_seq_in_batch == 1 && n_tokens <= this->params.n_max + 1) {
+            // common_batch::has_embd() only describes the first row. A later embedded
+            // row must not enter deferred_rows, which stores token IDs and scalar positions.
+            const bool has_embd = std::any_of(batch_in.tokens.begin(), batch_in.tokens.end(),
+                    [](const common_batch::token & t) { return t.embd.data != nullptr; });
+            if (can_defer() && !has_embd && n_seq_in_batch == 1 && n_tokens <= this->params.n_max + 1) {
                 const llama_seq_id seq_id = batch_in.tokens[0].seq_id;
                 next.n_valid = n_tokens;
                 next.pending = true;
                 deferred[seq_id] = std::move(next);
             } else {
-            batch.clear();
-            for (int k = 0; k < n_tokens; ++k) {
-                const auto & t = batch_in.tokens[k];
-                const int32_t idx = t.id != LLAMA_TOKEN_NULL
-                    ? batch.add(t.id, t.pos[0], t.seq_id, false)
-                    : batch.add_embd(t.embd, t.pos.data(), t.seq_id, false);
-                batch.set_embd_state(idx, { next.h.data() + (size_t) k * n_embd, 1, (size_t) n_embd });
-            }
-
             auto * mem_dft = llama_get_memory(ctx_dft);
 
             bool ok = true;
@@ -2598,11 +2593,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = trim_window() ? llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) : -1;
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
+                // MTP contexts accept token rows or embedded rows, but not mixed
+                // ubatches. Preserve their order by decoding homogeneous runs.
+                for (int beg = 0; beg < n_tokens && ok;) {
+                    const bool is_token = batch_in.tokens[beg].id != LLAMA_TOKEN_NULL;
+                    int end = beg;
+                    batch.clear();
+                    while (end < n_tokens && (batch_in.tokens[end].id != LLAMA_TOKEN_NULL) == is_token) {
+                        const auto & t = batch_in.tokens[end];
+                        const int32_t idx = is_token
+                            ? batch.add(t.id, t.pos[0], t.seq_id, false)
+                            : batch.add_embd(t.embd, t.pos.data(), t.seq_id, false);
+                        batch.set_embd_state(idx, { next.h.data() + (size_t) end * n_embd, 1, (size_t) n_embd });
+                        ++end;
+                    }
+                    const int32_t rc = trim_window() ? llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) : -1;
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[beg].pos[0]);
+                        ok = false;
+                    }
+                    beg = end;
+                }
+                if (!ok) {
                     break;
                 }
             }
