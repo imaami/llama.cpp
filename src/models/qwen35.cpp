@@ -146,7 +146,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
         const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-        if (reg_name == nullptr || strcmp(reg_name, "CPU") != 0) {
+        if (reg_name == nullptr || (strcmp(reg_name, "CPU") != 0 && strcmp(reg_name, "Vulkan") != 0)) {
             gdn_state_rows_dev_ok = false;
             gdn_raw_gates_dev_ok  = false;
             break;
