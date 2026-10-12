@@ -924,7 +924,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream*(1 + n_rs_seq))*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -975,7 +975,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
 
-        for (uint32_t s = 0; s < n_stream; ++s) {
+        for (uint32_t s = 0; s < n_planes; ++s) {
             kv_stream.push_back(ggml_view_2d(ctx, kv, n_embd_state, state_size, kv->nb[1], s*kv->nb[2]));
             score_stream.push_back(ggml_view_2d(ctx, score, n_embd_state, state_size, score->nb[1], s*score->nb[2]));
         }
@@ -1026,9 +1026,10 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
     }
 }
 
-void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, uint32_t rs_src) {
     GGML_ASSERT(seq_id_src >= 0 && (uint32_t) seq_id_src < n_stream);
     GGML_ASSERT(seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_stream);
+    GGML_ASSERT(rs_src <= n_rs_seq);
 
     if (seq_id_src == seq_id_dst) {
         return;
@@ -1036,7 +1037,8 @@ void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_
 
     clear(seq_id_dst, true);
 
-    sc_info.ssrc.push_back((uint32_t) seq_id_src);
+    // copy the snapshot plane of a pending rollback, so the destination starts from the rolled-back state
+    sc_info.ssrc.push_back(rs_src*n_stream + (uint32_t) seq_id_src);
     sc_info.sdst.push_back((uint32_t) seq_id_dst);
 }
 
@@ -1521,9 +1523,11 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     kv_hca->seq_cp(seq_id_src, seq_id_dst, -1, -1);
     kv_lid->seq_cp(seq_id_src, seq_id_dst, -1, -1);
 
-    csa_state->seq_cp(seq_id_src, seq_id_dst);
-    hca_state->seq_cp(seq_id_src, seq_id_dst);
-    lid_state->seq_cp(seq_id_src, seq_id_dst);
+    const uint32_t rs_src = seq_id_src != seq_id_dst ? rs_idx[seq_id_src] : 0;
+
+    csa_state->seq_cp(seq_id_src, seq_id_dst, rs_src);
+    hca_state->seq_cp(seq_id_src, seq_id_dst, rs_src);
+    lid_state->seq_cp(seq_id_src, seq_id_dst, rs_src);
 
     if (seq_id_src != seq_id_dst) {
         rs_idx[seq_id_dst] = 0;

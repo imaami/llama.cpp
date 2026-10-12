@@ -316,6 +316,67 @@ struct case_rollback : ctx_test {
     }
 };
 
+// fork a sequence before its pending rollback is applied, then compare the copied state
+// against a sequence that rolled back directly
+struct case_seq_cp_pending_rollback : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback-copy"; }
+
+    const char * description() const override {
+        return "seq_cp preserves a pending rollback in the copied sequence";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr uint32_t  n_prompt   = 12;
+        constexpr uint32_t  n_rollback = 3;
+        constexpr llama_pos p0         = n_prompt - n_rollback;
+
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_batch    = 256;
+        opts.n_ubatch   = 256;
+        opts.n_seq_max  = 2;
+        opts.n_rs_seq   = 8;
+        opts.kv_unified = 0;
+
+        std::vector<uint8_t> state[2];
+        for (int fork : { 1, 0 }) {
+            auto ctx = mr.ctx(opts);
+            CTX_REQUIRE(ctx, "failed to create a rollback-copy context");
+            if (llama_n_rs_seq(ctx.get()) < n_rollback) {
+                return case_result::skip("n_rs_seq is too small");
+            }
+
+            const llama_seq_id src = fork ? 0 : 1;
+            common_batch batch(ctx.get());
+            for (llama_pos pos = 0; pos < (llama_pos) n_prompt; ++pos) {
+                batch.add((5*pos + 3) % n_vocab, pos, src, false);
+            }
+            CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
+                    "rollback-copy prompt decode failed");
+
+            auto mem = llama_get_memory(ctx.get());
+            CTX_REQUIRE(llama_memory_seq_rm(mem, src, p0, -1), "rollback-copy partial removal failed");
+            if (fork) {
+                llama_memory_seq_cp(mem, 0, 1, -1, -1);
+            }
+
+            CTX_REQUIRE(decode_one(ctx.get(), p0 % n_vocab, p0, 1), "rollback-copy continuation failed");
+            CTX_REQUIRE(get_seq_state(ctx.get(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, state[fork]),
+                    "failed to save the rollback-copy state");
+        }
+
+        // Tiny model weights can mask recurrent-state errors in the logits.
+        CTX_REQUIRE(!state[0].empty() && blobs_equal(state[0], state[1]),
+                "copying a pending rollback changed the continued recurrent state");
+
+        return case_result::pass();
+    }
+};
+
 // decode a prompt into seq 0, share its cells with a second sequence, then keep decoding both
 struct case_shared_seq_reserve : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
@@ -397,6 +458,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
+    cases.push_back(std::make_unique<case_seq_cp_pending_rollback>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 

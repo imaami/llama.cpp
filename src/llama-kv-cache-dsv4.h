@@ -27,7 +27,7 @@ public:
         const llama_memory_i::layer_filter_cb & filter);
 
     void clear(llama_seq_id seq_id, bool data);
-    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
+    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, uint32_t rs_src);
     void apply_copies(const stream_copy_info & sc_info) const;
 
     uint32_t get_ratio()      const;

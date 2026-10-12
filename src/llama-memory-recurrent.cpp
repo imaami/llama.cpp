@@ -296,6 +296,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+        // a pending partial rollback is applied at the next decode, so the copy must use the same snapshot row
+        if (n_rs_seq != 0 && (uint32_t) seq_id_src < rs_idx.size() && (uint32_t) seq_id_dst < rs_idx.size()) {
+            rs_idx[seq_id_dst] = rs_idx[seq_id_src];
+        }
     }
 }
 
