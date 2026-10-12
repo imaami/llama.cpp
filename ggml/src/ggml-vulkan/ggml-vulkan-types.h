@@ -550,6 +550,8 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 6, 0, 5 }, // top_k->src[0]   == add
 };
 
+static constexpr std::initializer_list<ggml_op> rms_norm_scale_pattern { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_pattern     { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
@@ -640,6 +642,7 @@ enum topk_moe_mode {
 };
 
 enum rms_norm_mode {
+    RMS_NORM_SCALE,
     RMS_NORM_MUL,
     RMS_NORM_MUL_ADD,
     RMS_NORM_MUL_ADD_MUL,
@@ -882,6 +885,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_f32;
+    std::array<vk_pipeline, 3> pipeline_rms_norm_scale_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_mul_f32;
