@@ -300,6 +300,23 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-mtp-catchup-batch.cpp)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-mtp.cpp LABEL "model"
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/tiny-qwen35-mtp.gguf")
+    set_tests_properties(test-mtp PROPERTIES SKIP_RETURN_CODE 77)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import numpy"
+            RESULT_VARIABLE LLAMA_NUMPY_AVAILABLE OUTPUT_QUIET ERROR_QUIET)
+        if (LLAMA_NUMPY_AVAILABLE EQUAL 0)
+            llama_test_cmd("${Python3_EXECUTABLE}" NAME test-generate-mtp-fixture LABEL "model"
+                ARGS "${CMAKE_CURRENT_SOURCE_DIR}/gen_tiny_qwen35_mtp.py"
+                    "${CMAKE_CURRENT_BINARY_DIR}/tiny-qwen35-mtp.gguf")
+            set_tests_properties(test-generate-mtp-fixture PROPERTIES FIXTURES_SETUP mtp-fixture)
+            set_tests_properties(test-mtp PROPERTIES FIXTURES_REQUIRED mtp-fixture)
+        endif()
+    endif()
+endif()
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
