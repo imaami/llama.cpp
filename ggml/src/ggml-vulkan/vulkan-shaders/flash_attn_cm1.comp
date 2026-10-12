@@ -97,7 +97,9 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
-            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+            Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + fa_q_row_offset(i * Br + r) / 4 + d] * p.scale);
+        } else if (PACK_GQA_TOKENS && r < Br) {
+            Qf[r * qstride + d] = FLOAT_TYPEV4(0);
         }
     }
     barrier();
@@ -180,7 +182,20 @@ void main() {
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
                         if (kv_active) {
                             f16vec4 m;
-                            if (USE_SPARSE) {
+                            if (PACK_GQA_TOKENS) {
+                                // A vec4 may contain heads from both packed tokens.
+                                const uint32_t row0 = r * 4;
+                                const float16_t m0 = row0 < p.gqa_ratio
+                                    ? data_m[m_offset + kcol] : float16_t(NEG_FLT_MAX_OVER_2);
+                                const float16_t m1 = row0 + 3 >= p.gqa_ratio && row0 < N && N > p.gqa_ratio
+                                    ? data_m[m_offset + KV + kcol] : float16_t(NEG_FLT_MAX_OVER_2);
+                                [[unroll]] for (uint32_t lane = 0; lane < 4; ++lane) {
+                                    uint32_t row = row0 + lane;
+                                    m[lane] = row < N ? (row < p.gqa_ratio ? m0 : m1)
+                                                      : float16_t(NEG_FLT_MAX_OVER_2);
+                                }
+                                max_mask = max(max_mask, max(float(m0), float(m1)));
+                            } else if (USE_SPARSE) {
                                 // sparse is gqa-gated (m_stride == 0): all four rows share the value
                                 FLOAT_TYPE mv = FLOAT_TYPE(data_m[m_offset + kcol]);
                                 m = f16vec4(mv);
@@ -566,10 +581,12 @@ void main() {
             }
 
             o_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
-            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                if (tile_row(r) < N) {
-                    perElemOpStoreCol0(tile_row(r), 0u, ACC_TYPE(Lf[r]), o_offset, iq2, N);
-                    perElemOpStoreCol0(tile_row(r), 0u, ACC_TYPE(Mf[r]), o_offset + p.ne1, iq2, N);
+            if (col_tid == 0) {
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    if (tile_row(r) < N) {
+                        perElemOpStoreCol0(tile_row(r), 0u, ACC_TYPE(Lf[r]), o_offset, iq2, N);
+                        perElemOpStoreCol0(tile_row(r), 0u, ACC_TYPE(Mf[r]), o_offset + p.ne1, iq2, N);
+                    }
                 }
             }
         } else {
