@@ -200,6 +200,16 @@ struct vk_op_fwht_push_constants {
     float scale;
 };
 
+struct vk_op_fwht_signed_push_constants {
+    uint32_t n_rows;
+    uint32_t src_offset;
+    uint32_t dst_offset;
+    float scale;
+    uint32_t sign_width;
+    uint32_t sign_offset;
+    uint32_t up_offset;
+};
+
 struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_tokens;
 
