@@ -1404,6 +1404,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_fwht_signed {};
+    const ggml_tensor * fwht_q8_consumer {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
