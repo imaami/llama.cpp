@@ -2581,6 +2581,60 @@ struct test_mul_mat_reorder_then_big_batch : public test_case {
     }
 };
 
+// Every packed byte takes all 256 values at every PTQ1 element position.
+struct test_ptq1_decode : public test_case {
+    const bool view;
+
+    test_ptq1_decode(bool view) : view(view) {}
+
+    std::string op_desc(ggml_tensor *) override { return "PTQ1_DECODE"; }
+    std::string vars() override { return VAR_TO_STR(view); }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_PTQ1_0, view ? 384 : 256, view ? 258 : 256);
+        ggml_set_name(src, "packed");
+        if (view) {
+            src = ggml_view_2d(ctx, src, 256, 256, src->nb[1], src->nb[1] + ggml_type_size(src->type));
+        }
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 256);
+        ggml_set_name(ids, "ids");
+        return ggml_get_rows(ctx, src, ids);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "packed") == 0) {
+                GGML_ASSERT(ggml_type_size(t->type) == 28 && ggml_blck_size(t->type) == 128);
+                const size_t blocks_per_row = t->ne[0] / 128;
+                std::vector<uint8_t> bytes(ggml_nbytes(t));
+                for (size_t row = 0; row < (size_t) t->ne[1]; ++row) {
+                    for (size_t block = 0; block < blocks_per_row; ++block) {
+                        uint8_t * q = bytes.data() + (row * blocks_per_row + block) * 28;
+                        for (size_t j = 0; j < 26; ++j) {
+                            q[j] = (uint8_t) (row + 17 * j + 29 * block);
+                        }
+                        const ggml_fp16_t d = ggml_fp32_to_fp16(0.5f * (1u << (block % 4)));
+                        memcpy(q + 26, &d, sizeof(d));
+                    }
+                }
+                ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+            } else if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> ids(256);
+                for (int i = 0; i < 256; ++i) {
+                    ids[i] = (73 * i) % 256;
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(ids[0]));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -10156,6 +10210,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    for (bool view : {false, true}) {
+        test_cases.emplace_back(new test_ptq1_decode(view));
+    }
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));
