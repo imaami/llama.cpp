@@ -9877,9 +9877,12 @@ struct test_flash_attn_ext : public test_case {
                 ne_perm[permute[i]] = ne[i];
             }
             ggml_tensor * t;
-            if (is_view) {
-                ggml_tensor * t0 = ggml_new_tensor_4d(ctx, type, ne_perm[0], 2*ne_perm[1], ne_perm[2], ne_perm[3]);
-                t = ggml_view_4d(ctx, t0, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3], t0->nb[1], t0->nb[2], t0->nb[3], 0);
+            if (is_view || offset_views) {
+                // 32 rows retain 256-byte descriptor alignment for the tested
+                // Q8_0/Q4_0 head sizes while exercising nonzero Q/K/V offsets.
+                const int64_t offset_rows = offset_views ? 32 : 0;
+                ggml_tensor * t0 = ggml_new_tensor_4d(ctx, type, ne_perm[0], 2*ne_perm[1] + offset_rows, ne_perm[2], ne_perm[3]);
+                t = ggml_view_4d(ctx, t0, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3], t0->nb[1], t0->nb[2], t0->nb[3], offset_rows*t0->nb[1]);
             } else {
                 t = ggml_new_tensor_4d(ctx, type, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3]);
             }
@@ -14391,6 +14394,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3}) {
             test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, type_K, GGML_TYPE_F8_E4M3));
         }
+    }
+
+    // Bonsai MTP: two-token GQA6 packing, odd-token tails, and a second packed
+    // tile. Small/large KV exercise unsplit and split-K output addressing;
+    // permuted, offset Q/K/V views exercise independent head/token strides.
+    for (int64_t nb : {2, 3, 4}) {
+        for (int64_t kv : {32, 1025}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 1025, nb, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, true, true));
+    }
+    // N=1 remains on the existing decode path; feature flags force fallback.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1025, 1, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1025, 2, true, true, 8, 30,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
+    // Server masks pad query rows; packed tokens must not reuse mask-opt tile flags.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1025, 2, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true, false, 32));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 256, 2, {6, 1}, 4097, 2, false, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
+
+    // Packed mask vectors with aligned and unaligned token boundaries, plus odd-token tails.
+    for (int64_t gqa : {4, 7}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {gqa, 1}, 1025, 3, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
     }
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
