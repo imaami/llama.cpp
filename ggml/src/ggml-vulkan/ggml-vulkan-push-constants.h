@@ -831,6 +831,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t spg1, spg2, spg3;
 };
 
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;

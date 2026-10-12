@@ -4181,11 +4181,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
-        const char * gdn_names[][2] = {
-            {"gated_delta_net_f32_d16",     "gated_delta_net_f32_d16_kda"},
-            {"gated_delta_net_f32_d32",     "gated_delta_net_f32_d32_kda"},
-            {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
-            {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
+        const char * gdn_names[][3] = {
+            {"gated_delta_net_f32_d16",     "gated_delta_net_f32_d16_kda", "gated_delta_net_f32_d16_raw"},
+            {"gated_delta_net_f32_d32",     "gated_delta_net_f32_d32_kda", "gated_delta_net_f32_d32_raw"},
+            {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda", "gated_delta_net_f32_d64_raw"},
+            {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda", "gated_delta_net_f32_d128_raw"},
         };
         for (uint32_t si = 0; si < 4; si++) {
             const uint32_t S_V = gdn_sizes[si];
@@ -11503,6 +11503,8 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const ggml_tensor * src_k     = dst->src[1];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_rows  = dst->src[6] ? dst->src[6] : src_beta;
 
     GGML_ASSERT(dst->buffer != nullptr);
 
@@ -11513,6 +11515,10 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const uint32_t K = (uint32_t)ggml_get_op_params_i32(dst, 0);
+
+    const bool raw_gates = ggml_get_op_params_i32(dst, 1) != 0;
+    const ggml_tensor * raw_dt_bias = raw_gates ? dst->src[7] : src_beta;
+    const ggml_tensor * raw_a = raw_gates ? dst->src[8] : src_beta;
 
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 
@@ -17724,10 +17730,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GATED_DELTA_NET:
             {
-                // Indexed state and raw gates require CPU fallback.
-                if (op->src[6] != nullptr || ggml_get_op_params_i32(op, 1) != 0) {
-                    return false;
-                }
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
                     return false;
@@ -17735,6 +17737,29 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 for (int i = 0; i < 6; i++) {
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
                         return false;
+                    }
+                }
+                if (op->src[6] != nullptr) {
+                    const ggml_tensor * state = op->src[5];
+                    const ggml_tensor * rows = op->src[6];
+                    if (rows->type != GGML_TYPE_I32 || !ggml_is_contiguous(rows) ||
+                        ggml_nelements(rows) != op->src[2]->ne[3] || rows->view_offs % sizeof(int32_t) != 0 ||
+                        !ggml_is_contiguous(state) || state->ne[0] != S_v * S_v * op->src[2]->ne[1] ||
+                        state->ne[2] != 1 || state->ne[3] != 1 || state->view_offs % sizeof(float) != 0 ||
+                        ggml_nbytes(state) > UINT32_MAX || ggml_nbytes(rows) > UINT32_MAX) {
+                        return false;
+                    }
+                }
+                if (ggml_get_op_params_i32(op, 1) != 0) {
+                    if (op->src[3]->ne[0] != 1) {
+                        return false;
+                    }
+                    for (int i = 7; i < 9; ++i) {
+                        const ggml_tensor * t = op->src[i];
+                        if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
+                            ggml_nelements(t) != op->src[2]->ne[1] || t->view_offs % sizeof(float) != 0) {
+                            return false;
+                        }
                     }
                 }
                 return op->type == GGML_TYPE_F32;

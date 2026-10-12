@@ -5529,6 +5529,10 @@ struct test_gated_delta_net : public test_case {
     // lower bound of the log-gate; a mild gate keeps the state alive over the whole sequence
     const float   g_min;
 
+    const bool    raw_edges;
+    const bool    rows_view;
+    int           n_init = 0;
+
     std::string vars() override {
         std::string s = VARS_TO_STR12(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, correlated, padded_v, padded_q, permuted_k);
         if (g_min != -20.0f) {
@@ -5680,9 +5684,9 @@ struct test_gated_delta_net_replay : public test_case {
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, raw_gates ? -4.0f : 0.0f, raw_gates ? 4.0f : 1.0f);
             } else if (strcmp(t->name, "dt_bias") == 0) {
-                init_tensor_uniform(t, -1.0f, 1.0f);
+                init_tensor_uniform(t, raw_edges ? 0.0f : -1.0f, raw_edges ? 0.0f : 1.0f);
             } else if (strcmp(t->name, "a") == 0) {
-                init_tensor_uniform(t, -8.0f, -0.05f);
+                init_tensor_uniform(t, raw_edges ? -0.05f : -8.0f, -0.05f);
             } else if (strcmp(t->name, "v") == 0) {
                 init_tensor_uniform(t, -0.3f, 5.0f);
             } else if (strcmp(t->name, "n_rep") == 0) {
@@ -5724,6 +5728,62 @@ struct test_gated_delta_net_replay : public test_case {
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
             } else {
                 init_tensor_uniform(t);
+            }
+        }
+        ++n_init;
+    }
+};
+
+// Read indexed state, store snapshots in cache holes, then resume from an older snapshot.
+struct test_gated_delta_net_rows_update : public test_gated_delta_net {
+    ggml_tensor * first = nullptr;
+    ggml_tensor * cache_update = nullptr;
+    ggml_tensor * resumed = nullptr;
+
+    test_gated_delta_net_rows_update(int64_t head_size, int64_t n_tokens, int64_t n_seqs, int64_t K,
+                                    bool raw_gates, bool views, bool kda = false)
+        : test_gated_delta_net(GGML_TYPE_F32, 4, head_size, n_tokens, n_seqs, 1, false, kda, K, true,
+                              2 * std::min(n_tokens, K) * n_seqs + 3, raw_gates, false, views) {}
+
+    std::string op_desc(ggml_tensor *) override { return "GATED_DELTA_NET_ROWS_UPDATE"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return {first, cache_update, resumed}; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        first = test_gated_delta_net::build_graph(ctx);
+        const int64_t D = head_size * head_size * head_count;
+        const int64_t n_written = std::min(n_seq_tokens, K);
+        const int64_t attn_size = head_size * head_count * n_seq_tokens * n_seqs;
+        ggml_tensor * snapshots = ggml_view_2d(ctx, first, D, n_written * n_seqs, D * sizeof(float), attn_size * sizeof(float));
+        ggml_tensor * write_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_written * n_seqs);
+        ggml_set_name(write_rows, "write_rows");
+        cache_update = ggml_set_rows(ctx, first->src[5], snapshots, write_rows);
+        ggml_tensor * resume_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(resume_rows, "resume_rows");
+        resumed = ggml_gated_delta_net_rows(ctx, first->src[0], first->src[1], first->src[2],
+                                           first->src[3], first->src[4], cache_update, resume_rows, K);
+        if (raw_gates) {
+            ggml_gated_delta_net_set_raw_gates(resumed, first->src[7], first->src[8]);
+        }
+        return resumed;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_gated_delta_net::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "write_rows") == 0) {
+                std::vector<int64_t> ids(ggml_nelements(t));
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    ids[i] = (2 * i + n_init) % n_cache_rows();
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "resume_rows") == 0) {
+                std::vector<int32_t> ids(n_seqs);
+                const int64_t slot = std::min(n_seq_tokens, K) > 1 ? 1 : 0;
+                for (int64_t i = 0; i < n_seqs; ++i) {
+                    ids[i] = (2 * (slot * n_seqs + i) + n_init) % n_cache_rows();
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ggml_nbytes(t));
             }
         }
     }
@@ -14755,6 +14815,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  1, 1, false, false, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  2, 2, false, false, 1, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1, 1, false, false, 1, false, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 16,  2, 1, 1, false, false, 4, false, -1, true, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 4, 2, 1, false, false, 2, false, -1, true, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  4, 2, 2, true, false, 4, false, -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1,  2, 1, false, false, 2, true,  -1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
