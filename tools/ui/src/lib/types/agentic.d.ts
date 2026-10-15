@@ -24,6 +24,7 @@ import { AgenticSectionType, ContinueIntentKind, ToolCallType } from '$lib/enums
 export interface AgenticConfig {
 	enabled: boolean;
 	maxTurns: number;
+	parallelToolCalls: boolean;
 }
 
 /**
@@ -78,11 +79,8 @@ export interface AgenticSession {
 	lastError: Error | null;
 	streamingToolCall: { name: string; arguments: string } | null;
 	pendingPermissionRequest: { toolName: string; serverLabel: string } | null;
-	/** ID of the tool call whose output is currently being streamed back
-	 *  (e.g. exec_shell_command outputting to /tools?stream=true). Lets the
-	 *  matching tool renderer flip into live-update mode while chunks
-	 *  arrive; cleared when the tool's terminal event lands. */
-	executingToolCallId: string | null;
+	/** IDs of tool calls currently executing, including streamed tools. */
+	executingToolCallIds: string[];
 	/** Live LLM token totals of the running flow: completed turns plus the
 	 *  in-flight turn's streamed counts; null when idle. */
 	liveLlm: ChatMessageAgenticTimings['llm'] | null;
@@ -211,7 +209,7 @@ export interface AgenticSection {
 	/** ID of the model-side tool call (matches tool_calls[i].id). Lets
 	 *  downstream consumers correlate a section with the agentic loop's
 	 *  currently-executing tool, e.g. to drive live-streaming UI state
-	 *  by matching against agenticStore.getExecutingToolCallId. */
+	 *  by matching against agenticStore.getExecutingToolCallIds. */
 	toolCallId?: string;
 	wasInterrupted?: boolean;
 }

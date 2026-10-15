@@ -29,7 +29,8 @@ export const AGENTIC_TEXT_COPY_SEPARATOR = '\n\n';
 
 export const DEFAULT_AGENTIC_CONFIG: AgenticConfig = {
 	enabled: true,
-	maxTurns: 100
+	maxTurns: 100,
+	parallelToolCalls: false
 } as const;
 
 export const REASONING_TAGS = {

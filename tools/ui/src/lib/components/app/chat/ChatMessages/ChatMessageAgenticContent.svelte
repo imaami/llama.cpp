@@ -92,8 +92,8 @@
 
 	const sections = $derived(deriveAgenticSections(message, toolMessages, [], isStreaming));
 
-	const currentlyExecutingToolCallId = $derived(
-		isStreaming ? agenticStore.getExecutingToolCallId(message.convId) : null
+	const currentlyExecutingToolCallIds = $derived(
+		isStreaming ? agenticStore.getExecutingToolCallIds(message.convId) : []
 	);
 
 	// Cwd the agentic loop passes to tool calls in this conversation; the exec
@@ -190,7 +190,7 @@
 			attachments={section.toolResultExtras}
 			{conversationCwd}
 			isExecuting={section.toolCallId !== undefined &&
-				section.toolCallId === currentlyExecutingToolCallId}
+				currentlyExecutingToolCallIds.includes(section.toolCallId)}
 			{isStreaming}
 			onToggle={() => toggleExpanded(index, section)}
 			open={isExpanded(index, section)}
