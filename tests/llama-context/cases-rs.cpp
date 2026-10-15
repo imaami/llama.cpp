@@ -319,12 +319,25 @@ struct case_rollback : ctx_test {
 // fork a sequence before its pending rollback is applied, then compare the copied state
 // against a sequence that rolled back directly
 struct case_seq_cp_pending_rollback : ctx_test {
+    explicit case_seq_cp_pending_rollback(bool shared) : shared(shared) {}
+
+    const bool shared;
+
     test_group group() const override { return TEST_GROUP_RS; }
 
-    const char * name() const override { return "rollback-copy"; }
+    const char * name() const override { return shared ? "rollback-copy-shared" : "rollback-copy"; }
 
     const char * description() const override {
-        return "seq_cp preserves a pending rollback in the copied sequence";
+        return shared ? "shared continuation consumes every copied rollback marker" :
+                        "seq_cp preserves a pending rollback in the copied sequence";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (shared && arch_reserves_single_seq(mr.model)) {
+            return "the shared-seq batch is a multi-seq graph";
+        }
+
+        return ctx_test::skip_reason(mr);
     }
 
     case_result run(model_run & mr) const override {
@@ -340,7 +353,7 @@ struct case_seq_cp_pending_rollback : ctx_test {
         opts.n_ubatch   = 256;
         opts.n_seq_max  = 2;
         opts.n_rs_seq   = 8;
-        opts.kv_unified = 0;
+        opts.kv_unified = shared;
 
         std::vector<uint8_t> state[2];
         for (int fork : { 1, 0 }) {
@@ -364,7 +377,15 @@ struct case_seq_cp_pending_rollback : ctx_test {
                 llama_memory_seq_cp(mem, 0, 1, -1, -1);
             }
 
-            CTX_REQUIRE(decode_one(ctx.get(), p0 % n_vocab, p0, 1), "rollback-copy continuation failed");
+            batch.clear();
+            batch.add(p0 % n_vocab, p0,
+                    shared && fork ? std::vector<llama_seq_id>{ 0, 1 } : std::vector<llama_seq_id>{ 1 }, true);
+            CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
+                    "rollback-copy continuation failed");
+            if (shared) {
+                CTX_REQUIRE(decode_one(ctx.get(), (p0 + 1) % n_vocab, p0 + 1, 1),
+                        "rollback-copy sequence-only continuation failed");
+            }
             CTX_REQUIRE(get_seq_state(ctx.get(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, state[fork]),
                     "failed to save the rollback-copy state");
         }
@@ -458,7 +479,8 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
-    cases.push_back(std::make_unique<case_seq_cp_pending_rollback>());
+    cases.push_back(std::make_unique<case_seq_cp_pending_rollback>(false));
+    cases.push_back(std::make_unique<case_seq_cp_pending_rollback>(true));
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
