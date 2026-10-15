@@ -6,6 +6,7 @@
  */
 export const SETTINGS_KEYS = {
 	AGENTIC_MAX_TURNS: 'agenticMaxTurns',
+	AGENTIC_PARALLEL_TOOL_CALLS: 'agenticParallelToolCalls',
 	ALWAYS_SHOW_SIDEBAR_ON_DESKTOP: 'alwaysShowSidebarOnDesktop',
 	ALWAYS_SHOW_TOOL_CALL_CONTENT: 'alwaysShowToolCallContent',
 	API_KEY: 'apiKey',

@@ -84,7 +84,7 @@ import { SvelteMap } from 'svelte/reactivity';
 function createDefaultSession(): AgenticSession {
 	return {
 		currentTurn: 0,
-		executingToolCallId: null,
+		executingToolCallIds: [],
 		flowRootMessageId: null,
 		isRunning: false,
 		lastError: null,
@@ -210,7 +210,8 @@ class AgenticStore {
 
 		return {
 			enabled: hasTools && DEFAULT_AGENTIC_CONFIG.enabled,
-			maxTurns
+			maxTurns,
+			parallelToolCalls: settings.agenticParallelToolCalls === true
 		};
 	}
 
@@ -218,8 +219,8 @@ class AgenticStore {
 		return this.sessions.get(conversationId)?.currentTurn ?? 0;
 	}
 
-	getExecutingToolCallId(conversationId: string): string | null {
-		return this.sessions.get(conversationId)?.executingToolCallId ?? null;
+	getExecutingToolCallIds(conversationId: string): string[] {
+		return this.sessions.get(conversationId)?.executingToolCallIds ?? [];
 	}
 
 	// read-only: safe to call from derivations, unlike getSession
@@ -390,6 +391,7 @@ class AgenticStore {
 			return { error: normalizedError, handled: true };
 		} finally {
 			this.updateSession(conversationId, {
+				executingToolCallIds: [],
 				flowRootMessageId: null,
 				isRunning: false,
 				liveLlm: null
@@ -715,74 +717,25 @@ class AgenticStore {
 				tool_calls: normalizedCalls
 			});
 
-			// Execute each tool call and create result messages
-			for (let i = 0; i < normalizedCalls.length; i++) {
-				const toolCall = normalizedCalls[i];
-
-				if (signal?.aborted) {
-					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
-					return;
-				}
-
-				// Check for pending steering message - skip remaining tool calls
-				if (this.gates.hasPendingSteeringMessage(conversationId)) {
-					console.log(
-						`[AgenticStore] Steering message detected, skipping ${normalizedCalls.length - i} remaining tool call(s)`
-					);
-					for (let j = i; j < normalizedCalls.length; j++) {
-						const remainingCall = normalizedCalls[j];
-						const interruptedContent = 'Tool execution was interrupted by a new user message.';
-
-						if (createToolResultMessage) {
-							await createToolResultMessage(remainingCall.id, interruptedContent);
-						}
-
-						sessionMessages.push({
-							content: interruptedContent,
-							role: MessageRole.TOOL,
-							tool_call_id: remainingCall.id
-						});
-					}
-
-					break;
-				}
-
+			const executeToolCall = async (
+				toolCall: AgenticToolCallList[number],
+				permission: ToolPermissionDecision
+			) => {
 				const toolName = toolCall.function.name;
-				const serverLabel = toolsStore.getToolServerLabel(toolName);
-				// Ask for permission before executing the tool
-				const permission = await this.gates.requestPermission(
-					conversationId,
-					toolName,
-					serverLabel,
-					signal
-				);
-
-				// Yield to allow Svelte to flush the UI update (hide permission dialog)
-				await new Promise((r) => setTimeout(r, 0));
-
-				if (signal?.aborted) {
-					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
-					return;
-				}
-
-				const toolStartTime = performance.now();
 				const toolSource = toolsStore.getToolSource(toolName);
+				const toolStartTime = performance.now();
 
 				let result = '';
 				let toolSuccess = true;
 				let createdToolResultMessageId: string | null = null;
 
-				// Streaming tools (currently only exec_shell_command): mark
-				// the session so the matching renderer can switch to live mode.
-				// Cleared unconditionally below.
-				this.updateSession(conversationId, { executingToolCallId: toolCall.id });
-
 				if (permission === ToolPermissionDecision.DENY) {
 					result = 'Tool execution was denied by the user.';
 					toolSuccess = false;
 				} else {
+					this.updateSession(conversationId, {
+						executingToolCallIds: [...this.getExecutingToolCallIds(conversationId), toolCall.id]
+					});
 					try {
 						if (
 							toolSource === ToolSource.SERVER &&
@@ -859,13 +812,12 @@ class AgenticStore {
 							const executionResult = await mcpStore.executeTool(mcpCall, signal);
 
 							result = executionResult.content;
+
+							if (executionResult.isError) toolSuccess = false;
 						}
 					} catch (error) {
 						if (isAbortError(error)) {
-							this.updateSession(conversationId, { executingToolCallId: null });
-							onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
-							return;
+							throw error;
 						}
 
 						// Carry the partial stream contents already mirrored to the UI -
@@ -878,10 +830,14 @@ class AgenticStore {
 						if (createdToolResultMessageId && updateToolResultMessage) {
 							await updateToolResultMessage(createdToolResultMessageId, result);
 						}
+					} finally {
+						this.updateSession(conversationId, {
+							executingToolCallIds: this.getExecutingToolCallIds(conversationId).filter(
+								(id) => id !== toolCall.id
+							)
+						});
 					}
 				}
-
-				this.updateSession(conversationId, { executingToolCallId: null });
 
 				const toolDurationMs = performance.now() - toolStartTime;
 				const toolTiming: ChatMessageToolCallTiming = {
@@ -890,85 +846,190 @@ class AgenticStore {
 					success: toolSuccess
 				};
 
-				agenticTimings.toolCalls!.push(toolTiming);
-				agenticTimings.toolCallsCount++;
-				agenticTimings.toolsMs += Math.round(toolDurationMs);
-				turnStats.toolCalls.push(toolTiming);
-				turnStats.toolsMs += Math.round(toolDurationMs);
+				// Keep message writes and history in call order, even if requests finish out of order.
+				return async () => {
+					agenticTimings.toolCalls!.push(toolTiming);
+					agenticTimings.toolCallsCount++;
+					turnStats.toolCalls.push(toolTiming);
 
+					const { attachments, cleanedResult } = this.extractBase64Attachments(result);
+
+					// For streaming tools the result message was created empty
+					// at the start of execution and updated in place as chunks
+					// arrived via updateToolResultMessage. Skip the second
+					// create call - just attach any base64 attachments found in
+					// the final accumulator (rare, since chunks usually don't
+					// carry image data URIs) and emit the attachments callback.
+					let toolResultMessage: DatabaseMessage | undefined;
+
+					if (createdToolResultMessageId) {
+						toolResultMessage = { id: createdToolResultMessageId } as DatabaseMessage;
+
+						if (attachments.length > 0 && updateToolResultMessage) {
+							await updateToolResultMessage(createdToolResultMessageId, cleanedResult, attachments);
+						}
+					} else if (createToolResultMessage) {
+						toolResultMessage = await createToolResultMessage(
+							toolCall.id,
+							cleanedResult,
+							attachments.length > 0 ? attachments : undefined
+						);
+					}
+
+					if (attachments.length > 0 && toolResultMessage) {
+						onAttachments?.(toolResultMessage.id, attachments);
+					}
+
+					// Build content parts for session history (including images for vision models)
+					const contentParts: ApiChatMessageContentPart[] = [
+						{ text: cleanedResult, type: ContentPartType.TEXT }
+					];
+
+					for (const attachment of attachments) {
+						if (attachment.type === AttachmentType.AUDIO) {
+							if (modelsStore.props.modelSupportsAudio(effectiveModel)) {
+								contentParts.push({
+									input_audio: {
+										data: (attachment as DatabaseMessageExtraAudioFile).base64Data,
+										format: getAudioInputFormat(
+											(attachment as DatabaseMessageExtraAudioFile).mimeType
+										)
+									},
+									type: ContentPartType.INPUT_AUDIO
+								});
+							}
+						} else if (attachment.type === AttachmentType.IMAGE) {
+							if (modelsStore.props.modelSupportsVision(effectiveModel)) {
+								contentParts.push({
+									image_url: {
+										url: (attachment as DatabaseMessageExtraImageFile).base64Url
+									},
+									type: ContentPartType.IMAGE_URL
+								});
+							} else {
+								console.info(
+									`[AgenticStore] Skipping image attachment (model "${effectiveModel}" does not support vision)`
+								);
+							}
+						}
+					}
+
+					sessionMessages.push({
+						content: contentParts.length === 1 ? cleanedResult : contentParts,
+						role: MessageRole.TOOL,
+						tool_call_id: toolCall.id
+					});
+				};
+			};
+
+			// Execute each tool call and create result messages
+			for (let i = 0; i < normalizedCalls.length; ) {
 				if (signal?.aborted) {
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
 
 					return;
 				}
 
-				const { attachments, cleanedResult } = this.extractBase64Attachments(result);
-
-				// For streaming tools the result message was created empty
-				// at the start of execution and updated in place as chunks
-				// arrived via updateToolResultMessage. Skip the second
-				// create call - just attach any base64 attachments found in
-				// the final accumulator (rare, since chunks usually don't
-				// carry image data URIs) and emit the attachments callback.
-				let toolResultMessage: DatabaseMessage | undefined;
-
-				if (createdToolResultMessageId) {
-					toolResultMessage = { id: createdToolResultMessageId } as DatabaseMessage;
-
-					if (attachments.length > 0 && updateToolResultMessage) {
-						await updateToolResultMessage(createdToolResultMessageId, cleanedResult, attachments);
-					}
-				} else if (createToolResultMessage) {
-					toolResultMessage = await createToolResultMessage(
-						toolCall.id,
-						cleanedResult,
-						attachments.length > 0 ? attachments : undefined
+				// Check for pending steering message - skip remaining tool calls
+				if (this.gates.hasPendingSteeringMessage(conversationId)) {
+					console.log(
+						`[AgenticStore] Steering message detected, skipping ${normalizedCalls.length - i} remaining tool call(s)`
 					);
+					for (let j = i; j < normalizedCalls.length; j++) {
+						const remainingCall = normalizedCalls[j];
+						const interruptedContent = 'Tool execution was interrupted by a new user message.';
+
+						if (createToolResultMessage) {
+							await createToolResultMessage(remainingCall.id, interruptedContent);
+						}
+
+						sessionMessages.push({
+							content: interruptedContent,
+							role: MessageRole.TOOL,
+							tool_call_id: remainingCall.id
+						});
+					}
+
+					break;
 				}
 
-				if (attachments.length > 0 && toolResultMessage) {
-					onAttachments?.(toolResultMessage.id, attachments);
-				}
+				let batchEnd = i + 1;
 
-				// Build content parts for session history (including images for vision models)
-				const contentParts: ApiChatMessageContentPart[] = [
-					{ text: cleanedResult, type: ContentPartType.TEXT }
-				];
+				if (agenticConfig.parallelToolCalls) {
+					const servers: string[] = [];
 
-				for (const attachment of attachments) {
-					if (attachment.type === AttachmentType.AUDIO) {
-						if (modelsStore.props.modelSupportsAudio(effectiveModel)) {
-							contentParts.push({
-								input_audio: {
-									data: (attachment as DatabaseMessageExtraAudioFile).base64Data,
-									format: getAudioInputFormat(
-										(attachment as DatabaseMessageExtraAudioFile).mimeType
-									)
-								},
-								type: ContentPartType.INPUT_AUDIO
-							});
+					for (let j = i; j < normalizedCalls.length; j++) {
+						const name = normalizedCalls[j].function.name;
+						const server = mcpStore.getToolServer(name);
+
+						// Same-server calls and non-MCP tools are ordering barriers.
+						if (
+							toolsStore.getToolSource(name) !== ToolSource.MCP ||
+							!server ||
+							servers.includes(server)
+						) {
+							break;
 						}
-					} else if (attachment.type === AttachmentType.IMAGE) {
-						if (modelsStore.props.modelSupportsVision(effectiveModel)) {
-							contentParts.push({
-								image_url: {
-									url: (attachment as DatabaseMessageExtraImageFile).base64Url
-								},
-								type: ContentPartType.IMAGE_URL
-							});
-						} else {
-							console.info(
-								`[AgenticStore] Skipping image attachment (model "${effectiveModel}" does not support vision)`
-							);
-						}
+
+						servers.push(server);
+						batchEnd = j + 1;
 					}
 				}
 
-				sessionMessages.push({
-					content: contentParts.length === 1 ? cleanedResult : contentParts,
-					role: MessageRole.TOOL,
-					tool_call_id: toolCall.id
-				});
+				const batch = normalizedCalls.slice(i, batchEnd);
+				const permissions: ToolPermissionDecision[] = [];
+
+				// Each conversation has one permission gate. Resolve it before launching the batch.
+				for (const toolCall of batch) {
+					const toolName = toolCall.function.name;
+
+					permissions.push(
+						await this.gates.requestPermission(
+							conversationId,
+							toolName,
+							toolsStore.getToolServerLabel(toolName),
+							signal
+						)
+					);
+
+					// Let the UI hide the resolved permission prompt.
+					await new Promise((r) => setTimeout(r, 0));
+
+					if (signal?.aborted || this.gates.hasPendingSteeringMessage(conversationId)) break;
+				}
+
+				if (signal?.aborted || this.gates.hasPendingSteeringMessage(conversationId)) continue;
+
+				// Drain every request before completing the flow or releasing its MCP connections.
+				const batchStartTime = performance.now();
+				const results = await Promise.allSettled(
+					batch.map((toolCall, index) => executeToolCall(toolCall, permissions[index]))
+				);
+				const batchDurationMs = Math.round(performance.now() - batchStartTime);
+
+				agenticTimings.toolsMs += batchDurationMs;
+				turnStats.toolsMs += batchDurationMs;
+
+				for (const result of results) {
+					if (result.status === 'rejected') {
+						if (isAbortError(result.reason)) continue;
+
+						throw result.reason;
+					}
+
+					await result.value();
+				}
+
+				if (
+					signal?.aborted ||
+					results.some((result) => result.status === 'rejected' && isAbortError(result.reason))
+				) {
+					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
+
+					return;
+				}
+
+				i = batchEnd;
 			}
 
 			if (turnStats.toolCalls.length > 0) {
