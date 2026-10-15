@@ -24,6 +24,7 @@ import { AgenticSectionType, ContinueIntentKind, ToolCallType } from '#lib/enums
 export interface AgenticConfig {
 	enabled: boolean;
 	maxTurns: number;
+	parallelToolCalls: boolean;
 }
 
 /**
@@ -223,7 +224,7 @@ export interface AgenticSection {
 	/** ID of the model-side tool call (matches tool_calls[i].id). Lets
 	 *  downstream consumers correlate a section with the agentic loop's
 	 *  currently-executing tool, e.g. to drive live-streaming UI state
-	 *  by matching against agenticStore.getExecutingToolCallId. */
+	 *  by matching against agenticStore.getExecutingToolCallIds. */
 	toolCallId?: string;
 	wasInterrupted?: boolean;
 }
