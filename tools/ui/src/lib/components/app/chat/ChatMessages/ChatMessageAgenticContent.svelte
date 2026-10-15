@@ -91,8 +91,8 @@
 
 	const sections = $derived(deriveAgenticSections(message, toolMessages, [], isStreaming));
 
-	const currentlyExecutingToolCallId = $derived(
-		isStreaming ? agenticStore.getExecutingToolCallId(message.convId) : null
+	const currentlyExecutingToolCallIds = $derived(
+		isStreaming ? agenticStore.getExecutingToolCallIds(message.convId) : []
 	);
 
 	type TurnGroup = {
@@ -191,7 +191,7 @@
 		<ChatMessageToolCallBlock
 			attachments={section.toolResultExtras}
 			isExecuting={section.toolCallId !== undefined &&
-				section.toolCallId === currentlyExecutingToolCallId}
+				currentlyExecutingToolCallIds.includes(section.toolCallId)}
 			{isStreaming}
 			onToggle={() => toggleExpanded(index, section)}
 			open={isExpanded(index, section)}
