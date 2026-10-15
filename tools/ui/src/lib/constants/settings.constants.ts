@@ -360,6 +360,13 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.INPUT
 			},
 			{
+				defaultValue: false,
+				help: 'Allow calls to different MCP servers in the same model response to overlap. Enable only for independent tools; calls to the same server and other tools remain sequential.',
+				key: SETTINGS_KEYS.AGENTIC_PARALLEL_TOOL_CALLS,
+				label: 'Parallel MCP calls',
+				type: SettingsFieldType.CHECKBOX
+			},
+			{
 				defaultValue: DEFAULT_MCP_CONFIG.requestTimeoutSeconds,
 				help: 'Timeout for individual MCP tool calls.',
 				isPositiveInteger: true,
