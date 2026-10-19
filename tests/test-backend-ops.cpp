@@ -8298,7 +8298,7 @@ struct test_concat : public test_case {
     const std::array<int64_t, 4> ne_a;
     const int64_t ne_b_d;
     const int dim;
-    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: transposed b)
+    const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: transposed b, 1 << 5: transposed a)
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne_a, ne_b_d, dim, v);
@@ -8314,7 +8314,13 @@ struct test_concat : public test_case {
         auto ne_b = ne_a;
         ne_b[dim] = ne_b_d;
         ggml_tensor * a;
-        if (v & 1) {
+        if (v & 32) {
+            a = ggml_new_tensor_4d(ctx, type, ne_a[1], ne_a[0], ne_a[2], ne_a[3]);
+            ggml_set_name(a, "a");
+
+            a = ggml_transpose(ctx, a);
+            ggml_set_name(a, "transpose_of_a");
+        } else if (v & 1) {
             auto ne = ne_a; ne[0] *= 2; ne[1] *= 4; ne[2] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
             ggml_set_name(a, "a");
