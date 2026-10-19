@@ -2121,6 +2121,110 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// PQ2_0 mat-vec for Pascal, 1-4 columns, bit-identical to the generic mmvq there. The generic kernel (4 warps,
+// 32 blocks per iteration) gives thread t = 32*w + lane the 32-chunks t, t+128, ...: it sums them in order into
+// v[w], then warp 0 adds ((v0 + v1) + v2) + v3 and does the warp butterfly. Here ONE warp keeps that order for a
+// whole row (lane owns chunks lane + 32*w + 128*i), so there is no shared memory and no block barrier, and does 4
+// rows at once. Activations use the decode-free PQ2 layout (quantize.cu): sum(q*(c-1)) = sum(q*c) - sum(q) is the
+// same integer as the generic byte-perm decode, and d2*d8*sumi is the same float product.
+template <int ncols>
+static __global__ void __launch_bounds__(128) mul_mat_vec_pq2_0_ordered(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
+    constexpr int R = 4;
+    const int lane = threadIdx.x & 31;
+    const int row0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * R;
+    if (row0 >= nrows_x) {
+        return;
+    }
+    const int    nchunk    = ncols_x / QK8_1;
+    const size_t col_bytes = (size_t) stride_col_y * sizeof(block_q8_1);
+    const size_t ds_off    = (size_t) stride_col_y * QK8_1;
+    const char * y         = (const char *) vy;
+
+    float s[R][ncols];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        float v[R][ncols] = {};
+        for (int c = 32*w + lane; c < nchunk; c += 128) {
+            uint32_t w0[R], w1[R];
+            float    d2[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int row = min(row0 + r, nrows_x - 1); // clamped rows are computed but not stored
+                const block_pq2_0 * blk = (const block_pq2_0 *) vx + (int64_t) row*stride_row_x + (c >> 2);
+                const uint16_t    * qp  = (const uint16_t *) (blk->qs + (c & 3)*8); // blocks are only 2-byte aligned
+                d2[r] = blk->d;
+                w0[r] = (uint32_t) qp[0] | ((uint32_t) qp[1] << 16);
+                w1[r] = (uint32_t) qp[2] | ((uint32_t) qp[3] << 16);
+            }
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                const char * yc = y + j*col_bytes;
+                const int4  a0  = *(const int4 *) (yc + c*QK8_1);
+                const int4  a1  = *(const int4 *) (yc + c*QK8_1 + 16);
+                const half2 ds  = *(const half2 *) (yc + ds_off + c*sizeof(half2));
+                const float d8  = __low2float(ds);
+                const int   qs  = __half_as_short(__high2half(ds));
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    int sumi = 0;
+                    sumi = ggml_cuda_dp4a((int) ((w0[r] >> 0) & 0x03030303u), a0.x, sumi);
+                    sumi = ggml_cuda_dp4a((int) ((w0[r] >> 2) & 0x03030303u), a0.y, sumi);
+                    sumi = ggml_cuda_dp4a((int) ((w0[r] >> 4) & 0x03030303u), a0.z, sumi);
+                    sumi = ggml_cuda_dp4a((int) ((w0[r] >> 6) & 0x03030303u), a0.w, sumi);
+                    sumi = ggml_cuda_dp4a((int) ((w1[r] >> 0) & 0x03030303u), a1.x, sumi);
+                    sumi = ggml_cuda_dp4a((int) ((w1[r] >> 2) & 0x03030303u), a1.y, sumi);
+                    sumi = ggml_cuda_dp4a((int) ((w1[r] >> 4) & 0x03030303u), a1.z, sumi);
+                    sumi = ggml_cuda_dp4a((int) ((w1[r] >> 6) & 0x03030303u), a1.w, sumi);
+                    sumi -= qs;
+                    v[r][j] += d2[r] * d8 * sumi;
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                s[r][j] = w == 0 ? v[r][j] : s[r][j] + v[r][j];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            const float sum = warp_reduce_sum<WARP_SIZE>(s[r][j]);
+            if (lane == 0 && row0 + r < nrows_x) {
+                dst[(int64_t) j*stride_col_dst + row0 + r] = sum;
+            }
+        }
+    }
+}
+
+static void ggml_cuda_mul_mat_pq2_0_ordered(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+    cudaStream_t stream = ctx.stream();
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne10_padded*sizeof(block_q8_1)/QK8_1);
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), GGML_CUDA_Q8_1_PQ2, ne10,
+        nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float), ne10_padded, ne11, 1, 1, stream);
+    const dim3 blocks((ne01 + 15) / 16), threads(128);
+    const int sx = nb01/ggml_type_size(src0->type), sy = ne10_padded/QK8_1, sd = nb1/sizeof(float);
+    const void * x = src0->data;
+    const char * yq = src1_q8_1.get();
+    float * d = (float *) dst->data;
+    switch (ne11) {
+        case 1: mul_mat_vec_pq2_0_ordered<1><<<blocks, threads, 0, stream>>>(x, yq, d, ne00, ne01, sx, sy, sd); break;
+        case 2: mul_mat_vec_pq2_0_ordered<2><<<blocks, threads, 0, stream>>>(x, yq, d, ne00, ne01, sx, sy, sd); break;
+        case 3: mul_mat_vec_pq2_0_ordered<3><<<blocks, threads, 0, stream>>>(x, yq, d, ne00, ne01, sx, sy, sd); break;
+        case 4: mul_mat_vec_pq2_0_ordered<4><<<blocks, threads, 0, stream>>>(x, yq, d, ne00, ne01, sx, sy, sd); break;
+        default: GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2163,6 +2267,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // Pascal PQ2_0 at 1-4 columns (decode, MTP verify and draft head): same sums as the generic mmvq, faster
+    if (src0->type == GGML_TYPE_PQ2_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA &&
+            !ggml_cuda_batch_invariant() && ne11 <= 4 && ne00 % QK_PQ2_0 == 0 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(src0) &&
+            ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        ggml_cuda_mul_mat_pq2_0_ordered(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
