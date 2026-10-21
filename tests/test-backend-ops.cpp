@@ -12624,6 +12624,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {0, 64, 1, 1}, 33, 0, 0, true));
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {0, 37, 3, 2}, 64, 0, 0, true));
 
+    // Exercise the 8/16-bit transpose kernels at tile tails with padded src0 rows.
+    for (ggml_type type : { GGML_TYPE_I8, GGML_TYPE_F16 }) {
+        for (int64_t ne_b_d : { 31, 32, 33 }) {
+            test_cases.emplace_back(new test_concat(type, {3, 37, 1, 1}, ne_b_d, 0, 1, true));
+        }
+    }
+    // At and beyond the minimum Vulkan Y workgroup-count limit for 32-column tiles.
+    // The second case must use generic concat on devices with a 65535-group limit.
+    for (int64_t ne_b_d : { 65535 * 32 - 3, 65535 * 32 - 2 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 2, 1, 1}, ne_b_d, 0, 0, true));
+    }
+
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));

@@ -8978,7 +8978,7 @@ static vk_pipeline ggml_vk_rms_norm_pipeline(const std::array<vk_pipeline, 3> & 
     return pipelines[2];
 }
 
-static bool ggml_vk_concat_is_transposed(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+static bool ggml_vk_concat_is_transposed(const vk_device & device, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst, 0) != 0) {           // dim 0 only
         return false;
     }
@@ -8990,6 +8990,13 @@ static bool ggml_vk_concat_is_transposed(const ggml_tensor * src0, const ggml_te
         return false;
     }
     if (src1->nb[0] <= src1->nb[1]) {                     // src1 must actually be transposed
+        return false;
+    }
+    // The tiled kernel uses a two-dimensional dispatch without grid-stride loops.
+    // Leave larger shapes on the generic concat path.
+    const auto & limits = device->properties.limits;
+    if (uint64_t(src1->ne[1]) > uint64_t(limits.maxComputeWorkGroupCount[0]) * 32 ||
+        uint64_t(dst->ne[0]) > uint64_t(limits.maxComputeWorkGroupCount[1]) * 32) {
         return false;
     }
     return src0->ne[1] == src1->ne[1] && dst->ne[1] == src1->ne[1];
@@ -9087,7 +9094,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
         }
-        if (!ggml_is_quantized(src0->type) && ggml_vk_concat_is_transposed(src0, src1, dst)) {
+        if (!ggml_is_quantized(src0->type) && ggml_vk_concat_is_transposed(ctx->device, src0, src1, dst)) {
             switch (ggml_vk_concat_unit_size(src0->type)) {
             case 1:
                 return ctx->device->pipeline_concat_transpose_i8;
