@@ -12811,6 +12811,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PQ2_0 at the Bonsai 2 9B projection / vocab-head shapes and 3-8 columns (multi-column mat-vec)
+    for (int64_t m : {4096, 12288, 248320}) {
+        for (int64_t k : {4096, 12288}) {
+            for (int n : {3, 4, 8}) {
+                if (m == 248320 && k != 4096) { continue; }
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
