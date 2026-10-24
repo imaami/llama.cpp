@@ -153,13 +153,13 @@ static void topk_from_logits(const float * logits, int32_t n_vocab, int32_t k, s
         heap[hole] = value;
     };
 
-    constexpr int32_t BLOCK = 16;
+    constexpr int32_t BLOCK = 32; // not 16: a 16-iteration check loop is unrolled completely and then not vectorized
     float thr = heap[0].logit;
     int32_t i = k;
     for (; i + BLOCK <= n_vocab; i += BLOCK) {
-        bool any = false;
+        int any = 0; // int, not bool, so that the check is vectorized
         for (int32_t j = 0; j < BLOCK; j++) {
-            any |= logits[i + j] > thr;
+            any |= (int) (logits[i + j] > thr);
         }
         if (!any) {
             continue;
@@ -197,6 +197,13 @@ struct common_sampler {
     std::mt19937 rng;
     // > 0: the chain starts with top-k (all earlier samplers are no-ops), so cur_p can be built from the top k logits only
     int32_t fast_topk = 0;
+
+    // with fast_topk: tokens that the logit-bias sampler at the start of the chain sets to -INFINITY (all of its
+    // biases are -INFINITY, e.g. ignore_eos or model suppress tokens); the top k is taken with these masked
+    std::vector<llama_token> fast_topk_mask;
+
+    // scratch: the logits with fast_topk_mask applied
+    std::vector<float> logits_masked;
 
     void reset() {
         prev.clear();
@@ -251,6 +258,18 @@ struct common_sampler {
         const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
         if (n_vocab <= k) {
             return false;
+        }
+
+        if (!fast_topk_mask.empty()) {
+            // same values as llama_sampler_logit_bias gives the full array; it then finds none of these tokens in the
+            // top k (or only ones already at -INFINITY), so it does not change cur_p when the chain applies it again
+            logits_masked.assign(logits, logits + n_vocab);
+            for (const llama_token id : fast_topk_mask) {
+                if (id >= 0 && id < n_vocab) {
+                    logits_masked[id] += -INFINITY;
+                }
+            }
+            logits = logits_masked.data();
         }
 
         topk_from_logits(logits, n_vocab, k, cur);
@@ -462,6 +481,9 @@ struct common_sampler * common_sampler_init(
 
     bool has_logit_bias = false;
 
+    // the tokens of the logit-bias sampler if all of its biases are -INFINITY
+    std::vector<llama_token> logit_bias_mask;
+
     // logit bias: user biases + model suppress tokens (-INFINITY)
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
@@ -474,6 +496,15 @@ struct common_sampler * common_sampler_init(
 
         if (!merged.empty()) {
             has_logit_bias = true;
+
+            for (const auto & lb : merged) {
+                if (lb.bias != -INFINITY) {
+                    logit_bias_mask.clear();
+                    break;
+                }
+                logit_bias_mask.push_back(lb.token);
+            }
+
             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
         }
     }
@@ -580,7 +611,13 @@ struct common_sampler * common_sampler_init(
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
-    result->fast_topk = common_sampler_fast_topk(result->params, has_logit_bias);
+    // a logit bias that only masks tokens (-INFINITY) still allows the fast top-k, with these tokens masked
+    const bool logit_bias_masks_only = has_logit_bias && !logit_bias_mask.empty();
+
+    result->fast_topk = common_sampler_fast_topk(result->params, has_logit_bias && !logit_bias_masks_only);
+    if (result->fast_topk > 0 && logit_bias_masks_only) {
+        result->fast_topk_mask = std::move(logit_bias_mask);
+    }
 
     return result;
 }
@@ -665,6 +702,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
         /* .fast_topk = */ gsmpl->fast_topk,
+        /* .fast_topk_mask = */ gsmpl->fast_topk_mask,
+        /* .logits_masked  = */ {},
     };
 }
 
@@ -687,6 +726,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->fast_topk  = src->fast_topk;
+    dst->fast_topk_mask = src->fast_topk_mask;
     dst->t_total_us = src->t_total_us;
 }
 

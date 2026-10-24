@@ -560,7 +560,9 @@ struct server_metrics {
 // other utils
 //
 
-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top);
+// the n_top most likely candidates (by logit, descending) with their probabilities over all candidates
+// if tok is a candidate, *p_tok is set to its probability (otherwise left unchanged)
+std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top, llama_token tok, float * p_tok);
 
 std::string safe_json_to_str(const json & data);
 

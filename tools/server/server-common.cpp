@@ -1694,13 +1694,169 @@ json format_response_rerank(
 // other utils
 //
 
-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top) {
+// Top n_top of the logits, as std::partial_sort over the full {id, logit} array would leave them, without building that
+// array. It repeats the steps of libstdc++ std::partial_sort (make_heap on the first n_top, replace the heap top by every
+// larger logit in index order, sort_heap). Each replaced heap top is what partial_sort moves into that position of the
+// tail; these are appended to `evicted` as (position, logit) in position order.
+static void token_probs_topk(const float * logits, int32_t n_logits, int32_t k, std::vector<llama_token_data> & out,
+        std::vector<std::pair<int32_t, float>> & evicted) {
+    static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    };
+
+    out.resize(k);
+    for (int32_t i = 0; i < k; i++) {
+        out[i] = llama_token_data{ i, logits[i], 0.0f };
+    }
+    std::make_heap(out.begin(), out.end(), comp);
+
+    llama_token_data * heap = out.data();
+
+    // std::__pop_heap(first, middle, result) with value = the new token: sift down to a leaf, then sift up
+    const auto replace_top = [&](int32_t pos, const llama_token_data & value) {
+        evicted.emplace_back(pos, heap[0].logit);
+
+        ptrdiff_t hole = 0;
+        ptrdiff_t child = 0;
+        const ptrdiff_t len = k;
+        while (child < (len - 1) / 2) {
+            child = 2 * (child + 1);
+            if (comp(heap[child], heap[child - 1])) {
+                child--;
+            }
+            heap[hole] = heap[child];
+            hole = child;
+        }
+        if ((len & 1) == 0 && child == (len - 2) / 2) {
+            child = 2 * (child + 1);
+            heap[hole] = heap[child - 1];
+            hole = child - 1;
+        }
+        ptrdiff_t parent = (hole - 1) / 2;
+        while (hole > 0 && comp(heap[parent], value)) {
+            heap[hole] = heap[parent];
+            hole = parent;
+            parent = (hole - 1) / 2;
+        }
+        heap[hole] = value;
+    };
+
+    constexpr int32_t BLOCK = 32; // not 16: a 16-iteration check loop is unrolled completely and then not vectorized
+    float thr = heap[0].logit;
+    int32_t i = k;
+    for (; i + BLOCK <= n_logits; i += BLOCK) {
+        int any = 0; // int, not bool, so that the check is vectorized
+        for (int32_t j = 0; j < BLOCK; j++) {
+            any |= (int) (logits[i + j] > thr);
+        }
+        if (!any) {
+            continue;
+        }
+        for (int32_t j = 0; j < BLOCK; j++) {
+            if (logits[i + j] > heap[0].logit) {
+                replace_top(i + j, llama_token_data{ i + j, logits[i + j], 0.0f });
+            }
+        }
+        thr = heap[0].logit;
+    }
+    for (; i < n_logits; i++) {
+        if (logits[i] > heap[0].logit) {
+            replace_top(i, llama_token_data{ i, logits[i], 0.0f });
+        }
+    }
+
+    std::sort_heap(out.begin(), out.end(), comp);
+}
+
+std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top, llama_token tok, float * p_tok) {
     std::vector<llama_token_data> cur;
 
     const auto * logits = llama_get_logits_ith(ctx, idx);
     const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
 
     const int n_logits = llama_get_sampled_logits_count_ith(ctx, idx);
+
+    if (n_top > (size_t) n_logits) {
+        n_top = n_logits;
+    }
+
+    // plain logits: no backend sampling for this output, sampled_ids is the identity
+    const bool plain = llama_get_sampled_candidates_count_ith(ctx, idx) == 0 &&
+                       llama_get_sampled_logits_ith(ctx, idx) == nullptr &&
+                       llama_get_sampled_probs_ith(ctx, idx) == nullptr;
+
+    if (plain && n_top > 0 && n_top < (size_t) n_logits) {
+        // same result as the generic path below (sort the {id, logit} array partially, softmax over all of it in that
+        // order), without building the array: only the top n_top entries and the tail positions that partial_sort
+        // would overwrite are needed to repeat the summation order
+        std::vector<std::pair<int32_t, float>> evicted;
+        token_probs_topk(logits, n_logits, (int32_t) n_top, cur, evicted);
+
+        const float max_l = cur[0].logit;
+
+        // adding a term below half an ulp of the sum does not change the sum. while the sum is in [2^e, 2^(e+1)), e >= 0,
+        // that holds for every term expf(x) with x < x_skip = (e - 24)*ln(2) - 0.01 (the margin covers the rounding of
+        // x_skip and of expf), so these terms are skipped. the sum starts with the maximum (expf(0) = 1), so e >= 0.
+        float cum_sum  = 0.0f;
+        float x_skip   = -INFINITY;
+        float next_pow = 1.0f; // x_skip is updated when cum_sum reaches next_pow
+        int   e        = -1;
+
+        const auto add = [&](float logit) {
+            const float x = logit - max_l;
+            if (!(x < x_skip)) {
+                cum_sum += expf(x);
+                while (cum_sum >= next_pow && e < 127) {
+                    e++;
+                    next_pow *= 2.0f;
+                    x_skip = (float) ((e - 24) * 0.6931471805599453 - 0.01);
+                }
+            }
+        };
+
+        for (size_t i = 0; i < n_top; i++) {
+            add(cur[i].logit);
+        }
+
+        constexpr int32_t BLOCK = 32; // not 16: a 16-iteration check loop is unrolled completely and then not vectorized
+        size_t ie = 0;
+        int32_t i = (int32_t) n_top;
+        while (i < n_logits) {
+            const int32_t next_ev = ie < evicted.size() ? evicted[ie].first : n_logits;
+            if (i == next_ev) {
+                add(evicted[ie++].second);
+                i++;
+                continue;
+            }
+            // positions [i, next_ev) hold the original logits; skip the blocks where every term can be skipped
+            // (int instead of bool so that the check is vectorized)
+            for (; i + BLOCK <= next_ev; i += BLOCK) {
+                int any = 0;
+                for (int32_t j = 0; j < BLOCK; j++) {
+                    any |= (int) !(logits[i + j] - max_l < x_skip);
+                }
+                if (!any) {
+                    continue;
+                }
+                for (int32_t j = 0; j < BLOCK; j++) {
+                    add(logits[i + j]);
+                }
+            }
+            for (; i < next_ev; i++) {
+                add(logits[i]);
+            }
+        }
+
+        for (auto & t : cur) {
+            t.p = expf(t.logit - max_l) / cum_sum;
+        }
+
+        if (tok >= 0 && tok < n_logits) {
+            *p_tok = expf(logits[tok] - max_l) / cum_sum;
+        }
+
+        return cur;
+    }
 
     cur.resize(n_logits);
     if (sampled_ids) {
@@ -1714,9 +1870,6 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     }
 
     // sort tokens by logits (partial: only the leading `n_top` need ordering)
-    if (n_top > cur.size()) {
-        n_top = cur.size();
-    }
     if (n_top > 0) {
         std::partial_sort(cur.begin(), cur.begin() + n_top, cur.end(),
             [](const llama_token_data & a, const llama_token_data & b) {
@@ -1742,6 +1895,15 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     for (auto & t : cur) {
         t.p /= cum_sum;
     }
+
+    for (const auto & t : cur) {
+        if (t.id == tok) {
+            *p_tok = t.p;
+            break;
+        }
+    }
+
+    cur.resize(n_top);
 
     return cur;
 }
