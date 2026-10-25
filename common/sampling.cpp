@@ -609,6 +609,9 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+        /* .fast_topk = */ 0,
+        /* .fast_topk_mask = */ {},
+        /* .logits_masked  = */ {},
     };
 
     // a logit bias that only masks tokens (-INFINITY) still allows the fast top-k, with these tokens masked
