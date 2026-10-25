@@ -1456,12 +1456,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
     if constexpr (type == GGML_TYPE_PTQ1_0) {
         // plain 2D PTQ1_0 mat-vec with 2-8 columns: dedicated kernel with full lane utilization,
-        // see mmvq-ptq1_0.cuh. One column takes the SoA path in the generic kernel below.
+        // see mmvq-ptq1_0.cuh. One column takes the SoA path: the K-block-stationary kernel where it
+        // applies, otherwise the generic kernel below.
         if (!ids && !y_soa && mul_mat_vec_ptq1_0_pt_switch(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst,
                                                  stride_row_x, stride_col_y, stride_col_dst,
                                                  nchannels_dst, nsamples_dst, stream)) {
             return;
         }
+#if !defined(GGML_USE_MUSA)
+        // plain 2D one column on Hopper: K-block-stationary kernel, bit-exact with the generic one below
+        if (!ids && y_soa && ncols_dst == 1 && nchannels_dst == 1 && nsamples_dst == 1 &&
+            mul_mat_vec_ptq1_0_ks_switch(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream)) {
+            return;
+        }
+#endif
     }
 #endif
 
