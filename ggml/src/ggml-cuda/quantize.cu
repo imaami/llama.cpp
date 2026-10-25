@@ -277,12 +277,11 @@ static __global__ void fwht_quantize_q8_1(
     }
 }
 
-template <int N, typename T>
-static void fwht_quantize_launch_layout(
+template <int N, int NT, typename T>
+static void fwht_quantize_launch_nt(
         const T * x, const float * signs, void * vy, const ggml_cuda_q8_1_layout layout,
         const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
         const float scale, cudaStream_t stream) {
-    constexpr int NT = N < 256 ? N : 256;
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
     const dim3 num_blocks((unsigned) (ne0 / N), (unsigned) ne1, (unsigned) (ne2*ne3));
     const dim3 block_size(NT, 1, 1);
@@ -299,6 +298,28 @@ static void fwht_quantize_launch_layout(
         default:                      FWHT_Q_LAUNCH(GGML_CUDA_Q8_1_AOS);      break;
     }
 #undef FWHT_Q_LAUNCH
+}
+
+template <int N, typename T>
+static void fwht_quantize_launch_layout(
+        const T * x, const float * signs, void * vy, const ggml_cuda_q8_1_layout layout,
+        const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const float scale, cudaStream_t stream) {
+    // wider blocks for few rows (decode / verify), same choice as fwht_cuda_block
+    const int nt = ggml_cuda_fwht_block_threads(N, ne1*ne2*ne3);
+    if constexpr (N >= 1024) {
+        if (nt == 1024) {
+            fwht_quantize_launch_nt<N, 1024, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream);
+            return;
+        }
+    }
+    if constexpr (N >= 512) {
+        if (nt == 512) {
+            fwht_quantize_launch_nt<N, 512, T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream);
+            return;
+        }
+    }
+    fwht_quantize_launch_nt<N, (N < 256 ? N : 256), T>(x, signs, vy, layout, ne00, ne0, ne1, ne2, ne3, scale, stream);
 }
 
 template <typename T>
