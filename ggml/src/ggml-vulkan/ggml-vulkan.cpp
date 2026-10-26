@@ -9406,7 +9406,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // split and unsplit indexing can be exercised on software Vulkan devices.
         const uint32_t tuning_kv = force_pack_gqa ? std::max(KV, 1024u) : KV;
         const vk_fa_tuning_params packed_params = get_fa_tuning_params(ctx->device, HSK, HSV, packed_rows, tuning_kv,
-                                                                      k_type_eff, v_type_eff, f32acc);
+                                                                      k_type_eff, v_type_eff, f32acc, qk_ratio);
         if (packed_params.path == tuning_params.path && packed_rows <= packed_params.block_rows &&
             (force_pack_gqa || packed_params.block_rows == tuning_params.block_rows)) {
             pack_gqa_tokens = true;
@@ -9459,6 +9459,18 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, false);
             alignment = tuning_params.block_cols;
             aligned = fa_aligned(tuning_params);
+        }
+    }
+
+    if (tuning_params.flip) {
+        // flipped coopmat1 path reads K/V rows with 16-byte loads
+        const bool kv_16b = use_dequant_kv ||
+            (((uintptr_t)k->data | (uintptr_t)v->data | nbk2_eff | nbk3_eff | nbv2_eff | nbv3_eff) % 16) == 0;
+        if (!aligned || use_sparse || gqa_ratio != 1 || !kv_16b) {
+            tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio, false);
+            alignment = tuning_params.block_cols;
+            aligned = (KV % alignment) == 0 &&
+                      (q_stride & 7) == 0 && (k_stride & 7) == 0 && (v_stride & 7) == 0;
         }
     }
 
