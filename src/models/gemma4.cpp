@@ -548,5 +548,7 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor * 
     cb(inp_per_layer, "inp_per_layer", -1);
 
     // permute to shape: [n_embd_per_layer, n_tokens, n_layer]
-    return ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3);
+    // keep it contiguous: a layer on another backend copies its whole input view, and a slice of the
+    // permuted tensor spans almost all of it, so every such layer would copy the inputs of all layers
+    return ggml_cont(ctx0, ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3));
 }
