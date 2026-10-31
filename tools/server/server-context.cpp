@@ -2725,12 +2725,17 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // the buffers of an evicted checkpoint go to the new one: a fresh vector is zero-filled by resize()
-        std::vector<uint8_t> spare_tgt;
-        std::vector<uint8_t> spare_dft;
-        const auto keep_spare = [&](common_prompt_checkpoint & ckpt) {
-            spare_tgt = std::move(ckpt.data_tgt);
-            spare_dft = std::move(ckpt.data_dft);
+        // the buffers of an evicted checkpoint go to the new one, whose pages are then already faulted in
+        // the prompt cache may still share an evicted checkpoint: only an unshared one gives up its buffers
+        common_state_data spare_tgt;
+        common_state_data spare_dft;
+        const auto keep_spare = [&](const std::shared_ptr<const common_prompt_checkpoint> & ckpt) {
+            if (ckpt.use_count() == 1) {
+                // created non-const by make_shared, and nothing else refers to it
+                auto & owned = const_cast<common_prompt_checkpoint &>(*ckpt);
+                spare_tgt = std::move(owned.data_tgt);
+                spare_dft = std::move(owned.data_dft);
+            }
         };
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2761,7 +2766,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            keep_spare(cur);
+            keep_spare(slot.prompt.checkpoints.front());
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
