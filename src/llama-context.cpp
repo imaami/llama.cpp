@@ -2351,7 +2351,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (masked && n_rows < (int64_t) ubatch.n_tokens && t_h_nextn->ne[1] == (int64_t) ubatch.n_tokens &&
+                        t_h_nextn->ne[0] == (int64_t) n_embd && t_h_nextn->nb[1] == n_embd*sizeof(float)) {
+                    // the graph captured h_nextn before selecting the output rows (most MTP graphs do), and the
+                    // ubatch mixes rows without output with flagged ones, e.g. deferred MTP catch-up rows decoded
+                    // with the draft anchor: copy only the flagged rows, in ubatch order like the logits
+                    int64_t k = 0;
+                    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                        if (ubatch.output[i]) {
+                            ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + k*n_embd,
+                                    (size_t) i*t_h_nextn->nb[1], n_embd*sizeof(float));
+                            ++k;
+                        }
+                    }
+                    GGML_ASSERT(k == n_rows);
+                } else {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
                 extract_all_idxs = extract_all_idxs || !masked;
             }
         }

@@ -919,6 +919,10 @@ static bool mtp_test(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        // these MTP graphs publish h_nextn before selecting the output rows, the context copies the flagged rows
+        case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_COHERE2MOE:
+        case LLM_ARCH_HY_V3:
             return true;
         default:
             return false;
