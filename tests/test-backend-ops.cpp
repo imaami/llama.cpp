@@ -13184,6 +13184,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, true));
     }
 
+    // Packing with other K/V caches, reachable with GGML_VK_FA_GQA_PACK=1: q8_0/q8_0 and f16/f16
+    // at the GQA ratios of Qwen3.6 27B (6) and 35B-A3B (8), for 2- to 4-token verification.
+    for (ggml_type kv_type : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (int64_t gqa : {6, 8}) {
+            for (int64_t nb : {2, 3, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {gqa, 1}, 1025, nb, true, false, 0, 0,
+                    GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, false, 0, true));
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 32, 3, true, false, 0, 0,
+            GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, false, 0, true));
+    }
+
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));

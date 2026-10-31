@@ -8543,10 +8543,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const bool disable_pack_gqa = pack_gqa_env && strcmp(pack_gqa_env, "0") == 0;
     const bool default_pack_gqa = ctx->device->architecture == AMD_RDNA4 &&
                                   tuning_params.path == FA_COOPMAT1 && gqa_ratio == 6 && neq1 == 2;
+    // The default is measured with Q8_0 K / Q4_0 V only. The row mapping does not depend on
+    // the K/V types, so the override also packs other caches (e.g. q8_0/q8_0) for A/B runs.
+    const bool pack_kv_types = force_pack_gqa || (k_type_eff == GGML_TYPE_Q8_0 && v_type_eff == GGML_TYPE_Q4_0);
     bool pack_gqa_tokens = false;
     if (!disable_pack_gqa && (force_pack_gqa || default_pack_gqa) &&
-        neq1 >= 2 && neq1 <= 4 && gqa_ratio > 1 &&
-        k_type_eff == GGML_TYPE_Q8_0 && v_type_eff == GGML_TYPE_Q4_0 &&
+        neq1 >= 2 && neq1 <= 4 && gqa_ratio > 1 && pack_kv_types &&
         !sinks && max_bias == 0.0f && logit_softcap == 0.0f && n_kv_max == 0 &&
         (!mask || (nem0 == KV && nem1 >= neq1)) &&
         (tuning_params.path == FA_SCALAR || tuning_params.path == FA_COOPMAT1)) {
@@ -8674,7 +8676,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        // at least 1: the packed GQA token stores scale the token stride by k_num
+        split_k = std::max(1u, shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z));
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
