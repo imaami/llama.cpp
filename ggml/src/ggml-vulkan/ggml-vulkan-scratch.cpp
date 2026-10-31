@@ -1,7 +1,13 @@
 #include "ggml-vulkan-common.h"
 
+// The FA K/V copies are read with 16-byte and cooperative matrix loads, which need more than the
+// minStorageBufferOffsetAlignment that the tensor in front of the scratch is placed at (4 on RADV).
+static size_t ggml_vk_scratch_align(const vk_device & device) {
+    return std::max<size_t>(16, device->properties.limits.minStorageBufferOffsetAlignment);
+}
+
 size_t ggml_vk_scratch_offset(const vk_device & device, size_t nbytes) {
-    return ggml_vk_align_size(nbytes, device->properties.limits.minStorageBufferOffsetAlignment);
+    return ggml_vk_align_size(nbytes, ggml_vk_scratch_align(device));
 }
 
 vk_fa_dequant_kv ggml_vk_fa_dequant_kv(const vk_device & device, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
@@ -52,7 +58,8 @@ size_t ggml_vk_op_scratch_size(const vk_device & device, const ggml_tensor * dst
             if (dkv.use) {
                 const size_t k_sz = (size_t)ggml_nelements(dst->src[1]) * dkv.scratch_ts;
                 const size_t v_sz = (size_t)ggml_nelements(dst->src[2]) * dkv.scratch_ts;
-                scratch = ggml_vk_scratch_offset(device, k_sz) + v_sz;
+                // the leading slack lets ggml_vk_scratch_subbuffer() round the start up to the alignment
+                scratch = ggml_vk_scratch_align(device) + ggml_vk_scratch_offset(device, k_sz) + v_sz;
             }
         } break;
         default:
@@ -95,6 +102,7 @@ bool ggml_vk_scratch_available(const ggml_backend_vk_context * ctx, const ggml_t
 
 vk_subbuffer ggml_vk_scratch_subbuffer(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, size_t offset, size_t size) {
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-    const size_t base = vk_tensor_offset(dst) + ggml_vk_scratch_offset(ctx->device, ggml_nbytes(dst)) + offset;
-    return { buf_ctx->dev_buffer, base, size };
+    const size_t start = vk_tensor_offset(dst) + ggml_vk_scratch_offset(ctx->device, ggml_nbytes(dst));
+    const size_t base  = ggml_vk_align_size(start, ggml_vk_scratch_align(ctx->device));
+    return { buf_ctx->dev_buffer, base + offset, size };
 }
