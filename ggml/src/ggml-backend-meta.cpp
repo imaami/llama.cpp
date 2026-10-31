@@ -1092,6 +1092,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_PAD: {
                 split_state = handle_pad(src_ss);
             } break;
+            case GGML_OP_ARANGE: {
+                // no srcs, every device computes the same values
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
