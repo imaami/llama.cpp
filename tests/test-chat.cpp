@@ -4584,6 +4584,19 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     {
         auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.jinja", detailed_debug);
 
+        // A response format with tools and tool_choice=auto must not produce a lazy grammar
+        tst.test(
+               "```json\n"
+               R"({"amount": 123.45, "date": "2025-12-03"})"
+               "\n```")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_AUTO)
+            .json_schema(invoice_schema)
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+
         // Pure content (non-thinking mode; generation prompt ends with </think>)
         tst.test("Hello, world!\nWhat's up?")
             .enable_thinking(false)
