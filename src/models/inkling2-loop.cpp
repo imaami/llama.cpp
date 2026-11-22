@@ -80,7 +80,11 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
 
     auto * cur = build_inputs();
     ggml_tensor * blocks = nullptr;
+
+    // DSpark target features follow layer visits, including repeated passes through the core.
+    int visit = 0;
     for (int il = 0; il < start; ++il) {
+        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
 
@@ -99,6 +103,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         }
         for (int ip = start; ip < end; ++ip) {
             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
+            res->t_layer_inp[visit++] = cur;
             if (pass == 0) {
                 cur = build_layer(il, ip, cur, blocks);
                 continue;
@@ -109,7 +114,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     }
 
     for (int il = end; il < m.n_phys; ++il) {
+        res->t_layer_inp[visit++] = cur;
         cur = build_layer(il, il, cur, blocks);
     }
+    GGML_ASSERT(visit == n_layer);
     build_output(cur, blocks);
 }
