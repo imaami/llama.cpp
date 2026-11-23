@@ -9683,11 +9683,14 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     const bool kv_rows;     // all streams read one K/V cache of 2*kv rows through kv_rows
     const bool sinks;
     const ggml_type type_KV;
+    const bool causal;      // prefix of 0 per query, -inf after, distance bins
+    const int64_t n_kv_max; // sparse hint
 
     std::vector<int32_t> rows;
+    std::vector<int64_t> visible;
 
     std::string vars() override {
-        return VARS_TO_STR10(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV);
+        return VARS_TO_STR12(hs, nh, gqa, kv, nb, n_stream, n_bins, kv_rows, sinks, type_KV, causal, n_kv_max);
     }
 
     double max_nmse_err() override {
@@ -9695,8 +9698,10 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     }
 
     test_flash_attn_ext_indexed_bias(int64_t hs = 128, int64_t nh = 2, int64_t gqa = 3, int64_t kv = 768, int64_t nb = 7, int64_t n_stream = 2,
-                                     int64_t n_bins = 17, bool kv_rows = false, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16)
-        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_bins(n_bins), kv_rows(kv_rows), sinks(sinks), type_KV(type_KV) {}
+                                     int64_t n_bins = 17, bool kv_rows = false, bool sinks = true, ggml_type type_KV = GGML_TYPE_F16,
+                                     bool causal = false, int64_t n_kv_max = 0)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), nb(nb), n_stream(n_stream), n_bins(n_bins), kv_rows(kv_rows), sinks(sinks), type_KV(type_KV),
+          causal(causal), n_kv_max(n_kv_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_stream);
@@ -9729,6 +9734,7 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
             ggml_flash_attn_ext_add_sinks(out, s);
         }
         ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
+        ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
 
@@ -9756,13 +9762,23 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "r") == 0) {
                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0 && n_kv_max > 0) {
+                init_tensor_kq_mask_sparse(t, n_kv_max);
             } else if (strcmp(t->name, "m") == 0) {
                 std::vector<float> f(ggml_nelements(t));
                 std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+                visible.assign(nb*n_stream, kv);
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t j = 0; j < nb; ++j) {
+                        if (causal) {
+                            visible[s*nb + j] = kv/2 + (j + 1)*(kv/2)/nb - 37*s;
+                        }
                         for (int64_t i = 0; i < kv; ++i) {
                             const bool pad = kv_rows && rows[s*kv + i] < 0;
+                            if (causal) {
+                                f[(s*nb + j)*kv + i] = pad || i >= visible[s*nb + j] ? -INFINITY : 0.0f;
+                                continue;
+                            }
                             const bool drop = (i + 3*j + 5*s) % 11 == 0;
                             f[(s*nb + j)*kv + i] = pad || drop ? -INFINITY : dis(gen);
                         }
@@ -9776,6 +9792,14 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
                 std::uniform_int_distribution<int32_t> dis(0, n_bins - 1);
                 for (auto & i : idx) {
                     i = dis(gen);
+                }
+                if (causal) {
+                    for (int64_t q = 0; q < nb*n_stream; ++q) {
+                        for (int64_t i = 0; i < kv; ++i) {
+                            const int64_t dist = visible[q] - 1 - i;
+                            idx[q*kv + i] = dist < 0 ? n_bins - 1 : (int32_t) std::min<int64_t>(dist, n_bins - 1);
+                        }
+                    }
                 }
                 ggml_backend_tensor_set(t, idx.data(), 0, idx.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "table") == 0) {
@@ -13845,6 +13869,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, 7, 2, 17, kv_rows, true, type));
         }
     }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 4, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 2048, nb, 2, 33, false, true, type, true));
+        }
+    }
+    for (int64_t nb : {1, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 4096, nb, 2, 33, false, true, GGML_TYPE_F16, false, 512));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(256, 2, 3, 768, 65, 2, 17));
+    for (int64_t hs : {128, 256}) {
+        for (int64_t nb : {1, 7, 65}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(hs, 2, 3, 1000, nb, 2, 17));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1100, 256, 2, 33, false, true, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 1100,   7, 2, 33, false, true, GGML_TYPE_Q8_0));
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
