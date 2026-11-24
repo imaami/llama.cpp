@@ -54,6 +54,8 @@ These reservations were recorded for the original Inkling changes based on upstr
 
 At 131,072 with UD-IQ3_XXS and Q8_0, GPU compute scratch fell from 3,513 to 589 MiB and host compute scratch from 12,729 to 398 MiB. All 48 attention visits use indexed bias. At 262,144 the same patched target reserves 16,323 MiB. Reducing `-ub` to 128 brings it to 15,571 MiB. Using `-ctv q4_0` as well brings it to 14,522 MiB. These are capacity estimates. Cache precision affects the arithmetic.
 
+On the combined branch, the gfx1201 memory planner reserves 11,832 MiB of device memory at 32,768 tokens and 13,752 MiB at 131,072 for the UD-IQ3_XXS text target with Q8_0 K/V, compact SWA, one output, and `-b 512 -ub 512`. The 131,072-token plan includes 578 MiB of GPU compute buffers and uses another 398 MiB of host compute buffers.
+
 ## Measure the card
 
 Build the combined branch’s upstream base `40fe9164f43b4e7b4bf2a261813eed768c367468` with the same compiler, Vulkan SDK and Release options. Set `baseline` and `patched` to the resulting build directories. This measures prefill and decode at several occupied-context depths separately.

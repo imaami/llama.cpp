@@ -105,7 +105,7 @@ struct vk_fa_dequant_kv {
     bool   raw_strided = false;
     size_t scratch_ts  = 0;
 };
-vk_fa_dequant_kv ggml_vk_fa_dequant_kv(const vk_device & device, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v);
+vk_fa_dequant_kv ggml_vk_fa_dequant_kv(const vk_device & device, const ggml_tensor * dst);
 size_t ggml_vk_scratch_offset(const vk_device & device, size_t nbytes);
 size_t ggml_vk_op_scratch_size(const vk_device & device, const ggml_tensor * dst);
 size_t ggml_vk_tensor_alloc_size(const vk_device & device, const ggml_tensor * dst);
