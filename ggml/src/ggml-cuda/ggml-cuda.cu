@@ -3736,6 +3736,7 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // A Hadamard rotation of an activation ([MUL signs, RESHAPE,] MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD)
 // whose every use is a PTQ1_0 mat-vec on the mmvq path does not need to exist in F32: each of those
 // mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes
@@ -3917,6 +3918,7 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     }
     return consumed;
 }
+#endif
 
 // GET_ROWS and let the kernel index the cache row directly. Single-sequence only: with several
 // sequences a gathered row may alias a row another sequence writes in the same op.
@@ -6171,6 +6173,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
                 // Hadamard rotation that quantizes its own output; its PTQ1_0 mat-vecs skip quantize
                 if ((node->op == GGML_OP_MUL || node->op == GGML_OP_MUL_MAT) && !is_concurrent_event_active) {
                     const int consumed = ggml_cuda_try_fwht_q8(*cuda_ctx, cgraph, i);
@@ -6179,6 +6182,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
                 }
+#endif
 
                 // The normalized pre-attention residual is consumed only by a
                 // group of low-bit projections. Preserve residual + one scale per
