@@ -1,7 +1,7 @@
 #version 450
 
-#include "generic_head.glsl"
 #include "types.glsl"
+#include "sum_rows.glsl"
 
 #extension GL_EXT_control_flow_attributes : enable
 
@@ -21,19 +21,19 @@ void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint col = gl_LocalInvocationID.x;
 
-    if (row >= p.KY) {
+    if (row >= p.ne01) {
         return;
     }
 
     A_TYPE amax = -FLT_MAX;
     uint acol = col;
 
-    if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
+    if (col < p.n_cols) {
+        amax = data_a[get_aoffset() + row*p.n_cols + col];
     }
 
-    for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
+    for (uint i = col + BLOCK_SIZE; i < p.n_cols; i += BLOCK_SIZE) {
+        A_TYPE val = data_a[get_aoffset() + row*p.n_cols + i];
         if (val > amax) {
             amax = val;
             acol = i;
@@ -45,7 +45,7 @@ void main() {
 
     barrier();
     [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (col < s && col + s < p.KX) {
+        if (col < s && col + s < p.n_cols) {
             if (tmpmax[col] < tmpmax[col + s]) {
                 tmpmax[col] = tmpmax[col + s];
                 tmp[col] = tmp[col + s];
@@ -55,6 +55,6 @@ void main() {
     }
 
     if (col == 0) {
-        data_d[row] = D_TYPE(tmp[0]);
+        data_d[get_doffset() + row] = D_TYPE(tmp[0]);
     }
 }
