@@ -262,7 +262,8 @@ extern "C" {
         GGML_TYPE_F8_E4M3 = 43,
         GGML_TYPE_PQ2_0   = 142, // group 128; 44..141 are unused
         GGML_TYPE_PTQ1_0  = 143, // ternary, group 128
-        GGML_TYPE_COUNT   = 144,
+        GGML_TYPE_PQ2_0M  = 145, // Prism min/max KV cache, group 128
+        GGML_TYPE_COUNT   = 146,
     };
 
     // [TAG_GGML_PREC]

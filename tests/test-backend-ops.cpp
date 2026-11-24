@@ -11987,7 +11987,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
-    GGML_TYPE_PQ2_0,
+    GGML_TYPE_PQ2_0, GGML_TYPE_PQ2_0M,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     GGML_TYPE_F8_E4M3,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
@@ -14942,6 +14942,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    for (int64_t d : {128, 256}) {
+        for (auto kv : {std::make_pair(GGML_TYPE_Q4_0, GGML_TYPE_PQ2_0M),
+                        std::make_pair(GGML_TYPE_PQ2_0M, GGML_TYPE_F16),
+                        std::make_pair(GGML_TYPE_PQ2_0M, GGML_TYPE_PQ2_0M)}) {
+            test_cases.emplace_back(new test_flash_attn_ext(d, d, 4, {1, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, kv.first, kv.second));
+        }
+    }
 
     // vision encoder attention at head size 72 (no mask, n_q == n_kv), which the CUDA backend runs as zero-padded D=80 MMA
     for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_F32}) {

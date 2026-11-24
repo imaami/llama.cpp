@@ -206,6 +206,17 @@ typedef struct {
 } block_pq2_0;
 static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
 
+// PQ2_0M: min/max (range-scale) variant of PQ2_0, KV-cache only. Same 2-bit
+// codec (raw codes q in {0, 1, 2, 3}) but with a per-block range step
+// d = (max - min) / 3 and a per-block offset m = min, so all four levels span
+// the full data range [min, min+d, min+2d, min+3d=max]. Dequant: y = m + q * d.
+typedef struct {
+    ggml_half d;                   // delta (range step)
+    ggml_half m;                   // offset (block min)
+    uint8_t qs[QK_PQ2_0 / 4];     // 2 bits per element
+} block_pq2_0m;
+static_assert(sizeof(block_pq2_0m) == 2 * sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0m block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
