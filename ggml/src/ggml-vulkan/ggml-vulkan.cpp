@@ -4139,8 +4139,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         const uint32_t sg = device->architecture == AMD_RDNA4 && device->subgroup_size_control ? device->subgroup_min_size : device->subgroup_size;
-        ggml_vk_create_pipeline(device, device->pipeline_row_l2_clip, "row_l2_clip", row_l2_clip_len, row_l2_clip_data, "main", 2,
-                                sizeof(vk_op_row_l2_clip_push_constants), {1, 1, 1}, {sg}, 1, false, true, sg);
+        constexpr uint32_t widths[] = {0, 16, 128};
+        for (size_t i = 0; i < device->pipeline_row_l2_clip.size(); ++i) {
+            ggml_vk_create_pipeline(device, device->pipeline_row_l2_clip[i], "row_l2_clip", row_l2_clip_len, row_l2_clip_data,
+                                    "main", 2, sizeof(vk_op_row_l2_clip_push_constants), {1, 1, 1}, {sg, widths[i]}, 1, false, true, sg);
+        }
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_situ, "situ", situ_len, situ_data, "main", 3,
@@ -13168,7 +13171,7 @@ static void ggml_vk_row_l2_clip(ggml_backend_vk_context * ctx, vk_context & subc
         ggml_get_op_params_f32(graph->nodes[i + 4], 0),
     };
 
-    auto & pipeline = ctx->device->pipeline_row_l2_clip;
+    auto & pipeline = ctx->device->pipeline_row_l2_clip[pc.cols == 16 ? 1 : pc.cols == 128 ? 2 : 0];
     const uint32_t groups = std::min(pc.rows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -15457,7 +15460,7 @@ static bool ggml_vk_can_fuse_situ(const ggml_backend_vk_context * ctx, const ggm
 }
 
 static bool ggml_vk_can_fuse_row_l2_clip(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
-    if (!ctx->device->pipeline_row_l2_clip ||
+    if (!ctx->device->pipeline_row_l2_clip[0] ||
         !ggml_can_fuse_subgraph(graph, i, row_l2_clip_pattern, {i + 7}) ||
         !ggml_check_edges(graph, i, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {5, 1, 3},
                                      {6, 0, 5}, {7, 1, 6}})) {
