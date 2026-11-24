@@ -1,6 +1,6 @@
 # Inkling 2 Mini on RX 9070 XT with Vulkan
 
-Build the `inkling2-rdna4` branch for target-only inference. The `inkling2-rdna4-dspark` branch adds the matching recurrent DSpark drafter. Both use ordinary llama.cpp GGUFs with the `inkling2_loop` architecture.
+The `bonsai2-inkling-rdna4` branch builds one Vulkan backend and one set of executables for Ternary Bonsai 2 and Inkling 2 Mini. The same server supports Bonsai's embedded Qwen3.5 MTP and Inkling's separate recurrent DSpark GGUF.
 
 ```sh
 cmake -S . -B build-inkling -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
@@ -22,7 +22,7 @@ build-inkling/bin/llama-server -m inkling-iq3.gguf -dev "$dev" -ngl all \
     -fa on -np 1 -c 131072 -b 512 -ub 512 -ctk q8_0 -ctv q8_0 --jinja
 ```
 
-For DSpark, build `inkling2-rdna4-dspark` and download its paired draft.
+For DSpark, download the draft paired with this Inkling GGUF.
 
 ```sh
 curl -fL --retry 3 -o inkling-dspark.gguf "$src/dspark-Inkling-2-Mini-Q8_0.gguf_file"
@@ -30,9 +30,16 @@ curl -fL --retry 3 -o inkling-dspark.gguf "$src/dspark-Inkling-2-Mini-Q8_0.gguf_
 
 Add `-md inkling-dspark.gguf --spec-type draft-dspark --spec-draft-device "$dev" --spec-draft-ngl all --spec-draft-n-max 3` to the server command. Use `--spec-draft-sampling probabilistic` for rejection sampling at positive temperature. Measure accepted tokens and end-to-end generation time on the same prompts before selecting a draft length. The tables below cover the text target alone.
 
+For a Bonsai 2 GGUF that includes MTP weights, use the same server binary with the Bonsai model as the target. Set `--spec-draft-window` to a positive number to limit the draft's KV history independently of the target context.
+
+```sh
+build-inkling/bin/llama-server -m "$bonsai_mtp" -dev "$dev" -ngl all \
+    -fa on -np 1 -c 131072 --spec-type draft-mtp --spec-draft-n-max 1
+```
+
 ## What fits
 
-These are ggml graph reservations using the released GGUF tensor headers and a 16 GiB RADV gfx1201 device profile. The models use one sequence, one requested output, compact SWA, full layer offload, FA enabled and batch/microbatch 512. Device totals include model, context and compute. Allow additional memory for the display, driver, projector and draft as applicable.
+These reservations were recorded for the original Inkling changes based on upstream `4af4bb6d`, using the released GGUF tensor headers and a 16 GiB RADV gfx1201 device profile. The models use one sequence, one requested output, compact SWA, full layer offload, FA enabled and batch/microbatch 512. Device totals include model, context and compute. Allow additional memory for the display, driver, projector and draft as applicable.
 
 | Target | Context | K/V | Stock device MiB | Patched device MiB |
 | --- | ---: | --- | ---: | ---: |
@@ -45,7 +52,7 @@ At 131,072 with UD-IQ3_XXS and Q8_0, GPU compute scratch fell from 3,513 to 589 
 
 ## Measure the card
 
-Build upstream commit `4af4bb6d8ad83ec0b3ef84a3bc477ccfe179b4ff` with the same compiler, Vulkan SDK and Release options. Set `baseline` and `patched` to the resulting build directories. This measures prefill and decode at several occupied-context depths separately.
+Build the combined branch’s upstream base `40fe9164f43b4e7b4bf2a261813eed768c367468` with the same compiler, Vulkan SDK and Release options. Set `baseline` and `patched` to the resulting build directories. This measures prefill and decode at several occupied-context depths separately.
 
 ```sh
 for build in "$baseline" "$patched"; do
