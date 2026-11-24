@@ -247,7 +247,7 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0, const bool nextn = false) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -1095,6 +1095,83 @@ static double check_draft_rollback(llama_model * model, const std::vector<llama_
     return nmse(ref, logits);
 }
 
+// archs whose MTP graph is checked with check_mtp_masked_rows()
+static bool mtp_test(const llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        // these MTP graphs publish h_nextn before selecting the output rows, the context copies the flagged rows
+        case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_COHERE2MOE:
+        case LLM_ARCH_HY_V3:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// in masked mode, the MTP context returns h_nextn only for the batch entries flagged as outputs
+// the same entries are decoded as one batch with only the last entry flagged, and as a batch without outputs followed
+// by the last entry alone - both must return the h_nextn of the last entry
+// returns the NMSE between the two
+static double check_mtp_masked_rows(llama_model * model, llama_context * ctx_tgt, const std::vector<llama_token> & tokens) {
+    const uint32_t n_embd   = llama_model_n_embd_out(model);
+    const uint32_t n_tokens = 8;
+    GGML_ASSERT(tokens.size() > n_tokens);
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx           = llama_n_ctx(ctx_tgt);
+    cparams.n_ubatch        = llama_n_ubatch(ctx_tgt);
+    cparams.n_threads       = 4;
+    cparams.n_threads_batch = 4;
+    cparams.n_rs_seq        = 0;
+    cparams.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+    cparams.ctx_other       = ctx_tgt;
+    llama_context_ptr ctx_dft(llama_init_from_model(model, cparams));
+    if (!ctx_dft) {
+        throw std::runtime_error("failed to create MTP context");
+    }
+
+    llama_set_embeddings_nextn(ctx_tgt,       true, /*masked*/ false);
+    llama_set_embeddings_nextn(ctx_dft.get(), true, /*masked*/ true);
+
+    // target hidden states for tokens [0, n_tokens]
+    common_batch batch(ctx_tgt);
+    for (uint32_t pos = 0; pos <= n_tokens; pos++) {
+        batch.add(tokens[pos], pos, 0, true);
+    }
+    if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        throw std::runtime_error("failed to decode target batch");
+    }
+    const float * h = llama_get_embeddings_nextn(ctx_tgt);
+    const std::vector<float> h_tgt(h, h + (size_t) (n_tokens + 1)*n_embd);
+
+    // MTP entry k: token k + 1 paired with the target hidden state of token k, as in the speculative catch-up
+    common_batch batch_dft(ctx_dft.get());
+    auto decode_dft = [&](uint32_t k0, uint32_t k1, bool output_last) {
+        batch_dft.clear();
+        for (uint32_t k = k0; k < k1; k++) {
+            const int32_t idx = batch_dft.add(tokens[k + 1], k + 1, 0, output_last && k == k1 - 1);
+            batch_dft.set_embd_state(idx, { h_tgt.data() + (size_t) k*n_embd, 1, n_embd });
+        }
+        if (llama_process(ctx_dft.get(), LLAMA_PROCESS_TYPE_DECODE, batch_dft.get())) {
+            throw std::runtime_error("failed to decode MTP batch");
+        }
+    };
+
+    decode_dft(0, n_tokens, true);              // A: 8 entries, only the last flagged
+    const float * h_dft = llama_get_embeddings_nextn(ctx_dft.get());
+    const std::vector<float> h_batch(h_dft, h_dft + n_embd);
+
+    llama_memory_clear(llama_get_memory(ctx_dft.get()), true);
+    decode_dft(0, n_tokens - 1, false);         // B: 7 entries, none flagged
+    decode_dft(n_tokens - 1, n_tokens, true);   //    then the last one alone
+    h_dft = llama_get_embeddings_nextn(ctx_dft.get());
+    const std::vector<float> h_single(h_dft, h_dft + n_embd);
+
+    return nmse(h_single, h_batch);
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_FLINT:
@@ -1271,7 +1348,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         if (!arch_matches(arch_filter, arch)) {
             continue;
         }
-        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_DSPARK || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue;
         }
         for (bool moe : {false, true}) {
@@ -1428,7 +1505,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         if (!arch_matches(arch_filter, arch)) {
             continue;
         }
-        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_DSPARK || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue;
         }
 
@@ -1442,7 +1519,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             }
             const std::string config_name = moe ? "MoE" : "Dense";
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            gguf_context_ptr gguf_ctx_mtp = mtp_test(arch) ? get_gguf_ctx(arch, moe, /*nextn*/ true) : nullptr;
+            gguf_context_ptr gguf_ctx_mtp = mtp_test(arch) ? get_gguf_ctx(arch, moe, 0, /*nextn*/ true) : nullptr;
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
@@ -1540,6 +1617,17 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                     status_nmse = "\033[1;31mFAIL\033[0m (rollback)";
                                 }
                                 test_ok = false;
+                            }
+                        }
+                        if (gguf_ctx_mtp && dc.split_mode == LLAMA_SPLIT_MODE_LAYER && !dc.host_experts && dc.moe_cache_size == 0) {
+                            auto model_and_ctx_mtp = get_model_and_ctx(gguf_ctx_mtp.get(), nullptr, seed, stdev, dc.devs, dc.split_mode,
+                                /*encode*/ false, /*tensor_buft_overrides*/ nullptr, /*moe_cache_size*/ 0, /*load_mtp*/ true);
+                            const double nmse_mtp = check_mtp_masked_rows(model_and_ctx_mtp.first.get(), model_and_ctx_mtp.second.get(), tokens);
+                            snprintf(mtp_str, sizeof(mtp_str), "(%.2e)", nmse_mtp);
+                            status_mtp = "\033[1;32mOK\033[0m";
+                            if (nmse_mtp > 1e-4) {
+                                test_ok = false;
+                                status_mtp = "\033[1;31mFAIL\033[0m";
                             }
                         }
                     }

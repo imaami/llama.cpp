@@ -95,6 +95,12 @@ struct llama_context {
 
     ggml_tensor * get_layer_inp_dev() const { return layer_inp_dev; }
     ggml_tensor * get_h_nextn_dev()   const { return h_nextn_dev; }
+    // multi-layer hidden-state tap (EAGLE3 / dspark target-feature reuse).
+    // get_embeddings_capture_ith returns the concatenated [n_capture * n_embd] row
+    // for output position i, captured layers laid out in capture order.
+    float *  get_embeddings_capture();
+    float *  get_embeddings_capture_ith(int32_t i);
+    uint32_t get_n_capture() const;
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);

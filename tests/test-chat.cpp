@@ -2546,6 +2546,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
             .run();
 
+        // a response format with tools and tool_choice=auto must not produce a lazy grammar
         tst.test(
                "I need to output the invoice details in JSON\n"
                "</think>\n\n"
@@ -2553,6 +2554,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .enable_thinking(true)
             .tools({ get_time_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_AUTO)
             .json_schema(invoice_schema)
             .expect_reasoning("I need to output the invoice details in JSON")
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
@@ -2912,6 +2914,20 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
             .run();
 
+        tst.test(
+               "[THINK]I need to output the invoice details in JSON[/THINK]"
+               "```json\n"
+               R"({"amount": 123.45, "date": "2025-12-03"})"
+               "\n```")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_AUTO)
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+
+        // fake tool call marker in reasoning
         tst.test(
                "[THINK]I need to output the invoice details in JSON[/THINK]"
                "```json\n"
@@ -9039,6 +9055,21 @@ static void test_reasoning_policy_session() {
         assert_contains(session.prompt().str(), "Reasoning: medium\n");
         assert_equals(128, params.at("n_predict").get<int>());
     }
+    // This template rejects xhigh before rendering. Apply the server allowlist first.
+    opt.tmpls = read_templates("models/templates/IFM-K2-Horizon.jinja");
+    body.erase("chat_template_kwargs");
+    body["reasoning_effort"] = "medium";
+    const std::string expected_prompt = oaicompat_chat_params_parse(nullptr, body, opt, files, session).at("prompt");
+    body["reasoning_effort"] = "xhigh";
+    params = oaicompat_chat_params_parse(nullptr, body, opt, files, session);
+    assert_equals(expected_prompt, params.at("prompt").get<std::string>());
+
+    // An explicit opt-out still disables the token floor with an allowlist.
+    opt.tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+    opt.reasoning_max_tokens_floor = 4096;
+    body["reasoning_effort"] = "none";
+    params = oaicompat_chat_params_parse(nullptr, body, opt, files, session);
+    assert_equals(128, params.at("n_predict").get<int>());
 }
 
 static void test_reasoning_effort_caps() {

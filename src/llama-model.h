@@ -1191,7 +1191,7 @@ struct llama_model_base : public llama_model {
     void load_hparams_hadamard(llama_model_loader & ml);
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
-    void load_tensors_hadamard();
+    void load_tensors_hadamard(const llama_model_loader & ml);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

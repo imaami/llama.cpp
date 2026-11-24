@@ -1278,6 +1278,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+            if (flags & TENSOR_SKIP) {
+                skipped_tensors.insert(tn.str());
+            }
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 

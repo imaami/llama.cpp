@@ -209,6 +209,24 @@ llama_context::llama_context(
             model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
             model.arch == LLM_ARCH_BAILINGMOE3);
 
+    // Keep activation replay as the default. Explicit snapshots trade cache memory for
+    // skipping replay at verification, on the backends with direct GDN state-row reads.
+    const char * snapshots = getenv("GGML_GDN_STATE_SNAPSHOTS");
+    if (cparams.rs_replay && snapshots && strcmp(snapshots, "1") == 0 &&
+        model.arch == LLM_ARCH_QWEN35 && cparams.n_seq_max == 1 &&
+        model.split_mode() != LLAMA_SPLIT_MODE_TENSOR && !getenv("GGML_GDN_STATE_GATHER")) {
+        const bool rows_supported = std::all_of(model.devices.begin(), model.devices.end(), [](const llama_device & d) {
+            if (!d.dev) {
+                return true;
+            }
+            const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(d.dev));
+            return strcmp(name, "Vulkan") == 0 || strcmp(name, "CPU") == 0;
+        });
+        if (rows_supported) {
+            cparams.rs_replay = false;
+        }
+    }
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -3293,6 +3311,11 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.dspark_ctx  =*/ &dspark_ctx,
+        /*.dspark_has_context =*/ !dspark_ctx.v_ctx_feat.empty(),
+        /*.dspark_ctx_rows =*/ dspark_ctx.n_ctx_rows,
+        /*.dspark_ctx_width =*/ dspark_ctx.n_embd_cap,
+        /*.hdmd        =*/ hdmd->rot.empty() && hdmd->inv.empty() ? nullptr : hdmd.get(),
         /*.layer_inp_dev =*/ layer_inp_dev,
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
@@ -4647,6 +4670,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
+        /*.path_kv_mean_center         =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

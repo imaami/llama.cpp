@@ -385,6 +385,11 @@ public:
     ggml_tensor * rep_cols_p = nullptr;
 
     void set_input_rep(const llama_memory_recurrent_context * mctx, const llama_ubatch * ubatch);
+    // GDN rows mode only (see build_rs_write_rows): I64 [n_write*n_seqs]
+    // cache-row indices for the snapshot SET_ROWS scatter; created lazily,
+    // shared across recurrent layers
+    ggml_tensor * s_write_rows = nullptr;
+    int64_t       s_write_K    = 0;
 
     const llama_memory_recurrent_context * mctx;
 
@@ -926,6 +931,8 @@ struct llm_graph_params {
     bool                    dspark_has_context;
     int64_t                 dspark_ctx_rows;
     int64_t                 dspark_ctx_width;
+
+    const llama_hadamard * hdmd;
 
     ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
@@ -1606,6 +1613,26 @@ struct llm_graph_context {
             ggml_tensor * conv_x,
                 int64_t   n_cols,
                  size_t   offs) const;
+    // like build_rs, but WITHOUT the main per-seq state gather: performs the
+    // rs_zero clear and the extra-states relocation, then returns the 2D
+    // (state_size, n_rows) cache view. For consumers that read per-seq state
+    // rows directly via inp->s_copy_main (e.g. ggml_gated_delta_net_rows),
+    // saving a get_rows per layer per decode.
+    ggml_tensor * build_rs_cache_view(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
+
+    // I64 cache-row indices for the rows-mode snapshot scatter: row of
+    // (slot s, seq i) = s*mem_size + head + i, matching the strided-cpy
+    // destination of the legacy gathered path. Created lazily on the shared
+    // rs input and reused by every recurrent layer of the graph.
+    ggml_tensor * build_rs_write_rows(
+            llm_graph_input_rs * inp,
+                int64_t   K,
+                int64_t   n_seq_tokens,
+                int64_t   n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

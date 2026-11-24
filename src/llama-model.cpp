@@ -770,6 +770,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2 + head_ratio}};
                 }
+                if (ud->model->hdmd.gdn_v_grouped && std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                    return {{value_dim, 1}};
+                }
                 if ((hparams.is_recr(il) && std::regex_match(tensor_name, pattern_attn_gate_weight)) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                     return {{key_dim, head_ratio}};
                 }
@@ -2175,6 +2178,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_prec_policy(ml);
+    if (arch == LLM_ARCH_DSPARK && params.dspark_head_source) {
+        tensors_by_name.emplace_back("output.weight", output);
+    }
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
@@ -2337,7 +2343,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_tensor_get(per_layer_tok_embd_s, &per_layer_tok_embd_scale, 0, sizeof(per_layer_tok_embd_scale));
     }
 
-    load_tensors_hadamard();
+    load_tensors_hadamard(ml);
 
     return true;
 }
@@ -2510,7 +2516,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
 
 // make one Hadamard matrix per block size and one sign vector per width (the GGUF does not contain them)
 // each tensor goes on the buffer type of its weights (never a CPU extra type), and each transform goes in hdmd.rot or hdmd.inv
-void llama_model_base::load_tensors_hadamard() {
+void llama_model_base::load_tensors_hadamard(const llama_model_loader & ml) {
     if (hdmd.weight_blocks.empty() && hdmd.inverse_blocks.empty()) {
         return;
     }
@@ -2543,6 +2549,10 @@ void llama_model_base::load_tensors_hadamard() {
                 }
             }
             if (weight == nullptr) {
+                // A combined GGUF may list folds in MTP layers excluded from a trunk-only load.
+                if (ml.skipped_tensors.count(weight_name)) {
+                    continue;
+                }
                 throw std::runtime_error(format("prism.hadamard weight not found: %s", weight_name.c_str()));
             }
             if (weight->ne[0] % block_size != 0) {
