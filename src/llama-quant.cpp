@@ -224,6 +224,7 @@ struct tensor_metadata {
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
+    bool            fit_ptq1 = false;
 };
 
 // dequantization
@@ -763,9 +764,56 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs,
     return new_type;
 }
 
+// Fit ordinary weights to {-d, 0, +d} before packing them with the existing PTQ1 encoder.
+// For fixed d, a weight is nonzero when |x| > d/2. The optimum is therefore a
+// prefix in descending |x| order, with d = sum(w*|x|)/sum(w) for that prefix.
+static size_t quantize_ptq1_fitted(const float * src, void * dst, int64_t nrows, int64_t ncols, const float * imatrix) {
+    constexpr int block_size = 128;
+    const auto * type = ggml_get_type_traits(GGML_TYPE_PTQ1_0);
+    GGML_ASSERT(type->blck_size == block_size && ncols % block_size == 0);
+    auto * out = static_cast<uint8_t *>(dst);
+    for (int64_t row = 0; row < nrows; ++row) {
+        for (int64_t col = 0; col < ncols; col += block_size) {
+            // An expert absent from the calibration corpus can have an all-zero imatrix.
+            const float * weights = imatrix ? imatrix + col : nullptr;
+            if (weights && std::all_of(weights, weights + block_size, [](float w) { return w == 0.0f; })) {
+                weights = nullptr;
+            }
+            std::array<std::pair<float, float>, block_size> ranked;
+            for (int j = 0; j < block_size; ++j) {
+                const float w = weights ? weights[j] : 1.0f;
+                if (!std::isfinite(src[j]) || w < 0.0f) { return 0; }
+                ranked[j] = {std::fabs(src[j]), w};
+            }
+            std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+
+            double sum = 0.0, mass = 0.0, best_gain = 0.0, scale = 0.0;
+            for (const auto & [magnitude, weight] : ranked) {
+                sum  += double(weight) * magnitude;
+                mass += weight;
+                if (sum*sum > best_gain*mass) {
+                    scale = sum/mass;
+                    best_gain = sum*scale;
+                }
+            }
+
+            // Select trits using the stored FP16 scale, then reuse the exact wire encoder.
+            const float d = ggml_fp16_to_fp32(ggml_fp32_to_fp16(float(std::min(scale, 65504.0))));
+            std::array<float, block_size> fitted;
+            for (int j = 0; j < block_size; ++j) {
+                fitted[j] = std::fabs(src[j]) > 0.5f*d ? std::copysign(d, src[j]) : 0.0f;
+            }
+            type->from_float_ref(fitted.data(), out, block_size);
+            out += type->type_size;
+            src += block_size;
+        }
+    }
+    return out - static_cast<uint8_t *>(dst);
+}
+
 // quantize rows [first_row, first_row + nrows), indexed globally across all expert matrices
 // note: chunks never cross an expert boundary since each expert has its own imatrix slice
-static size_t llama_tensor_quantize_impl(ggml_type new_type,
+static size_t llama_tensor_quantize_impl(ggml_type new_type, bool fit_ptq1,
     const float * f32_data,
     void * new_data,
     const int64_t chunk_size,
@@ -783,6 +831,12 @@ static size_t llama_tensor_quantize_impl(ggml_type new_type,
         return imatrix ? imatrix + (row_global / nrows_per_expert) * n_per_row : nullptr;
     };
 
+    auto quantize_rows = [=](const float * data, void * dst, int64_t count, int64_t row_global) {
+        const float * weights = imatrix_for_row(row_global);
+        return fit_ptq1 ? quantize_ptq1_fitted(data, dst, count, n_per_row, weights) :
+                          ggml_quantize_chunk(new_type, data, dst, 0, count, n_per_row, weights);
+    };
+
     if (nthread < 2) {
         // single-thread
         size_t new_size = 0;
@@ -790,8 +844,8 @@ static size_t llama_tensor_quantize_impl(ggml_type new_type,
             const int64_t row_global = first_row + row;
             const int64_t this_nrow  = std::min(nrows - row, nrows_per_expert - row_global % nrows_per_expert);
             void * this_data = (char *) new_data + row * row_size;
-            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
-            if (!ggml_validate_row_data(new_type, this_data, this_size)) { throw std::runtime_error("quantized data validation failed"); }
+            size_t this_size = quantize_rows(f32_data + row * n_per_row, this_data, this_nrow, row_global);
+            if (!this_size || !ggml_validate_row_data(new_type, this_data, this_size)) { throw std::runtime_error("quantized data validation failed"); }
 
             new_size += this_size;
             row += this_nrow;
@@ -805,7 +859,7 @@ static size_t llama_tensor_quantize_impl(ggml_type new_type,
     size_t new_size = 0;
     bool valid = true;
     auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
-            first_row, nrows, nrows_per_expert, n_per_row, row_size, imatrix_for_row] {
+            first_row, nrows, nrows_per_expert, n_per_row, row_size, quantize_rows] {
         const int64_t nrows_per_chunk = chunk_size / n_per_row;
         size_t local_size = 0;
         while (true) {
@@ -822,11 +876,11 @@ static size_t llama_tensor_quantize_impl(ggml_type new_type,
             lock.unlock();
 
             void * this_data = (char *) new_data + row * row_size;
-            size_t this_size = ggml_quantize_chunk(new_type, f32_data + row * n_per_row, this_data, 0, this_nrow, n_per_row, imatrix_for_row(row_global));
+            size_t this_size = quantize_rows(f32_data + row * n_per_row, this_data, this_nrow, row_global);
             local_size += this_size;
 
             // validate the quantized data
-            if (!ggml_validate_row_data(new_type, this_data, this_size)) {
+            if (!this_size || !ggml_validate_row_data(new_type, this_data, this_size)) {
                 std::unique_lock<std::mutex> lock(mutex);
                 valid = false;
                 break;
@@ -3365,12 +3419,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 __func__, metadata[i].name.c_str(), ggml_type_name(metadata[i].target_type));
         }
 
-        // PQ2_0 and PTQ1_0 weights are only valid in the Hadamard-rotated basis
-        if ((metadata[i].target_type == GGML_TYPE_PQ2_0 || metadata[i].target_type == GGML_TYPE_PTQ1_0) && model->hdmd.weight_blocks.empty()) {
-            throw std::runtime_error(format("%s requires an input model with prism.hadamard.* metadata (tensor %s)",
-                    ggml_type_name(metadata[i].target_type), metadata[i].name.c_str()));
-        }
-
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
         if (params->imatrix) { metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped); }
@@ -3508,6 +3556,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             }
         } else {
             throw std::runtime_error(format("--target-bpw/--target-size require an imatrix but none was provided\n"));
+        }
+    }
+
+    // Check the final types, including overrides resolved by the size-budget optimizer.
+    // Prism checkpoints use the reference encoder in their trained, rotated basis.
+    if (model->hdmd.weight_blocks.empty()) {
+        static const std::regex inkling_expert(R"(blk\.[0-9]+\.ffn_(gate_up|down)_exps\.weight)");
+        const bool inkling = model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            auto & tm = metadata[i];
+            if (tm.target_type != GGML_TYPE_PTQ1_0 && tm.target_type != GGML_TYPE_PQ2_0) { continue; }
+            if (tm.target_type == GGML_TYPE_PTQ1_0 && inkling && std::regex_match(tm.name, inkling_expert)) {
+                if (tensors[i]->tensor->type == GGML_TYPE_PTQ1_0) { continue; }
+                if (tensor_type_override_for(qs, tm.name.c_str()) == GGML_TYPE_PTQ1_0) {
+                    tm.fit_ptq1 = true;
+                    continue;
+                }
+            }
+            throw std::runtime_error(format("%s requires an input model with prism.hadamard.* metadata (tensor %s)",
+                    ggml_type_name(tm.target_type), tm.name.c_str()));
         }
     }
 
@@ -3681,7 +3749,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
                     const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
+                    const size_t size_cur = llama_tensor_quantize_impl(new_type, tm.fit_ptq1, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
 
                     fout.write((const char *) work.data(), size_cur);
                     new_size += size_cur;
