@@ -173,6 +173,7 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, d * sum);
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // Hadamard transform folded into the activation quantizer (see ggml_cuda_fwht_skip): one block per
 // (transform width N, row), the same butterfly as fwht_cuda_block, then the same per-32 quantization
 // and stores as quantize_q8_1<layout> above. Element i*NT + tid of the transform sits in reg[i], so
@@ -358,6 +359,7 @@ void fwht_quantize_row_q8_1_cuda(
         fwht_quantize_launch<float>((const float *) x, signs, vy, layout, n, ne00, ne0, ncols, 1, 1, scale, stream);
     }
 }
+#endif
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     if (!(amax > 0.0f)) {
