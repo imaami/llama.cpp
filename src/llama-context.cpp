@@ -4398,6 +4398,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    // These persistent outputs and speculative feature buffers are allocated outside the scheduler.
+    for (auto * buf : { buf_output.get(), buf_layer_inp_dev.get(), buf_h_nextn_dev.get() }) {
+        if (buf) {
+            ret[ggml_backend_buffer_get_type(buf)].context += ggml_backend_buffer_get_size(buf);
+        }
+    }
     if (model.no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
