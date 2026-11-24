@@ -20,14 +20,14 @@ layout(binding = 3) buffer Dst { float dst[]; };
 layout(push_constant) uniform PushConstants {
     uint nb01; uint nb02;
     uint nb11;
-    uint dst_nb0; uint dst_nb1; uint dst_nb2;
+    uint dst_nb1; uint dst_nb2;
     uint nc; uint nr; uint n_t; uint n_s;
-    float scale;
+    float scale; float scale_bias;
 };
 
 float add_scale(float conv, float residual) {
     precise float value = conv + residual;
-    return value * scale + 0.0f;
+    return value * scale + scale_bias;
 }
 
 void main() {

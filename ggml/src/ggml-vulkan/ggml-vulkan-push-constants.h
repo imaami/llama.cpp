@@ -872,9 +872,9 @@ struct vk_op_ssm_scan_push_constants {
 struct vk_op_ssm_conv_push_constants {
     uint32_t nb01, nb02;
     uint32_t nb11;
-    uint32_t dst_nb0, dst_nb1, dst_nb2;
+    uint32_t dst_nb1, dst_nb2;
     uint32_t nc, nr, n_t, n_s;
-    float scale;
+    float scale, scale_bias;
 };
 
 struct vk_op_conv2d_push_constants {
