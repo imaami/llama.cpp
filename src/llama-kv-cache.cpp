@@ -2235,11 +2235,44 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
         staging.resize(n_kv * ubatch->n_tokens);
         data = staging.data();
     }
+
+    // For ordinary prefill, verify once that cache columns follow position order.
+    // Only the columns within the learned extent then need individual distances.
+    bool linear = ubatch->n_tokens > 1 && (v_cells.size() == 1 || ubatch->n_seqs_unq == 1);
+    int64_t first = 0, end = 0, pos_offset = 0;
+    if (linear) {
+        const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+        first = std::min<int64_t>(cells.used_min(), n_kv);
+        end   = std::min<int64_t>(cells.used_max_p1(), n_kv);
+        if (first < end) {
+            pos_offset = int64_t(cells.pos_get(first)) - first;
+        }
+        for (int64_t j = first + 1; j < end; ++j) {
+            if (cells.is_empty(j) || cells.pos_get(j) != pos_offset + j) {
+                linear = false;
+                break;
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        int32_t * row = data + i*n_kv;
+        if (linear) {
+            const int64_t query = int64_t(ubatch->pos[i]) - pos_offset;
+            const int64_t lo = std::clamp(query - extent + 1, first, end);
+            const int64_t hi = std::clamp(query + 1, first, end);
+            std::fill(row, row + lo, extent);
+            for (int64_t j = lo; j < hi; ++j) {
+                row[j] = query - j;
+            }
+            std::fill(row + hi, row + n_kv, extent);
+            continue;
+        }
+
         const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
         for (int64_t j = 0; j < n_kv; ++j) {
             const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
-            data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
+            row[j] = distance >= 0 && distance < extent ? distance : extent;
         }
     }
     if (!staging.empty()) {
