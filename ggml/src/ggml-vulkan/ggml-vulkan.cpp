@@ -4137,6 +4137,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f32, "out_prod_f32", out_prod_f32_len, out_prod_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
 
+    if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
+        const uint32_t sg = device->architecture == AMD_RDNA4 && device->subgroup_size_control ? device->subgroup_min_size : device->subgroup_size;
+        ggml_vk_create_pipeline(device, device->pipeline_row_l2_clip, "row_l2_clip", row_l2_clip_len, row_l2_clip_data, "main", 2,
+                                sizeof(vk_op_row_l2_clip_push_constants), {1, 1, 1}, {sg}, 1, false, true, sg);
+    }
+
     ggml_vk_create_pipeline(device, device->pipeline_snake_f32,  "snake_f32",  snake_f32_len,  snake_f32_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_f16,  "snake_f16",  snake_f16_len,  snake_f16_data,  "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
@@ -13126,6 +13132,25 @@ void ggml_vk_col2im_1d(ggml_backend_vk_context * ctx, vk_context& subctx, const 
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_COL2IM_1D, std::move(p));
 }
 
+static void ggml_vk_row_l2_clip(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * graph, int i) {
+    const ggml_tensor * src = graph->nodes[i]->src[0];
+    ggml_tensor * dst = graph->nodes[i + 7];
+    vk_op_row_l2_clip_push_constants pc = {
+        (uint32_t) src->ne[0],
+        (uint32_t) ggml_nrows(src),
+        get_misalign_bytes(ctx, src) / (uint32_t) sizeof(float),
+        get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(float),
+        ggml_get_op_params_f32(graph->nodes[i + 3], 1),
+        ggml_get_op_params_f32(graph->nodes[i + 4], 0),
+    };
+
+    auto & pipeline = ctx->device->pipeline_row_l2_clip;
+    const uint32_t groups = std::min(pc.rows, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, src, true), ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc, { groups, 1, 1 });
+}
+
 void ggml_vk_snake_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * mul0 = cgraph->nodes[node_idx + 0];
     const ggml_tensor * sqr  = cgraph->nodes[node_idx + 2];
@@ -13696,7 +13721,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_SQR:
-        ggml_vk_sqr(ctx, compute_ctx, src0, node);
+        if (ctx->num_additional_fused_ops) {
+            ggml_vk_row_l2_clip(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_sqr(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SQRT:
@@ -15361,6 +15390,24 @@ bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const str
     return true;
 }
 
+static bool ggml_vk_can_fuse_row_l2_clip(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    if (!ctx->device->pipeline_row_l2_clip ||
+        !ggml_can_fuse_subgraph(graph, i, row_l2_clip_pattern, {i + 7}) ||
+        !ggml_check_edges(graph, i, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {5, 1, 3},
+                                     {6, 0, 5}, {7, 1, 6}})) {
+        return false;
+    }
+
+    const ggml_tensor * src   = graph->nodes[i]->src[0];
+    const ggml_tensor * scale = graph->nodes[i + 3];
+    const ggml_tensor * clamp = graph->nodes[i + 6];
+    const ggml_tensor * dst   = graph->nodes[i + 7];
+    return src == dst->src[0] && src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
+           src->ne[0] <= 128 && ggml_nelements(src) <= INT32_MAX &&
+           ggml_get_op_params_f32(scale, 0) == 1.0f &&
+           ggml_get_op_params_f32(clamp, 0) == 0.0f && ggml_get_op_params_f32(clamp, 1) == 1.0f;
+}
+
 bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(ctx);
     if (!ggml_can_fuse(cgraph, node_idx, snake_pattern)) {
@@ -15823,6 +15870,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (ggml_vk_can_fuse_row_l2_clip(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = row_l2_clip_pattern.size() - 1;
+                fusion_string = "ROW_L2_CLIP";
+                // The subgroup reads the entire input row into registers before writing it back.
+                std::fill_n(op_srcs_fused_elementwise, row_l2_clip_pattern.size(), true);
             } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";
@@ -16190,6 +16242,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_topk_moe_pattern(topk_moe_late_softmax)) {
             continue;
         }
+        if (keep_pattern(row_l2_clip_pattern)) {
+            continue;
+        }
         if (keep_pattern(snake_pattern)) {
             continue;
         }
@@ -16250,6 +16305,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||
                 match_pattern(topk_moe_late_softmax, j) ||
+                match_pattern(row_l2_clip_pattern, j) ||
                 match_pattern(snake_pattern, j) ||
                 in_qsa_pattern(j) ||
                 match_pattern(rms_norm_mul_add_mul_pattern, j) ||

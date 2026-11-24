@@ -4730,6 +4730,29 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+// Inkling 2 clips query, key and relative-position projections by their row L2 norms.
+struct test_row_l2_clip : public test_case {
+    const int64_t cols;
+    const float limit;
+    const bool reuse_norm;
+
+    test_row_l2_clip(int64_t cols, float limit, bool reuse_norm = false) :
+        cols(cols), limit(limit), reuse_norm(reuse_norm) {}
+
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "ROW_L2_CLIP"; }
+    std::string vars() override { return VARS_TO_STR3(cols, limit, reuse_norm); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cols, 8, 5, 2);
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, x)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, limit), norm);
+        ggml_tensor * clipped = ggml_mul(ctx, x, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+        return reuse_norm ? ggml_add(ctx, clipped, norm) : clipped;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -11256,6 +11279,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    test_cases.emplace_back(new test_row_l2_clip(16, 0.5f));
+    test_cases.emplace_back(new test_row_l2_clip(128, 0.75f));
+    test_cases.emplace_back(new test_row_l2_clip(37, 64.0f));
+    test_cases.emplace_back(new test_row_l2_clip(129, 1.0f));
+    test_cases.emplace_back(new test_row_l2_clip(16, 0.5f, true));
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
