@@ -713,6 +713,15 @@ struct vk_op_conv_transpose_1d_push_constants {
     int32_t s0;
 };
 
+struct vk_op_row_l2_clip_push_constants {
+    uint32_t cols;
+    uint32_t rows;
+    uint32_t src_offset;
+    uint32_t dst_offset;
+    float    eps;
+    float    threshold;
+};
+
 struct vk_op_snake_push_constants {
     uint32_t ne0;
     uint32_t ne1;

@@ -1,0 +1,35 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Each workgroup is exactly one subgroup. Inkling clips 16- and 128-column rows.
+layout(local_size_x_id = 0) in;
+layout(binding = 0) readonly  buffer A { float x[]; };
+layout(binding = 1) writeonly buffer D { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint cols;
+    uint rows;
+    uint src_offset;
+    uint dst_offset;
+    float eps;
+    float threshold;
+} p;
+
+void main() {
+    for (uint row = gl_WorkGroupID.x; row < p.rows; row += gl_NumWorkGroups.x) {
+        float values[(128 + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x];
+        float sum = 0.0;
+        uint base = row * p.cols + gl_LocalInvocationIndex;
+        for (uint col = gl_LocalInvocationIndex, i = 0; col < p.cols; col += gl_WorkGroupSize.x, ++i) {
+            float v = x[p.src_offset + base + i * gl_WorkGroupSize.x];
+            values[i] = v;
+            sum += v * v;
+        }
+        float factor = clamp(p.threshold / (sqrt(subgroupAdd(sum)) + p.eps), 0.0, 1.0);
+        for (uint col = gl_LocalInvocationIndex, i = 0; col < p.cols; col += gl_WorkGroupSize.x, ++i) {
+            y[p.dst_offset + base + i * gl_WorkGroupSize.x] = values[i] * factor;
+        }
+    }
+}
