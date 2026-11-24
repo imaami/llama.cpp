@@ -1481,6 +1481,15 @@ struct test_case {
         std::string unsupported_str;
         for (ggml_backend_t backend : {backend1, backend2}) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
+                // Indexed FA is implemented in the CPU reference kernel, but deliberately
+                // excluded from CPU scheduler placement. Check the other FA inputs as usual.
+                if (backend == backend2 && ggml_flash_attn_ext_has_indexed_bias(t)) {
+                    ggml_tensor plain = *t;
+                    ggml_flash_attn_ext_add_indexed_bias(&plain, nullptr, nullptr);
+                    if (ggml_backend_supports_op(backend, &plain)) {
+                        continue;
+                    }
+                }
                 if (!ggml_backend_supports_op(backend, t)) {
                     supported = false;
                     if (unsupported_str.empty()) {
@@ -9850,6 +9859,35 @@ struct test_flash_attn_ext_indexed_bias : public test_case {
     }
 };
 
+// Compare the model's materialized per-head mask and the same attention with an indexed bias.
+struct test_flash_attn_ext_bias_vs_dense : public test_flash_attn_ext_indexed_bias {
+    explicit test_flash_attn_ext_bias_vs_dense(int64_t nb, ggml_type type)
+        : test_flash_attn_ext_indexed_bias(128, 2, 3, 512, nb, 2, 33, false, true, type, true) {}
+
+    std::string op_desc(ggml_tensor *) override { return "FLASH_ATTN_EXT_BIAS_VS_DENSE"; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * compact = test_flash_attn_ext_indexed_bias::build_graph(ctx);
+        ggml_tensor * table = ggml_cont(ctx, ggml_permute(ctx, compact->src[6], 1, 0, 2, 3));
+        ggml_tensor * bias = ggml_get_rows(ctx, table, compact->src[7]);
+        bias = ggml_reshape_4d(ctx, bias, nh*gqa, kv, nb, n_stream);
+        bias = ggml_cont(ctx, ggml_permute(ctx, bias, 2, 0, 1, 3));
+        ggml_tensor * mask = ggml_cast(ctx, ggml_add(ctx, bias, ggml_cast(ctx, compact->src[3], GGML_TYPE_F32)), GGML_TYPE_F16);
+        ggml_tensor * dense = ggml_flash_attn_ext(ctx, compact->src[0], compact->src[1], compact->src[2],
+                mask, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(dense, compact->src[4]);
+        ggml_prec_set_acc(dense, GGML_PREC_F32);
+        return ggml_concat(ctx, compact, dense, 3);
+    }
+
+    double err(const float * device, const float * ref, size_t n) override {
+        // Both halves must match across devices, and materializing the mask must
+        // independently reproduce the indexed result on each device.
+        return std::max({nmse(device, ref, n), nmse(device, device + n/2, n/2), nmse(ref, ref + n/2, n/2)});
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -13954,6 +13992,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1100, 256, 2, 33, false, true, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 1100,   7, 2, 33, false, true, GGML_TYPE_Q8_0));
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 4, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext_bias_vs_dense(nb, type));
+        }
+    }
 
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
