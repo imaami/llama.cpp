@@ -58,7 +58,7 @@ On the combined branch, the gfx1201 memory planner reserves 11,832 MiB of device
 
 ## Measure the card
 
-Build the combined branch’s upstream base `40fe9164f43b4e7b4bf2a261813eed768c367468` with the same compiler, Vulkan SDK and Release options. Set `baseline` and `patched` to the resulting build directories. This measures prefill and decode at several occupied-context depths separately.
+Build the combined branch’s upstream base `97bbf98fdfeb311e50e313fc807d3af1a1ff32d4` with the same compiler, Vulkan SDK and Release options. Set `baseline` and `patched` to the resulting build directories. This measures prefill and decode at several occupied-context depths separately.
 
 ```sh
 for build in "$baseline" "$patched"; do
