@@ -1,0 +1,29 @@
+#version 450
+
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly  buffer G { float gate[]; };
+layout(binding = 1) readonly  buffer U { float up[]; };
+layout(binding = 2) writeonly buffer D { float dst[]; };
+
+layout(push_constant) uniform Params {
+    uint cols, rows;
+    uint gate_stride, up_stride;
+    uint gate_offset, up_offset, dst_offset;
+    float gate_in_scale, gate_out_scale, up_in_scale, up_out_scale;
+} p;
+
+// Match the tanh and sigmoid used by the unfused Vulkan unary pipeline.
+float softcap(float x, float in_scale, float out_scale) {
+    return out_scale * (1.0 - 2.0 / (exp(2.0 * (x * in_scale)) + 1.0));
+}
+
+void main() {
+    for (uint row = gl_WorkGroupID.y; row < p.rows; row += gl_NumWorkGroups.y) {
+        for (uint col = gl_GlobalInvocationID.x; col < p.cols; col += gl_NumWorkGroups.x * gl_WorkGroupSize.x) {
+            float g = gate[p.gate_offset + row * p.gate_stride + col];
+            float u = up[p.up_offset + row * p.up_stride + col];
+            float act = softcap(g, p.gate_in_scale, p.gate_out_scale) * (1.0 / (1.0 + exp(-g)));
+            dst[p.dst_offset + row * p.cols + col] = act * softcap(u, p.up_in_scale, p.up_out_scale);
+        }
+    }
+}
