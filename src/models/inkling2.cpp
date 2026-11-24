@@ -252,10 +252,14 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     gate = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, gate, 1e-6f), 2*n_embd, n_tokens);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
+    // Schedule both projections before the elementwise controller update so a backend can fuse it.
+    ggml_tensor * gain = build_lora_mm(loop.ctrl_gain[ctrl], gate);
+    ggml_build_forward_expand(gf, gain);
     ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
-
-    return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
+    ggml_tensor * result = ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)),
+            ggml_mul(ctx0, ggml_tanh(ctx0, gain), message));
+    ggml_build_forward_expand(gf, result);
+    return result;
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {

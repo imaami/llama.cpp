@@ -4241,6 +4241,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    if (device->properties.limits.maxPerStageDescriptorStorageBuffers >= 5) {
+        ggml_vk_create_pipeline(device, device->pipeline_controller_mix, "controller_mix", controller_mix_len, controller_mix_data,
+                                "main", 5, sizeof(vk_op_controller_mix_push_constants), {128, 1, 1}, {}, 1);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_situ, "situ", situ_len, situ_data, "main", 3,
                             sizeof(vk_op_situ_push_constants), {128, 1, 1}, {}, 1);
 
@@ -13449,6 +13453,29 @@ void ggml_vk_col2im_1d(ggml_backend_vk_context * ctx, vk_context& subctx, const 
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_COL2IM_1D, std::move(p));
 }
 
+static void ggml_vk_controller_mix(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * graph, int i) {
+    const auto nodes = graph->nodes + i;
+    const ggml_tensor * forget  = nodes[0]->src[0];
+    const ggml_tensor * cur     = nodes[1]->src[1];
+    const ggml_tensor * gain    = nodes[3]->src[0];
+    const ggml_tensor * message = nodes[4]->src[1];
+    const ggml_tensor * dst     = nodes[5];
+
+    auto offset = [&](const ggml_tensor * t) { return get_misalign_bytes(ctx, t) / (uint32_t) sizeof(float); };
+    vk_op_controller_mix_push_constants pc = {
+        (uint32_t) ggml_nelements(dst), offset(forget), offset(cur), offset(gain), offset(message), offset(dst),
+    };
+    auto & pipeline = ctx->device->pipeline_controller_mix;
+    const uint32_t count = (uint32_t) std::min<uint64_t>(pc.n,
+            (uint64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0] * pipeline->wg_denoms[0]);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        ggml_vk_tensor_subbuffer(ctx, forget, true), ggml_vk_tensor_subbuffer(ctx, cur, true),
+        ggml_vk_tensor_subbuffer(ctx, gain, true), ggml_vk_tensor_subbuffer(ctx, message, true),
+        ggml_vk_tensor_subbuffer(ctx, dst, true),
+    }, pc, {count, 1, 1});
+}
+
 static void ggml_vk_situ(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_cgraph * graph, int i) {
     const ggml_tensor * gate = graph->nodes[i]->src[0];
     const ggml_tensor * up   = graph->nodes[i + 5]->src[0];
@@ -14153,6 +14180,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_UNARY:
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
+        if (ctx->num_additional_fused_ops == (int) controller_mix_pattern.size() - 1) {
+            ggml_vk_controller_mix(ctx, compute_ctx, cgraph, node_idx);
             break;
         }
         if (ctx->num_additional_fused_ops) {
@@ -15859,6 +15890,33 @@ bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const str
     return true;
 }
 
+static bool ggml_vk_can_fuse_controller_mix(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    if (!ctx->device->pipeline_controller_mix || !ggml_can_fuse_subgraph(graph, i, controller_mix_pattern, {i + 5}) ||
+        !ggml_check_edges(graph, i, {{1, 0, 0}, {2, 1, 1}, {4, 0, 3}, {5, 0, 2}, {5, 1, 4}})) {
+        return false;
+    }
+    const auto nodes = graph->nodes + i;
+    const ggml_tensor * dst = nodes[5];
+    if (ggml_get_unary_op(nodes[0]) != GGML_UNARY_OP_TANH || ggml_get_unary_op(nodes[3]) != GGML_UNARY_OP_TANH ||
+        nodes[2]->src[0] != nodes[1]->src[1] || ggml_is_empty(dst)) {
+        return false;
+    }
+    for (int j = 0; j < 5; ++j) {
+        if (nodes[j]->view_src) {
+            return false;
+        }
+    }
+    const size_t max_range = ctx->device->properties.limits.maxStorageBufferRange;
+    for (const ggml_tensor * t : {nodes[0]->src[0], nodes[1]->src[1], nodes[3]->src[0], nodes[4]->src[1], nodes[5]}) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, dst) ||
+            !ggml_backend_buffer_is_vk(t->buffer) || ggml_vk_tensor_buffer_offset(ctx, t) % sizeof(float) != 0 ||
+            ggml_nbytes(t) + get_misalign_bytes(ctx, t) > max_range || std::find(nodes, nodes + 5, t) != nodes + 5 || ggml_vk_tensors_overlap(t, dst, true)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_vk_can_fuse_situ(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
     if (!ggml_can_fuse_subgraph(graph, i, situ_pattern, {i + 8}) ||
         !ggml_check_edges(graph, i, {{1, 0, 0}, {2, 0, 1}, {4, 0, 2}, {4, 1, 3}, {6, 0, 5}, {7, 0, 6},
@@ -16400,6 +16458,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // they are overwritten, and one workgroup per row. So close enough.
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_controller_mix(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = controller_mix_pattern.size() - 1;
+                fusion_string = "CONTROLLER_MIX";
+                std::fill_n(op_srcs_fused_elementwise, controller_mix_pattern.size(), true);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 switch (ggml_get_unary_op(cgraph->nodes[i])) {
@@ -16822,6 +16884,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_topk_moe_pattern(topk_moe_late_softmax)) {
             continue;
         }
+        if (match_pattern(controller_mix_pattern, first_unused)) {
+            add_pattern_alloc_deps(controller_mix_pattern, first_unused + (int) controller_mix_pattern.size() - 1);
+            keep_pattern(controller_mix_pattern);
+            continue;
+        }
         if (match_pattern(situ_pattern, first_unused)) {
             add_pattern_alloc_deps(situ_pattern, first_unused + (int) situ_pattern.size() - 1);
             keep_pattern(situ_pattern);
@@ -16900,8 +16967,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
+            // Both gate branches must stay together until keep_pattern handles them.
+            if (match_pattern(controller_mix_pattern, j)) {
+                j += (int) controller_mix_pattern.size() - 1;
+                continue;
+            }
             // The sigmoid and the up branch are independent of the first tanh.
-            // Leave the entire candidate in order until keep_pattern handles it.
             if (match_pattern(situ_pattern, j)) {
                 j += (int) situ_pattern.size() - 1;
                 continue;

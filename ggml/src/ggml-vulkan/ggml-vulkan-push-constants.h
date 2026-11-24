@@ -727,6 +727,11 @@ struct vk_op_conv_transpose_1d_push_constants {
     int32_t s0;
 };
 
+struct vk_op_controller_mix_push_constants {
+    uint32_t n;
+    uint32_t forget_offset, cur_offset, gain_offset, message_offset, dst_offset;
+};
+
 struct vk_op_situ_push_constants {
     uint32_t cols;
     uint32_t rows;
