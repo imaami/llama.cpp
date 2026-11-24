@@ -244,10 +244,10 @@ void quantize(uint dst_idx, uint src_idx)
 // packing as PQ2_0 (4 codes per byte); the only differences are the range-based
 // d, the stored m, and the (w - min) normalization.
 #if defined(DATA_A_PQ2_0M)
-uint quantize_pq2_0m(float x)
+uint quantize_pq2_0m(float offset, float range)
 {
-    const int q = int(x >= 0.0f ? floor(x + 0.5f) : ceil(x - 0.5f));
-    return uint(clamp(q, 0, 3));
+    precise float scaled = 6.0f * offset;
+    return range == 0.0f ? 0u : uint(scaled >= range) + uint(2.0f * offset >= range) + uint(scaled >= 5.0f * range);
 }
 
 void quantize(uint dst_idx, uint src_idx)
@@ -261,17 +261,17 @@ void quantize(uint dst_idx, uint src_idx)
         if (v > vmax) vmax = v;
     }
 
-    const float d = (vmax - vmin) / 3.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    const float range = vmax - vmin;
+    const float d = range / 3.0f;
 
     data_q[dst_idx].d = float16_t(d);
     data_q[dst_idx].m = float16_t(vmin);
 
     [[unroll]] for (int j = 0; j < QUANT_K_PQ2_0M / 4; ++j) {
-        const uint q0 = quantize_pq2_0m((float(data_s[src_idx + 4*j    ]) - vmin) * id);
-        const uint q1 = quantize_pq2_0m((float(data_s[src_idx + 4*j + 1]) - vmin) * id);
-        const uint q2 = quantize_pq2_0m((float(data_s[src_idx + 4*j + 2]) - vmin) * id);
-        const uint q3 = quantize_pq2_0m((float(data_s[src_idx + 4*j + 3]) - vmin) * id);
+        const uint q0 = quantize_pq2_0m(float(data_s[src_idx + 4*j    ]) - vmin, range);
+        const uint q1 = quantize_pq2_0m(float(data_s[src_idx + 4*j + 1]) - vmin, range);
+        const uint q2 = quantize_pq2_0m(float(data_s[src_idx + 4*j + 2]) - vmin, range);
+        const uint q3 = quantize_pq2_0m(float(data_s[src_idx + 4*j + 3]) - vmin, range);
         data_q[dst_idx].qs[j] = uint8_t(q0 | (q1 << 2u) | (q2 << 4u) | (q3 << 6u));
     }
 }

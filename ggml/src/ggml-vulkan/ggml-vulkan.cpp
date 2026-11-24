@@ -17741,6 +17741,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_PQ2_0:
+                    case GGML_TYPE_PQ2_0M:
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:

@@ -160,24 +160,23 @@ void quantize_row_pq2_0m_ref(const float * GGML_RESTRICT x, block_pq2_0m * GGML_
             if (v < min) min = v;
             if (v > max) max = v;
         }
-        const float d = (max - min) / 3.0f;
-        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        const float range = max - min;
+        const float d = range / 3.0f;
 
         y[i].d = GGML_FP32_TO_FP16(d);
         y[i].m = GGML_FP32_TO_FP16(min);
 
-        for (int j = 0; j < qk / 4; ++j) {
-            y[i].qs[j] = 0;
-        }
-
-        for (int j = 0; j < qk; ++j) {
-            const float w = x[i*qk + j];
-            int q = (int)roundf((w - min) * id);
-            if (q < 0) q = 0;
-            if (q > 3) q = 3;
-            const int byte_index = j / 4;
-            const int bit_offset = (j % 4) * 2;
-            y[i].qs[byte_index] |= ((uint8_t)q << bit_offset);
+        // Classify against the exact midpoints at 1/6, 1/2 and 5/6 of the range.
+        // This avoids reciprocal rounding changing a tie on a different backend.
+        for (int byte = 0; byte < qk / 4; ++byte) {
+            uint8_t packed = 0;
+            for (int lane = 0; lane < 4; ++lane) {
+                const float offset = x[i*qk + 4*byte + lane] - min;
+                const float scaled = 6.0f * offset;
+                const unsigned q = range == 0.0f ? 0 : (scaled >= range) + (2.0f * offset >= range) + (scaled >= 5.0f * range);
+                packed |= q << (2*lane);
+            }
+            y[i].qs[byte] = packed;
         }
     }
 }
