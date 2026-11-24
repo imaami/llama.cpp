@@ -180,6 +180,11 @@ llama_model_inkling2::graph::mix_bank llama_model_inkling2::graph::prepare_mix(g
     return { states, ggml_cont(ctx0, ggml_transpose(ctx0, states)) };
 }
 
+static bool inkling2_mix_states_first(int64_t n_tokens) {
+    // Use the matvec layout for single-token decode and short speculative verification batches.
+    return n_tokens <= 8;
+}
+
 // attention over the depth: mix the normalized block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const mix_bank & bank, ggml_tensor * query) {
     ggml_tensor * queries = query;
@@ -190,10 +195,9 @@ ggml_tensor * llama_model_inkling2::graph::mix(const mix_bank & bank, ggml_tenso
     ggml_tensor * scores = ggml_mul_mat(ctx0, bank.states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
-    // Keep each controller stream contiguous in decode. During prefill, put
-    // n_embd on the long dimension of the weighted sum.
-    return n_tokens == 1 ? ggml_mul_mat(ctx0, bank.states_t, scores)
-                         : ggml_mul_mat(ctx0, scores, bank.states_t);
+    // During prefill, put n_embd on the long dimension of the weighted sum.
+    return inkling2_mix_states_first(n_tokens) ? ggml_mul_mat(ctx0, bank.states_t, scores)
+                                               : ggml_mul_mat(ctx0, scores, bank.states_t);
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
@@ -298,8 +302,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // Extract [n_embd, n_tokens] from the weighted sum in its native matmul layout.
     auto mix_stream = [&](ggml_tensor * mixed, int stream) {
-        if (n_tokens == 1) {
-            return ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, 1, mixed->nb[2], stream*mixed->nb[1]));
+        if (inkling2_mix_states_first(n_tokens)) {
+            ggml_tensor * view = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], stream*mixed->nb[1]);
+            return ggml_is_contiguous(view) ? view : ggml_cont(ctx0, view);
         }
         ggml_tensor * view = ggml_view_3d(ctx0, mixed, 1, n_embd, n_tokens, mixed->nb[1], mixed->nb[2], stream*mixed->nb[0]);
         return ggml_reshape_2d(ctx0, ggml_cont(ctx0, view), n_embd, n_tokens);
