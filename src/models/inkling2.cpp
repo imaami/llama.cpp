@@ -312,8 +312,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(prepare_mix(blocks, inpSA_norm), layer.attn_res_query);
-        for (int j = 0; j < 3; ++j) {
-            inputs[j] = mix_stream(mixed, is_swa ? 0 : j);
+        if (is_swa) {
+            inputs[0] = inputs[1] = inputs[2] = ggml_reshape_2d(ctx0, mixed, n_embd, n_tokens);
+        } else {
+            for (int j = 0; j < 3; ++j) {
+                inputs[j] = mix_stream(mixed, j);
+            }
         }
     }
 
