@@ -66,6 +66,24 @@ f16vec4 dequantFuncQ2_0_v(const in decodeBufQ2_0 bl, const in uint blockCoords[2
     return f16vec4((vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f) * float(d));
 }
 
+// Min/max 2-bit cache. Consecutive groups of four share a byte, low bits first.
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufPQ2_0M {
+    readonly block_pq2_0m block;
+};
+
+float16_t dequantFuncPQ2_0M(const in decodeBufPQ2_0M bl, const in uint blockCoords[2], const in uint coordInBlock[2]) {
+    const uint i = coordInBlock[1];
+    const uint bits = uint(bl.block.qs[i / 4]);
+    const uint q = (bits >> (2 * (i % 4))) & 3u;
+    return float16_t(float(bl.block.m) + float(bl.block.d) * float(q));
+}
+
+f16vec4 dequantFuncPQ2_0M_v(const in decodeBufPQ2_0M bl, const in uint blockCoords[2], const in uint coordInBlock[2]) {
+    const uint bits = uint(bl.block.qs[coordInBlock[1] / 4]);
+    const vec4 q = vec4(bits & 3u, (bits >> 2) & 3u, (bits >> 4) & 3u, bits >> 6);
+    return f16vec4(float(bl.block.m) + float(bl.block.d) * q);
+}
+
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
    readonly block_q4_0_packed16 block;
 };
