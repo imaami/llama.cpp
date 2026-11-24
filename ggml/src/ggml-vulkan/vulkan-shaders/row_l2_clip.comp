@@ -18,6 +18,7 @@ layout(push_constant) uniform Params {
     uint dst_offset;
     float eps;
     float threshold;
+    float bias;
 } p;
 
 void main() {
@@ -38,7 +39,7 @@ void main() {
             uint col = gl_LocalInvocationIndex + i * gl_WorkGroupSize.x;
             if (col < cols) {
                 precise float value = values[i] * factor;
-                y[p.dst_offset + base + col] = L2_NORM_SCALE ? value * p.threshold : value;
+                y[p.dst_offset + base + col] = L2_NORM_SCALE ? value * p.threshold + p.bias : value;
             }
         }
     }

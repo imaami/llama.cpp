@@ -13481,6 +13481,7 @@ static void ggml_vk_row_l2_clip(ggml_backend_vk_context * ctx, vk_context & subc
         get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(float),
         canonical ? ggml_get_op_params_f32(graph->nodes[i], 0) : ggml_get_op_params_f32(graph->nodes[i + 3], 1),
         canonical ? ggml_get_op_params_f32(dst, 0) : ggml_get_op_params_f32(graph->nodes[i + 4], 0),
+        canonical ? ggml_get_op_params_f32(dst, 1) : 0.0f,
     };
 
     auto & pipeline = ctx->device->pipeline_row_l2_clip[canonical][pc.cols == 16 ? 1 : pc.cols == 128 ? 2 : 0];
@@ -15914,7 +15915,7 @@ static bool ggml_vk_can_fuse_row_l2_clip(const ggml_backend_vk_context * ctx, co
     }
     if (canonical) {
         // L2_NORM stores an F32 row before SCALE. Preserve the two multiplies.
-        if (dst->src[0] != graph->nodes[i] || ggml_get_op_params_f32(dst, 1) != 0.0f) {
+        if (dst->src[0] != graph->nodes[i]) {
             return false;
         }
     } else {

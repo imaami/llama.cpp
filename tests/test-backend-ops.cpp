@@ -4867,20 +4867,21 @@ struct test_row_l2_clip : public test_case {
     const float limit;
     const bool reuse_norm;
     const bool canonical;
+    const float bias;
 
-    test_row_l2_clip(int64_t cols, float limit, bool reuse_norm = false, bool canonical = false) :
-        cols(cols), limit(limit), reuse_norm(reuse_norm), canonical(canonical) {}
+    test_row_l2_clip(int64_t cols, float limit, bool reuse_norm = false, bool canonical = false, float bias = 0.0f) :
+        cols(cols), limit(limit), reuse_norm(reuse_norm), canonical(canonical), bias(bias) {}
 
     bool run_whole_graph() override { return true; }
     std::string op_desc(ggml_tensor *) override { return "ROW_L2_CLIP"; }
-    std::string vars() override { return VARS_TO_STR4(cols, limit, reuse_norm, canonical); }
+    std::string vars() override { return VARS_TO_STR5(cols, limit, reuse_norm, canonical, bias); }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cols, 8, 5, 2);
         if (canonical) {
             ggml_set_name(x, "clip_input");
             ggml_tensor * norm = ggml_l2_norm(ctx, x, limit);
-            ggml_tensor * scaled = ggml_scale(ctx, norm, limit);
+            ggml_tensor * scaled = ggml_scale_bias(ctx, norm, limit, bias);
             return reuse_norm ? ggml_add(ctx, scaled, norm) : scaled;
         }
         ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, x)));
@@ -12058,7 +12059,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_row_l2_clip(16, 0.5f, true));
     test_cases.emplace_back(new test_row_l2_clip(16, 0.5f, false, true));
     test_cases.emplace_back(new test_row_l2_clip(128, 0.75f, false, true));
-    test_cases.emplace_back(new test_row_l2_clip(37, 1.25f, false, true));
+    test_cases.emplace_back(new test_row_l2_clip(37, 1.25f, false, true, 0.125f));
     test_cases.emplace_back(new test_row_l2_clip(129, 0.75f, false, true));
     test_cases.emplace_back(new test_row_l2_clip(16, 0.5f, true, true));
 
