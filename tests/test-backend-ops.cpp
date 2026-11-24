@@ -5267,6 +5267,35 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// Inkling's static short convolution flattens the sequence and token axes before adding the residual.
+struct test_ssm_conv_res_scale : public test_case {
+    int64_t channels, tokens, seqs;
+    float bias;
+    bool broadcast, reverse_add, reuse_conv;
+
+    test_ssm_conv_res_scale(int64_t channels, int64_t tokens, int64_t seqs, float bias = 0.0f,
+            bool broadcast = false, bool reverse_add = false, bool reuse_conv = false)
+        : channels(channels), tokens(tokens), seqs(seqs), bias(bias), broadcast(broadcast),
+          reverse_add(reverse_add), reuse_conv(reuse_conv) {}
+
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_RES_SCALE"; }
+    std::string vars() override {
+        return VARS_TO_STR7(channels, tokens, seqs, bias, broadcast, reverse_add, reuse_conv);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, tokens + 3, channels, seqs);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+        ggml_tensor * conv = ggml_ssm_conv(ctx, x, w);
+        ggml_tensor * flat = ggml_reshape_2d(ctx, conv, channels, tokens * seqs);
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, broadcast ? 1 : tokens * seqs);
+        ggml_tensor * add = reverse_add || broadcast ? ggml_add(ctx, flat, res) : ggml_add(ctx, res, flat);
+        ggml_tensor * out = ggml_scale_bias(ctx, add, 1.0f / sqrtf(5.0f), bias);
+        return reuse_conv ? ggml_add(ctx, out, flat) : out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -13254,6 +13283,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    test_cases.emplace_back(new test_ssm_conv_res_scale(2304, 1, 1));
+    test_cases.emplace_back(new test_ssm_conv_res_scale(1024, 64, 1));
+    test_cases.emplace_back(new test_ssm_conv_res_scale(65, 1, 3));
+    test_cases.emplace_back(new test_ssm_conv_res_scale(65, 2, 3, 0.0f, false, true));
+    test_cases.emplace_back(new test_ssm_conv_res_scale(65, 17, 3));
+    // These graphs must preserve the affine bias, broadcast indexing and externally used convolution.
+    test_cases.emplace_back(new test_ssm_conv_res_scale(65, 2, 3, 0.75f));
+    test_cases.emplace_back(new test_ssm_conv_res_scale(65, 2, 3, 0.0f, true));
+    test_cases.emplace_back(new test_ssm_conv_res_scale(65, 2, 3, 0.0f, false, false, true));
 
     // Short convolution tiles: channel tails, two-token verification, and general-path boundary.
     for (int64_t d_inner : {63, 65, 10240}) {

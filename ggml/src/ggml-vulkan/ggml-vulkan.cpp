@@ -4445,6 +4445,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_f32[i],           "ssm_conv_f32" + suffix,           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 0}, 1);
         ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_silu_f32[i],      "ssm_conv_silu_f32" + suffix,      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 1}, 1);
         ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_bias_silu_f32[i], "ssm_conv_bias_silu_f32" + suffix, ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 1, 1}, 1);
+        ggml_vk_create_pipeline2(device, device->pipeline_ssm_conv_res_scale_f32[i], "ssm_conv_res_scale_f32" + suffix, ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {channels, tokens, 1}, {channels, tokens, 0, 0, 1}, 1);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -10537,12 +10538,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_SSM_CONV:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            const int64_t n_t = dst->ne[1];
+            const int64_t n_t = src0->ne[0] - src1->ne[0] + 1;
             const uint32_t tile = n_t >= 1 && n_t <= 2 && ctx->device->pipeline_ssm_conv_f32[n_t] ? uint32_t(n_t) : 0;
             switch (ctx->num_additional_fused_ops) {
                 case 0:  return ctx->device->pipeline_ssm_conv_f32[tile];
                 case 1:  return ctx->device->pipeline_ssm_conv_silu_f32[tile];
                 case 2:  return ctx->device->pipeline_ssm_conv_bias_silu_f32[tile];
+                case 3:  return ctx->device->pipeline_ssm_conv_res_scale_f32[tile];
                 default: return nullptr;
             }
         }
@@ -11079,8 +11081,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_SSM_CONV:
         {
             const uint32_t nr  = src0->ne[1];
-            const uint32_t n_t = dst->ne[1];
-            const uint32_t n_s = dst->ne[2];
+            const uint32_t n_t = src0->ne[0] - src1->ne[0] + 1;
+            const uint32_t n_s = src0->ne[2];
             elements = { nr, n_t, n_s };
         }
         break;
@@ -11905,31 +11907,32 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     const ggml_tensor * src0 = conv->src[0];
     const ggml_tensor * src1 = conv->src[1];
 
-    // Pick the destination tensor (last node in the fused chain) and the optional bias.
-    // Fusion modes: 0 = ssm_conv, 1 = ssm_conv+silu, 2 = ssm_conv+add(bias)+silu.
     ggml_tensor * dst = conv;
-    const ggml_tensor * bias = nullptr;
+    const ggml_tensor * addend = src0; // dummy binding for the plain and SiLU kernels
+    float scale = 1.0f;
 
     if (ctx->num_additional_fused_ops == 1) {
         dst = cgraph->nodes[node_idx + 1]; // silu
     } else if (ctx->num_additional_fused_ops == 2) {
         ggml_tensor * add = cgraph->nodes[node_idx + 1];
-        bias = (add->src[0] == conv) ? add->src[1] : add->src[0];
+        addend = (add->src[0] == conv) ? add->src[1] : add->src[0];
         dst = cgraph->nodes[node_idx + 2]; // silu
+    } else if (ctx->num_additional_fused_ops == 3) {
+        const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        addend = add->src[0] == reshape ? add->src[1] : add->src[0];
+        dst = cgraph->nodes[node_idx + 3];
+        scale = ggml_get_op_params_f32(dst, 0);
     }
 
-    // The shader always declares 4 bindings; bind src0 as a dummy when bias isn't fused.
-    const ggml_tensor * src2 = bias ? bias : src0;
-
-    ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SSM_CONV, {
+    // The residual and its destination flatten tokens and sequences in the same order.
+    const ggml_tensor * layout = ctx->num_additional_fused_ops == 3 ? conv : dst;
+    ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, addend, nullptr, dst, GGML_OP_SSM_CONV, {
         (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
         (uint32_t)src1->nb[1],
-        (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
-        (uint32_t)src1->ne[0],
-        (uint32_t)src0->ne[0],
-        (uint32_t)src0->ne[1],
-        (uint32_t)dst->ne[1],
-        (uint32_t)dst->ne[2],
+        (uint32_t)layout->nb[0], (uint32_t)layout->nb[1], (uint32_t)layout->nb[2],
+        (uint32_t)src1->ne[0], (uint32_t)conv->ne[0], (uint32_t)conv->ne[1], (uint32_t)conv->ne[2],
+        scale,
     });
 }
 
@@ -15576,6 +15579,46 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     return true;
 }
 
+static bool ggml_vk_can_fuse_ssm_conv_res_scale(const ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int i) {
+    if (!ggml_can_fuse_subgraph(graph, i, ssm_conv_res_scale_pattern, { i + 3 })) {
+        return false;
+    }
+    const ggml_tensor * conv = graph->nodes[i];
+    const ggml_tensor * view = graph->nodes[i + 1];
+    const ggml_tensor * add  = graph->nodes[i + 2];
+    const ggml_tensor * dst  = graph->nodes[i + 3];
+    if (view->src[0] != conv || (add->src[0] != view && add->src[1] != view) || dst->src[0] != add ||
+        add->view_src || ggml_get_op_params_i32(dst, 1) != 0 || ggml_is_empty(conv)) {
+        return false;
+    }
+    const ggml_tensor * res = add->src[0] == view ? add->src[1] : add->src[0];
+    // A broadcast addend has different indexing, and an internal addend would be elided.
+    if (res == view || res == conv || !ggml_are_same_shape(res, view) || !ggml_are_same_shape(res, dst) ||
+        !ggml_is_contiguous(conv) || !ggml_is_contiguous(res) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const auto & limits = ctx->device->properties.limits;
+    const int64_t n_t = conv->ne[1];
+    const uint32_t tile = n_t <= 2 && ctx->device->pipeline_ssm_conv_f32[n_t] ? uint32_t(n_t) : 0;
+    const auto & denoms = ctx->device->pipeline_ssm_conv_res_scale_f32[tile]->wg_denoms;
+    for (int j = 0; j < 3; ++j) {
+        if (CEIL_DIV(conv->ne[j], denoms[j]) > limits.maxComputeWorkGroupCount[j]) {
+            return false;
+        }
+    }
+    const ggml_tensor * x = conv->src[0];
+    const ggml_tensor * w = conv->src[1];
+    for (const ggml_tensor * t : { x, w, res, dst }) {
+        if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || !ggml_backend_buffer_is_vk(t->buffer) ||
+            get_misalign_bytes(ctx, t) != 0 || ggml_nbytes(t) > limits.maxStorageBufferRange) {
+            return false;
+        }
+    }
+    // Include leaves, too. Exact in-place residual reuse is safe, but a shifted overlap is not.
+    return !ggml_vk_tensors_overlap(x, dst, false) && !ggml_vk_tensors_overlap(w, dst, false) &&
+           !ggml_vk_tensors_overlap(res, dst, true);
+}
+
 bool ggml_vk_can_fuse_ssm_conv(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                       int node_idx, int num_extra) {
     const ggml_tensor * conv = cgraph->nodes[node_idx];
@@ -16473,6 +16516,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_ssm_conv_res_scale(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                fusion_string = "SSM_CONV_RES_SCALE";
+                op_srcs_fused_elementwise[0] = false;
+                std::fill_n(op_srcs_fused_elementwise + 1, 3, true);
             } else if (ggml_vk_can_fuse_ssm_conv(ctx, cgraph, i, 2)) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "SSM_CONV_BIAS_SILU";
@@ -16935,6 +16983,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        if (match_pattern(ssm_conv_res_scale_pattern, first_unused)) {
+            add_pattern_alloc_deps(ssm_conv_res_scale_pattern, first_unused + 3);
+            keep_pattern(ssm_conv_res_scale_pattern);
+            continue;
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -16995,6 +17048,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
+                match_pattern(ssm_conv_res_scale_pattern, j) ||
                 match_pattern(hc_post_gate_pattern, j)) {
                 continue;
             }
