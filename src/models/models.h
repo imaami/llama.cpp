@@ -2578,6 +2578,13 @@ struct llama_model_inkling2 : public llama_model_base {
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_rs                  * recr = nullptr;
 
+        // Graph constants can be shared across visits to the same layer device.
+        struct attn_constants {
+            std::map<int64_t, ggml_tensor *> zero_sinks;  // by head count
+            std::map<int, ggml_tensor *> padded_bias;     // by physical layer
+        };
+        std::map<ggml_backend_dev_t, attn_constants> attn_by_device;
+
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
     };
