@@ -11910,6 +11910,7 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * dst = conv;
     const ggml_tensor * addend = src0; // dummy binding for the plain and SiLU kernels
     float scale = 1.0f;
+    float scale_bias = 0.0f;
 
     if (ctx->num_additional_fused_ops == 1) {
         dst = cgraph->nodes[node_idx + 1]; // silu
@@ -11923,6 +11924,7 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         addend = add->src[0] == reshape ? add->src[1] : add->src[0];
         dst = cgraph->nodes[node_idx + 3];
         scale = ggml_get_op_params_f32(dst, 0);
+        scale_bias = ggml_get_op_params_f32(dst, 1);
     }
 
     // The residual and its destination flatten tokens and sequences in the same order.
@@ -11930,9 +11932,9 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, addend, nullptr, dst, GGML_OP_SSM_CONV, {
         (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
         (uint32_t)src1->nb[1],
-        (uint32_t)layout->nb[0], (uint32_t)layout->nb[1], (uint32_t)layout->nb[2],
+        (uint32_t)layout->nb[1], (uint32_t)layout->nb[2],
         (uint32_t)src1->ne[0], (uint32_t)conv->ne[0], (uint32_t)conv->ne[1], (uint32_t)conv->ne[2],
-        scale,
+        scale, scale_bias,
     });
 }
 
@@ -15588,7 +15590,7 @@ static bool ggml_vk_can_fuse_ssm_conv_res_scale(const ggml_backend_vk_context * 
     const ggml_tensor * add  = graph->nodes[i + 2];
     const ggml_tensor * dst  = graph->nodes[i + 3];
     if (view->src[0] != conv || (add->src[0] != view && add->src[1] != view) || dst->src[0] != add ||
-        add->view_src || ggml_get_op_params_i32(dst, 1) != 0 || ggml_is_empty(conv)) {
+        add->view_src || ggml_get_op_params_f32(dst, 1) != 0.0f || ggml_is_empty(conv)) {
         return false;
     }
     const ggml_tensor * res = add->src[0] == view ? add->src[1] : add->src[0];
