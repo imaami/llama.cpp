@@ -15402,10 +15402,24 @@ static bool ggml_vk_can_fuse_row_l2_clip(const ggml_backend_vk_context * ctx, co
     const ggml_tensor * scale = graph->nodes[i + 3];
     const ggml_tensor * clamp = graph->nodes[i + 6];
     const ggml_tensor * dst   = graph->nodes[i + 7];
-    return src == dst->src[0] && src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
-           src->ne[0] <= 128 && ggml_nelements(src) <= INT32_MAX &&
-           ggml_get_op_params_f32(scale, 0) == 1.0f &&
-           ggml_get_op_params_f32(clamp, 0) == 0.0f && ggml_get_op_params_f32(clamp, 1) == 1.0f;
+    if (src != dst->src[0] || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+        ggml_is_empty(src) || src->ne[0] > 128 || ggml_get_op_params_f32(scale, 0) != 1.0f ||
+        ggml_get_op_params_f32(clamp, 0) != 0.0f || ggml_get_op_params_f32(clamp, 1) != 1.0f) {
+        return false;
+    }
+    // Elided in-place ops can have observable writes through another view.
+    for (int j = 0; j < 7; ++j) {
+        if (graph->nodes[i + j]->view_src) {
+            return false;
+        }
+    }
+
+    // Include leaf inputs, which the general fusion overlap check skips. The shader
+    // can write back to the exact same rows, but a shifted alias can clobber another row.
+    return ggml_backend_buffer_is_vk(src->buffer) && ggml_backend_buffer_is_vk(dst->buffer) &&
+           !ggml_vk_tensors_overlap(src, dst, true) &&
+           ggml_nbytes(src) + std::max(get_misalign_bytes(ctx, src), get_misalign_bytes(ctx, dst)) <=
+               ctx->device->properties.limits.maxStorageBufferRange;
 }
 
 bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
