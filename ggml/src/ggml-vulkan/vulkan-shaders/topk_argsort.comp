@@ -23,6 +23,8 @@ layout (push_constant) uniform parameter {
     uint nrows;
     uint first_pass;
     uint last_pass;
+    uint src_offset;
+    uint dst_offset;
 } p;
 
 // pairs of (gid, value)
@@ -35,7 +37,7 @@ void topk(bool needs_bounds_check, const uint row) {
     if (gl_GlobalInvocationID.x < p.ncols_input) {
         if (p.first_pass != 0) {
             const uint row_offset = row * p.ncols_input;
-            dst_row[col] = ivec2(gl_GlobalInvocationID.x, floatBitsToInt(data_a[row_offset + gl_GlobalInvocationID.x]));
+            dst_row[col] = ivec2(gl_GlobalInvocationID.x, floatBitsToInt(data_a[p.src_offset + row_offset + gl_GlobalInvocationID.x]));
         } else {
             const uint row_offset = row * p.ncols_input;
             dst_row[col] = data_s[row_offset + gl_GlobalInvocationID.x];
@@ -89,7 +91,7 @@ void topk(bool needs_bounds_check, const uint row) {
         if (p.last_pass != 0) {
             if (gl_GlobalInvocationID.x < p.ncols_input) {
                 const uint row_offset = row * p.k;
-                data_d[row_offset + col] = dst_row[col].x;
+                data_d[p.dst_offset + row_offset + col] = dst_row[col].x;
             }
         } else {
             if (gl_WorkGroupID.x * p.k + col < p.ncols_output) {

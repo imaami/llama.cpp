@@ -623,6 +623,8 @@ struct vk_op_topk_push_constants {
     uint32_t nrows;
     uint32_t first_pass;
     uint32_t last_pass;
+    uint32_t src_offset;
+    uint32_t dst_offset;
 };
 
 struct vk_op_topk_radix_push_constants {
@@ -632,6 +634,8 @@ struct vk_op_topk_radix_push_constants {
     uint32_t n_tps;    // QSA only
     uint32_t n_blocks; // QSA only
     uint32_t n_stream; // QSA only
+    uint32_t src_offset;
+    uint32_t dst_offset;
 };
 
 struct vk_op_im2col_push_constants {

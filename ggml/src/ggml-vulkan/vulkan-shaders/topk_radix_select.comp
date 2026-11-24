@@ -32,6 +32,8 @@ layout (push_constant) uniform parameter {
     uint n_tps;    // QSA only
     uint n_blocks; // QSA only
     uint n_stream; // QSA only
+    uint src_offset;
+    uint dst_offset;
 } p;
 
 #define RADIX_BITS 8
@@ -72,7 +74,7 @@ float gather(uint row, uint i) {
 
 float load(uint row, uint i, bool first) {
     if (QSA == 0) {
-        return data_a[row * p.ncols + i];
+        return data_a[p.src_offset + row * p.ncols + i];
     }
     // materialize the scattered gather on the first pass and reuse it after; each
     // invocation only touches its own scratch entries, so no barrier is needed
@@ -89,7 +91,7 @@ float load(uint row, uint i, bool first) {
 void topk(const uint row) {
     const uint tid = gl_LocalInvocationID.x;
     const uint ncols = p.ncols;
-    const uint row_out = row * p.k;
+    const uint row_out = p.dst_offset + row * p.k;
 
     uint prefix  = 0;     // fixed high bits of the threshold key
     uint desired = p.k;   // count still needed from the candidate range

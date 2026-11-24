@@ -7921,16 +7921,17 @@ struct test_top_k : public test_case {
     const std::array<int64_t, 4> ne;
     const int k;
     const bool ties;
+    const int view_offset;
     ggml_tensor * input {};
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, k, ties);
+        return VARS_TO_STR5(type, ne, k, ties, view_offset);
     }
 
     test_top_k(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            int k = 4, bool ties = false)
-        : type(type), ne(ne), k(k), ties(ties) {}
+            int k = 4, bool ties = false, int view_offset = 0)
+        : type(type), ne(ne), k(k), ties(ties), view_offset(view_offset) {}
 
     double max_err() override {
         return 0.0;
@@ -8030,7 +8031,14 @@ struct test_top_k : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * a;
+        if (view_offset) {
+            int64_t n = ne[0] * ne[1] * ne[2] * ne[3];
+            ggml_tensor * base = ggml_new_tensor_1d(ctx, type, view_offset + n);
+            a = ggml_reshape_4d(ctx, ggml_view_1d(ctx, base, n, view_offset * ggml_type_size(type)), ne[0], ne[1], ne[2], ne[3]);
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+        }
         ggml_set_name(a, "a");
 
         // Save 'a' for err()
@@ -13596,6 +13604,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
+
+    // Unpadded vocabulary rows can start between storage-buffer descriptor alignment boundaries.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4098, 2, 1, 1}, 64, false, 2));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4098, 2, 1, 1}, 2051, false, 2));
 
     // Large-k, including multi-row and ties (qwen4exp)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
