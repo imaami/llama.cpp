@@ -4837,6 +4837,35 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+struct test_controller_mix : public test_case {
+    const int64_t cols, rows;
+    const bool reuse_forget, different_residual;
+    test_controller_mix(int64_t cols, int64_t rows, bool reuse_forget = false, bool different_residual = false) :
+        cols(cols), rows(rows), reuse_forget(reuse_forget), different_residual(different_residual) {}
+
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "CONTROLLER_MIX"; }
+    std::string vars() override { return VARS_TO_STR4(cols, rows, reuse_forget, different_residual); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto make_view = [&](size_t offset) {
+            auto * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cols * rows + offset);
+            auto * view = ggml_view_2d(ctx, base, cols, rows, cols * sizeof(float), offset * sizeof(float));
+            if (gf) {
+                ggml_build_forward_expand(gf, view);
+            }
+            return view;
+        };
+        auto * cur     = make_view(0);
+        auto * message = make_view(1);
+        auto * gain    = ggml_tanh(ctx, make_view(2));
+        auto * forget  = ggml_tanh(ctx, make_view(3));
+        auto * retained = ggml_sub(ctx, different_residual ? message : cur, ggml_mul(ctx, forget, cur));
+        auto * mixed = ggml_add(ctx, retained, ggml_mul(ctx, gain, message));
+        return reuse_forget ? ggml_add(ctx, mixed, forget) : mixed;
+    }
+};
+
 struct test_situ_fuse : public test_case {
     const int64_t cols;
     const bool reuse_gate_act;
@@ -12047,6 +12076,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    test_cases.emplace_back(new test_controller_mix(2304, 1));
+    test_cases.emplace_back(new test_controller_mix(2304, 16));
+    test_cases.emplace_back(new test_controller_mix(131, 3));
+    test_cases.emplace_back(new test_controller_mix(131, 3, true));
+    test_cases.emplace_back(new test_controller_mix(131, 3, false, true));
 
     test_cases.emplace_back(new test_situ_fuse(1152, false));
     test_cases.emplace_back(new test_situ_fuse(131, false));

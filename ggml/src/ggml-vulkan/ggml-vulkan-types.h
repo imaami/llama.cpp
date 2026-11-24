@@ -566,6 +566,10 @@ static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGM
                                                                              GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
                                                                              GGML_OP_SOFT_MAX, GGML_OP_RESHAPE };
 
+static constexpr std::initializer_list<ggml_op> controller_mix_pattern {
+    GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_SUB, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD,
+};
+
 static constexpr std::initializer_list<ggml_op> situ_pattern {
     GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL,
     GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL,
@@ -1040,6 +1044,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_f16;
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
+    vk_pipeline pipeline_controller_mix;
     vk_pipeline pipeline_situ;
     std::array<vk_pipeline, 3> pipeline_row_l2_clip[2]; // dynamic width, 16, 128
     vk_pipeline pipeline_snake_f32;
