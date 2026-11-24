@@ -157,7 +157,7 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
-    if (op->op == GGML_OP_GATED_DELTA_NET && (op->src[6] != nullptr || ggml_get_op_params_i32(op, 1) != 0)) {
+    if (op->op == GGML_OP_GATED_DELTA_NET && (ggml_gdn_has_rows(op) || ggml_gdn_has_raw_gates(op))) {
         return false;
     }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -900,7 +900,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         // replay (src 6..9): the pending k, v and gates/betas are split by heads like k, v and g, n_rep is per seq
-        const bool replay = tensor->src[6] != nullptr;
+        const bool replay = ggml_gdn_has_replay(tensor);
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
@@ -1091,10 +1091,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_PAD: {
                 split_state = handle_pad(src_ss);
-            } break;
-            case GGML_OP_ARANGE: {
-                // no srcs, every device computes the same values
-                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL: {

@@ -529,7 +529,7 @@ static void rms_norm_f32_dispatch(
             const char * env = getenv("GGML_CUDA_GB10_RMS128");
             return !env || std::atoi(env) != 0;
         }();
-        if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+        if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_GB10 &&
                 ncols <= 128 && rms128_enabled) {
             RMS_NORM_LAUNCH(128, 1, false);
             return;

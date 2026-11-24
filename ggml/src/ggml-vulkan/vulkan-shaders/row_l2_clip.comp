@@ -7,6 +7,7 @@
 // Each workgroup is exactly one subgroup. Inkling clips 16- and 128-column rows.
 layout(local_size_x_id = 0) in;
 layout(constant_id = 1) const uint width = 0;
+layout(constant_id = 2) const bool L2_NORM_SCALE = false;
 layout(binding = 0) readonly  buffer A { float x[]; };
 layout(binding = 1) writeonly buffer D { float y[]; };
 
@@ -31,11 +32,13 @@ void main() {
             values[i] = v;
             sum += v * v;
         }
-        float factor = clamp(p.threshold / (sqrt(subgroupAdd(sum)) + p.eps), 0.0, 1.0);
+        float norm = sqrt(subgroupAdd(sum));
+        float factor = L2_NORM_SCALE ? 1.0 / max(norm, p.eps) : clamp(p.threshold / (norm + p.eps), 0.0, 1.0);
         [[unroll]] for (uint i = 0; i < values.length(); ++i) {
             uint col = gl_LocalInvocationIndex + i * gl_WorkGroupSize.x;
             if (col < cols) {
-                y[p.dst_offset + base + col] = values[i] * factor;
+                precise float value = values[i] * factor;
+                y[p.dst_offset + base + col] = L2_NORM_SCALE ? value * p.threshold : value;
             }
         }
     }

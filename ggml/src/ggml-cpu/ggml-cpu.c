@@ -1355,7 +1355,7 @@ void ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    enum ggml_type    const vec_dot_type     = type_traits_cpu[src0->type].vec_dot_type;
+    enum ggml_type    const vec_dot_type     = ggml_cpu_vec_dot_type(src0);
     ggml_from_float_t const from_float       = type_traits_cpu[vec_dot_type].from_float;
     int64_t           const vec_dot_num_rows = type_traits_cpu[src0->type].nrows;
 
@@ -1563,10 +1563,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const enum ggml_type type = src0->type;
-
-    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_vec_dot_t const vec_dot      = ggml_cpu_vec_dot(src0);
+    enum ggml_type const vec_dot_type = ggml_cpu_vec_dot_type(src0);
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1633,7 +1631,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    enum ggml_type    const vec_dot_type = ggml_cpu_vec_dot_type(src0);
     ggml_from_float_t const from_float   = type_traits_cpu[vec_dot_type].from_float;
 
     // TODO: a more efficient F16 x F16 path can be used here if ggml_prec_get_src(dst, 1) allows converting src1 to F16
@@ -3097,7 +3095,7 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t S_v  = node->src[2]->ne[0];
                         const int64_t K    = ggml_get_op_params_i32(node, 0);
-                        const bool    keep = node->src[6] && ggml_get_op_params_i32(node, 2) != 0;
+                        const bool    keep = ggml_gdn_has_replay(node) && ggml_get_op_params_i32(node, 2) != 0;
                         const int64_t per_thread = S_v + (K > 1 || keep ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;

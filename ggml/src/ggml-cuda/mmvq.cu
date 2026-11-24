@@ -676,6 +676,10 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (ptq1_0_pt_enabled() && type == GGML_TYPE_PTQ1_0 && ncols_dst > 1 &&
+        (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING)) {
+        return ptq1_0_pt_rows_per_block(ncols_dst);
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 || table_id == MMVQ_PARAMETERS_RDNA1) {
         switch (ncols_dst) {
             case 1:
@@ -2041,7 +2045,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), y_layout, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

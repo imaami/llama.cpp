@@ -5336,7 +5336,7 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_GATED_DELTA_NET:
             {
-                if (op->src[6] != nullptr || ggml_get_op_params_i32(op, 1) != 0) {
+                if (ggml_gdn_has_rows(op) || ggml_gdn_has_raw_gates(op)) {
                     supports_op = false; // rows-indexed state read / raw gates not implemented here
                     break;
                 }

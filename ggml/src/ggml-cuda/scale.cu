@@ -53,7 +53,7 @@ static void scale_f32_cuda(const T * x, T * dst, const float scale, const float 
     if constexpr (std::is_same<T, float>::value) {
         // GB10: contiguous, 16-byte aligned F32 rows take a float4 kernel
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        if (cc == GGML_CUDA_CC_DGX_SPARK && k >= 1024 && k % 4 == 0 && ggml_is_contiguous(src0) && ggml_is_contiguous(t) &&
+        if (cc == GGML_CUDA_CC_GB10 && k >= 1024 && k % 4 == 0 && ggml_is_contiguous(src0) && ggml_is_contiguous(t) &&
                 (uintptr_t(x) & 0x0F) == 0 && (uintptr_t(dst) & 0x0F) == 0) {
             const int64_t nelements4 = k / 4;
             const int64_t num_blocks4 = (nelements4 + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;

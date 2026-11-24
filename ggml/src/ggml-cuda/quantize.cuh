@@ -11,9 +11,11 @@
 static_assert(MATRIX_ROW_PADDING %    CUDA_QUANTIZE_BLOCK_SIZE      == 0, "Risk of out-of-bounds access.");
 static_assert(MATRIX_ROW_PADDING % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0, "Risk of out-of-bounds access.");
 
+// layout: see ggml_cuda_q8_1_layout_for() in common.cuh. The caller must pass the same layout the
+// consuming mat-vec kernel expects for (type_src0, ncols_dst, ids).
 void quantize_row_q8_1_cuda(
         const float * x, void * vy,
-        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        ggml_cuda_q8_1_layout layout, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
 // Hadamard transform (width n, optional per-element signs, scale 1/sqrt(n)) + q8_1 quantization in one
@@ -47,6 +49,15 @@ static constexpr int MMQ_FEW_PAIR_INTS = 2 + MMQ_FEW_NCOLS;
 void quantize_mmq_few_id_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, int * pairs, mmq_q8_1_ds_layout ds_layout, int64_t ne00, int64_t s11, int64_t s12,
         int64_t ne11, int64_t n_experts, int64_t n_expert_used, int64_t n_tokens, int64_t si1, int64_t npairs_max, cudaStream_t stream);
+void quantize_mmq_q8_1_swiglu_cuda(
+        const float * x, const float * gate, void * vy, ggml_type type_src0,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+void quantize_mmq_q8_1_rms_cuda(
+        const float * x, const float * weight, const float * scale, void * vy, ggml_type type_src0,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,

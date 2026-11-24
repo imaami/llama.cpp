@@ -4,6 +4,9 @@ constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
 constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
 constant bool  FC_gated_delta_net_rep  [[function_constant(FC_GATED_DELTA_NET + 3)]];
+constant bool  FC_gated_delta_net_rows       [[function_constant(FC_GATED_DELTA_NET_ROWS)]];
+constant bool  FC_gated_delta_net_write_rows [[function_constant(FC_GATED_DELTA_NET_WRITE_ROWS)]];
+constant bool  FC_gated_delta_net_raw_gates  [[function_constant(FC_GATED_DELTA_NET_RAW_GATES)]];
 
 #if 1
 template<short NSG>
@@ -24,6 +27,8 @@ kernel void kernel_gated_delta_net_impl(
         device const char * pv,
         device const char * pgb,
         device const char * n_rep,
+        device const char * raw_dt_bias,
+        device const char * raw_a,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -117,36 +122,38 @@ kernel void kernel_gated_delta_net_impl(
             if (G == 1) {
                 const float g_exp = exp(g_t[0]);
 
-                FOR_UNROLL (short j = 0; j < NSG; j++) {
-                    const short is = tx*NSG + j;
+                FOR_UNROLL (short j = 0; j < SEG; j++) {
+                    const short is = lane*SEG + j;
                     ls[j] *= g_exp;
 
                     s_k += ls[j]*k_t[is];
                 }
             } else {
                 // KDA
-                FOR_UNROLL (short j = 0; j < NSG; j++) {
-                    const short is = tx*NSG + j;
+                FOR_UNROLL (short j = 0; j < SEG; j++) {
+                    const short is = lane*SEG + j;
                     ls[j] *= exp(g_t[is]);
 
                     s_k += ls[j]*k_t[is];
                 }
             }
 
-            s_k = simd_sum(s_k);
+            for (short offset = 1; offset < LANES_PER_ROW; offset <<= 1) {
+                s_k += simd_shuffle_xor(s_k, offset);
+            }
 
             const float d = (v_t - s_k)*beta_t;
 
-            FOR_UNROLL (short j = 0; j < NSG; j++) {
-                const short is = tx*NSG + j;
+            FOR_UNROLL (short j = 0; j < SEG; j++) {
+                const short is = lane*SEG + j;
                 ls[j] += k_t[is]*d;
             }
         }
 
         if (args.keep) {
             device float * dst_state = (device float *)state_out + state_out_base;
-            FOR_UNROLL (short j = 0; j < NSG; j++) {
-                const short is = tx*NSG + j;
+            FOR_UNROLL (short j = 0; j < SEG; j++) {
+                const short is = lane*SEG + j;
                 dst_state[is] = ls[j];
             }
         }

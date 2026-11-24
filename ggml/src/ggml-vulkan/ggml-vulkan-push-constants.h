@@ -831,7 +831,28 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t spg1, spg2, spg3;
 };
 
+struct vk_op_gated_delta_net_rows_push_constants {
+    uint32_t H;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t s_off;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sk1, sk2, sk3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t neq1, rq3;
+    float scale;
+    uint32_t K;
+    uint32_t raw_dt_bias_offset;
+    uint32_t raw_a_offset;
+    uint32_t state_offset;
+    uint32_t state_row_stride;
+    uint32_t n_state_rows;
+    uint32_t rows_offset;
+};
+
 static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
+static_assert(sizeof(vk_op_gated_delta_net_rows_push_constants) <= 128);
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
@@ -1076,6 +1097,15 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
 
     GGML_UNUSED(src1);
     GGML_UNUSED(src2);
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_fwht_signed_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.src_offset  = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.dst_offset  = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+    p.sign_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.up_offset   = src2 ? get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type) : 0;
+
     GGML_UNUSED(src3);
 }
 

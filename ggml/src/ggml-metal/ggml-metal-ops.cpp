@@ -2169,7 +2169,7 @@ static int ggml_metal_gdn_write_rows(
     const ggml_tensor * gdn = ctx->node(idx);
     // honor the backend-wide fusion switch, like every other Metal fusion
     if (!ctx->use_fusion() ||
-        gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] == nullptr ||
+        gdn->op != GGML_OP_GATED_DELTA_NET || !ggml_gdn_has_rows(gdn) ||
         getenv("GGML_GDN_WRITE_FOLD_DISABLE") != nullptr) {
         return 1;
     }
@@ -2314,7 +2314,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     uint64_t nb_out = 0;
     int n_fuse = 1;
 
-    if (use_fusion && !has_write_rows && !op->src[6]) {
+    if (use_fusion && !has_write_rows && !ggml_gdn_has_rows(op)) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
 
@@ -2334,10 +2334,13 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     }
 
     // replay of pending tokens, see ggml_gated_delta_net_ext
-    const ggml_tensor * pk  = op->src[6];
-    const ggml_tensor * pv  = op->src[7];
-    const ggml_tensor * pgb = op->src[8];
-    const ggml_tensor * rep = op->src[9];
+    const bool replay    = ggml_gdn_has_replay(op);
+    const bool raw_gates = ggml_gdn_has_raw_gates(op);
+    const ggml_tensor * rows = ggml_gdn_has_rows(op) ? op->src[6] : nullptr;
+    const ggml_tensor * pk  = replay ? op->src[6] : nullptr;
+    const ggml_tensor * pv  = replay ? op->src[7] : nullptr;
+    const ggml_tensor * pgb = replay ? op->src[8] : nullptr;
+    const ggml_tensor * rep = replay ? op->src[9] : nullptr;
 
     int ida = 0;
 
@@ -2399,12 +2402,22 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
-    ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
+    // rows (rows mode; bind state as a never-read placeholder otherwise --
+    // the function constant compiles the rows path out entirely)
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rows ? rows : op->src[5]), ida++);
+    // write rows and destination are only consumed by the fused ring path;
+    // bind valid placeholders for the ordinary/scratch variants.
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(has_write_rows ? write_rows : (rows ? rows : op->src[5])), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(has_write_rows ? state_dst : op->src[5]), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
+    ggml_metal_encoder_set_buffer(enc, bid_out, ida++); // state_out
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(pk  ? pk  : op->src[0]), ida++); // pend_k
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(pv  ? pv  : op->src[0]), ida++); // pend_v
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(pgb ? pgb : op->src[0]), ida++); // pend_gb
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rep ? rep : op->src[0]), ida++); // n_rep
+    // raw-gate tables (dt_bias, a); never read unless the raw flag is set, bind beta as the dummy
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(raw_gates ? op->src[7] : op->src[4]), ida++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(raw_gates ? op->src[8] : op->src[4]), ida++);
 
     const int nsg = pipeline.nsg;
 
@@ -3301,7 +3314,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         static const int  fewrow_max = getenv("GGML_METAL_PQ2_0_FEWROW_MAX") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_MAX")) : 32;
         static const int  fewrow_cfg = getenv("GGML_METAL_PQ2_0_FEWROW_CFG") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_CFG")) : 0;
 
-        if (fewrow_on && props_dev->has_tensor &&
+        if (fewrow_on && props_dev->has_tensor && ggml_prec_get_src(op, 1) != GGML_PREC_F32 &&
             op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
             ne11 >= fewrow_min && ne11 <= fewrow_max &&
             ne00 % 128 == 0 && // QK_PQ2_0

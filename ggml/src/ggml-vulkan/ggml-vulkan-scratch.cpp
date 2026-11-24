@@ -33,6 +33,11 @@ vk_fa_dequant_kv ggml_vk_fa_dequant_kv(const vk_device & device, const ggml_tens
                                 (k->nb[1] != (uint64_t)HSK * ggml_type_size(k->type) ||
                                  v->nb[1] != (uint64_t)HSV * ggml_type_size(v->type)) &&
                                 (HSK % 8) == 0 && (HSV % 8) == 0;
+    // CM2 benefits from conversion only when enough query heads reuse each converted KV row.
+    const int64_t kv = k->ne[1];
+    const int64_t qk_ratio = k->ne[2] > 0 ? q->ne[2] / k->ne[2] : 0;
+    const bool cm2_dequant_kv = kv >= 4096 && neq1 >= (kv >= 8192 ? 512 : 1024) &&
+                                neq1 * qk_ratio >= (kv >= 8192 ? 4096 : 8192);
     const size_t scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
     const bool use = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
                      is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
@@ -41,8 +46,7 @@ vk_fa_dequant_kv ggml_vk_fa_dequant_kv(const vk_device & device, const ggml_tens
                      (kv_raw_strided ||
                       (device->pipeline_dequant_transpose[k->type] != nullptr &&
                        device->pipeline_dequant_transpose[v->type] != nullptr)) &&
-                     // coopmat2 path does not benefit from the f16 scratch
-                     !device->coopmat2 &&
+                     (!device->coopmat2 || cm2_dequant_kv) &&
                      // Intel Xe1 regresses, see PR 25494
                      (device->vendor_id != VK_VENDOR_ID_INTEL ||
                       (device->coopmat_support && device->architecture != vk_device_architecture::INTEL_XE1));
@@ -65,9 +69,13 @@ size_t ggml_vk_op_scratch_size(const vk_device & device, const ggml_tensor * dst
         default:
             break;
     }
-    if (scratch != 0 &&
-        ggml_vk_scratch_offset(device, ggml_nbytes(dst)) + scratch > device->max_memory_allocation_size) {
-        return 0;
+    if (scratch != 0) {
+        // Both scratch slices and the output share a single Vulkan allocation.
+        const uint64_t limit = std::min(device->max_buffer_size, device->max_memory_allocation_size);
+        const size_t output = ggml_vk_scratch_offset(device, ggml_nbytes(dst));
+        if (output > limit || scratch > limit - output) {
+            return 0;
+        }
     }
     return scratch;
 }
@@ -95,9 +103,11 @@ bool ggml_vk_scratch_available(const ggml_backend_vk_context * ctx, const ggml_t
     if (scratch == 0) {
         return false;
     }
-    // meta backend (-sm tensor) reserves for the full tensor, slices may not fit
-    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-    return vk_tensor_offset(dst) + ggml_vk_scratch_offset(ctx->device, ggml_nbytes(dst)) + scratch <= buf_ctx->dev_buffer->size;
+    // The backing VkBuffer may also contain other live tensors. Only the bytes reserved
+    // for this tensor at allocation time belong to it.
+    const uintptr_t capacity = reinterpret_cast<uintptr_t>(dst->extra);
+    const size_t output = ggml_vk_scratch_offset(ctx->device, ggml_nbytes(dst));
+    return output <= capacity && scratch <= capacity - output;
 }
 
 vk_subbuffer ggml_vk_scratch_subbuffer(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, size_t offset, size_t size) {

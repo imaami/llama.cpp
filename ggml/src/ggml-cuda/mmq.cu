@@ -288,11 +288,8 @@ void ggml_cuda_mul_mat_q(
     int64_t ncols_opt = ne11;
     if (ids) {
         const int64_t n_expert_used = ids->ne[0];
-        ncols_opt = ne12;
-
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-        }
+        // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
     }
     const auto config = ggml_cuda_mmq_select_launch_config(src0->type, fallback, cc, smpbo, ncols_opt, prec_src1);
     const int J_best = config.J;
@@ -300,9 +297,10 @@ void ggml_cuda_mul_mat_q(
 
     if (!ids) {
         const int ntj = (ne1 + J_best - 1) / J_best;
-
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        const size_t nbytes_src1_q8_1 = ne13*ne12*ne11*ne10_padded*y_block_size/y_values_per_block + src1_q8_1_padding;
+        GGML_ASSERT(!external_q8 || (!swiglu_gate && !use_native_fp4));
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        char * src1_q8_ptr = external_q8 ? (char *) external_q8 : src1_q8_1.alloc(nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
@@ -504,7 +502,7 @@ void ggml_cuda_mul_mat_q_fused_two(
             src0->ne[0], src0->ne[1], dst->ne[1], (int64_t)(src0->nb[1]/ts0), ne11, (int64_t)(dst->nb[1]/sizeof(float)),
             src0->ne[2], ne12, (int64_t)(src0->nb[2]/ts0), stride_q_channel, (int64_t)(dst->nb[2]/sizeof(float)),
             src0->ne[3], ne13, (int64_t)(src0->nb[3]/ts0), stride_q_sample, (int64_t)(dst->nb[3]/sizeof(float)),
-            dst->ne[1], config.J};
+            (dst->ne[1] + config.J - 1)/config.J, config.J};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     };
     launch_one(src0_a, dst_a, config_a);

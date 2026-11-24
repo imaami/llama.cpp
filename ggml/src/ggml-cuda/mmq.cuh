@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "mmid.cuh"
+#include "cp-async.cuh"
 #include "unary.cuh"
 
 #include <climits>
@@ -263,7 +264,7 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         if (prec_src1 != GGML_PREC_Q4 && (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4)) {
             return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
         }
-        if (cc == GGML_CUDA_CC_DGX_SPARK) {
+        if (cc == GGML_CUDA_CC_GB10) {
             return ggml_cuda_mmq_get_config_gb10(type, J, fallback);
         }
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
@@ -300,7 +301,7 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     if (prec_src1 != GGML_PREC_Q4 && (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4)) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
-#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+#if __CUDA_ARCH__ == GGML_CUDA_CC_GB10
     return ggml_cuda_mmq_get_config_gb10(type, J, fallback);
 #else
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
@@ -1000,7 +1001,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
     constexpr int tile_y_stride = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_GB10
     constexpr bool async_buffer_y =
         type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0;
 #else
@@ -1027,8 +1028,20 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
-        {
+        if constexpr (async_buffer_y) {
+            const char * by0 = reinterpret_cast<const char *>(
+                y + ncols_y * (kb0 * qk / ne_block) * sz);
+            char * tile_y_bytes = reinterpret_cast<char *>(tile_y);
+            const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+            for (int byte0 = 16*tid; byte0 < J*MMQ_TILE_Y_K*int(sizeof(int)); byte0 += 16*nwarps*warp_size) {
+                cp_async_cg_16<256>(
+                    ggml_cuda_cvta_generic_to_shared(tile_y_bytes + byte0), by0 + byte0);
+            }
+            load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
+            cp_async_wait_all();
+        } else {
+            load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
@@ -1059,7 +1072,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                         (blocks_per_iter*sizeof(block_q1_0) + hint_stride - 1) / hint_stride;
 #pragma unroll
                     for (int linear = tid; linear < I*hints_per_row; linear += nwarps*warp_size) {
-                        const int row  = min(linear / hints_per_row, tile_x_max_i);
+                        const int row  = min(linear / hints_per_row, tile_x_i_max);
                         const int hint = linear % hints_per_row;
                         const char * next = reinterpret_cast<const char *>(reinterpret_cast<const block_q1_0 *>(x) +
                             offset_x + row*stride_row_x + kb0_next) + hint*hint_stride;
@@ -1571,7 +1584,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     const size_t nbs_y_padded = GGML_PAD(nbs_y, config.nthreads*sizeof(int));
-    const bool async_buffer_y = cc == GGML_CUDA_CC_DGX_SPARK &&
+    const bool async_buffer_y = cc == GGML_CUDA_CC_GB10 &&
         (config.type == GGML_TYPE_Q1_0 || config.type == GGML_TYPE_Q2_0 || config.type == GGML_TYPE_PQ2_0);
     const int y_buffers = async_buffer_y ? 2 : 1;
     return nbs_ids + nbs_x + y_buffers*nbs_y_padded;
