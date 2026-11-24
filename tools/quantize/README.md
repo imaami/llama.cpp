@@ -131,6 +131,13 @@ python convert_hf_to_gguf.py --mmproj --outfile mmproj-gemma-4-E2B-it-Q8_0.gguf 
 ```
 
 ```bash
+# fit unrotated Inkling 2 routed experts to 128-weight PTQ1_0 blocks, using Q8_0 for other eligible tensors
+./llama-quantize --tensor-type 'ffn_(gate_up|down)_exps[.]weight=ptq1_0' Inkling-2-Mini-BF16.gguf Inkling-2-Mini-PTQ1-experts.gguf Q8_0
+```
+
+The explicit Inkling expert override fits one scale per block by least squares. An optional `--imatrix` weights the error by input channel and expert. This conversion is experimental. Evaluate perplexity or KL divergence on representative text before using it.
+
+```bash
 # quantize model setting tensors attn_v and ffn_down to Q5_K_M and pruning layers 20, 21, and 22
 ./llama-quantize --imatrix imatrix.gguf --tensor-type attn_v=q5_k --tensor-type ffn_down=q5_k --prune-layers 20,21,22 input-model-f32.gguf q4_k_m 8
 ```
