@@ -1023,7 +1023,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
     vk_pipeline pipeline_situ;
-    vk_pipeline pipeline_row_l2_clip;
+    std::array<vk_pipeline, 3> pipeline_row_l2_clip; // dynamic width, 16, 128
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;

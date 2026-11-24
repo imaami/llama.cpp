@@ -1,10 +1,12 @@
 #version 450
 
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 // Each workgroup is exactly one subgroup. Inkling clips 16- and 128-column rows.
 layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const uint width = 0;
 layout(binding = 0) readonly  buffer A { float x[]; };
 layout(binding = 1) writeonly buffer D { float y[]; };
 
@@ -18,18 +20,23 @@ layout(push_constant) uniform Params {
 } p;
 
 void main() {
+    const uint cols = width == 0 ? p.cols : width;
     for (uint row = gl_WorkGroupID.x; row < p.rows; row += gl_NumWorkGroups.x) {
-        float values[(128 + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x];
+        float values[((width == 0 ? 128 : width) + gl_WorkGroupSize.x - 1) / gl_WorkGroupSize.x];
         float sum = 0.0;
-        uint base = row * p.cols + gl_LocalInvocationIndex;
-        for (uint col = gl_LocalInvocationIndex, i = 0; col < p.cols; col += gl_WorkGroupSize.x, ++i) {
-            float v = x[p.src_offset + base + i * gl_WorkGroupSize.x];
+        uint base = row * cols;
+        [[unroll]] for (uint i = 0; i < values.length(); ++i) {
+            uint col = gl_LocalInvocationIndex + i * gl_WorkGroupSize.x;
+            float v = col < cols ? x[p.src_offset + base + col] : 0.0;
             values[i] = v;
             sum += v * v;
         }
         float factor = clamp(p.threshold / (sqrt(subgroupAdd(sum)) + p.eps), 0.0, 1.0);
-        for (uint col = gl_LocalInvocationIndex, i = 0; col < p.cols; col += gl_WorkGroupSize.x, ++i) {
-            y[p.dst_offset + base + i * gl_WorkGroupSize.x] = values[i] * factor;
+        [[unroll]] for (uint i = 0; i < values.length(); ++i) {
+            uint col = gl_LocalInvocationIndex + i * gl_WorkGroupSize.x;
+            if (col < cols) {
+                y[p.dst_offset + base + col] = values[i] * factor;
+            }
         }
     }
 }
