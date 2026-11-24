@@ -120,7 +120,7 @@ static dspark_meta read_dspark_meta(const llama_model * model) {
     return m;
 }
 
-static llama_context * make_ctx(llama_model * model, uint32_t n_ctx) {
+static llama_context * make_ctx(llama_model * model, uint32_t n_ctx, llama_context * other = nullptr, int * cdfs = nullptr) {
     llama_context_params cparams  = llama_context_default_params();
     cparams.n_ctx                 = n_ctx;
     cparams.n_batch               = n_ctx;
@@ -128,11 +128,21 @@ static llama_context * make_ctx(llama_model * model, uint32_t n_ctx) {
     cparams.n_seq_max             = 1;
     cparams.n_outputs_max_per_seq = 0;
     cparams.no_perf               = true;
+    cparams.ctx_other             = other;
     if (std::getenv("DSPARK_TEST_NO_FA")) {
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
     if (std::getenv("DSPARK_TEST_TRACE") || std::getenv("DSPARK_TEST_ORACLE")) {
         cparams.cb_eval = trace_node;
+    }
+    if (cdfs) {
+        cparams.cb_eval_user_data = cdfs;
+        cparams.cb_eval = [](ggml_tensor * t, bool ask, void * data) {
+            if (ask && t->op == GGML_OP_CUMSUM) {
+                ++*static_cast<int *>(data);
+            }
+            return false;
+        };
     }
 
     llama_context * ctx = llama_init_from_model(model, cparams);
@@ -303,6 +313,62 @@ static std::vector<float> correction_reference(const llama_model *          mode
         result.insert(result.end(), logits.begin(), logits.end());
     }
     return result;
+}
+
+// Compare both mask positions of the Inkling Markov head against its original packed-draw graph.
+static int test_inkling_greedy(const char * draft_path, const char * target_path) {
+    auto mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    llama_model_ptr target(llama_model_load_from_file(target_path, mp));
+    llama_model_ptr draft(llama_model_load_from_file(draft_path, mp));
+    if (!target || !draft || !draft->hparams.dspark_f_rnn) {
+        fail("expected an Inkling target and its recurrent DSpark draft");
+    }
+
+    llama_context_ptr tgt(make_ctx(target.get(), 32));
+    int cdfs = 0;
+    llama_context_ptr ctx(make_ctx(draft.get(), 32, tgt.get(), &cdfs));
+    llama_set_embeddings_nextn(ctx.get(), true, false);
+    const size_t width = draft->hparams.n_embd;
+    const llama_vocab * vocab = llama_model_get_vocab(draft.get());
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<float> features(draft->hparams.n_embd_inp_enc());
+    for (size_t j = 0; j < features.size(); ++j) {
+        features[j] = float(int(j % 127) - 63) / 64.0f;
+    }
+
+    for (int depth : {1, 2}) {
+        std::vector<float> reference;
+        for (bool greedy : {false, true}) {
+            llama_set_dspark_greedy(ctx.get(), greedy);
+            llama_memory_clear(llama_get_memory(ctx.get()), true);
+            common_batch batch(ctx.get());
+            llama_pos pos[4] = {};
+            batch.add_embd({features.data(), 1, features.size()}, pos, 0, false);
+            GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+            const float * anchor = llama_get_embeddings_nextn(ctx.get());
+            GGML_ASSERT(anchor);
+            std::vector<float> state((1 + depth) * width, 0.0f); // zero inverse temperature selects argmax
+            std::copy_n(anchor, width, state.data());
+            batch.clear();
+            for (int i = 0; i <= depth; ++i) {
+                const int idx = batch.add(i == 0 ? 1 : llama_vocab_mask(vocab), i + 1, 0, true);
+                GGML_ASSERT(batch.set_embd_state(idx, {state.data() + i * width, 1, width}));
+            }
+            cdfs = 0;
+            GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+            const float * logits = llama_get_logits_ith(ctx.get(), 0);
+            if (!logits || cdfs != (greedy ? 0 : depth)) {
+                fail("unexpected Inkling draft outputs or sampling graph");
+            }
+            if (!greedy) {
+                reference.assign(logits, logits + (1 + depth) * n_vocab);
+            } else if (!std::equal(reference.begin(), reference.end(), logits)) {
+                fail("greedy Inkling draft logits differ from the packed-draw graph");
+            }
+        }
+    }
+    return 0;
 }
 
 static int run_tier1(const std::string & model_path, bool metal = false, std::vector<float> * output = nullptr) {
@@ -1159,7 +1225,7 @@ int main(int argc, char ** argv) {
                 "usage: %s <model.gguf> --tier1 | --tier1-metal | --snr-ab-cpu | --snr-ab-metal | --output-ab-cpu | "
                 "--output-ab-metal | --runtime-ab-cpu | --runtime-ab-metal | --runtime-ab-cuda | "
                 "--runtime-bench-metal | --runtime-bench-cuda | --prefix-ab-cpu | --prefix-ab-metal | --prefix-ab-cuda "
-                "| --tier2 <ref.bin>\n",
+                "| --inkling-greedy <target.gguf> | --tier2 <ref.bin>\n",
                 argv[0]);
         return 1;
     }
@@ -1171,7 +1237,12 @@ int main(int argc, char ** argv) {
     const std::string mode       = argv[2];
 
     int rc;
-    if (mode == "--prefix-ab-cpu" || mode == "--prefix-ab-metal" || mode == "--prefix-ab-cuda") {
+    if (mode == "--inkling-greedy") {
+        if (argc != 4) {
+            fail("--inkling-greedy requires the target GGUF");
+        }
+        rc = test_inkling_greedy(argv[1], argv[3]);
+    } else if (mode == "--prefix-ab-cpu" || mode == "--prefix-ab-metal" || mode == "--prefix-ab-cuda") {
         rc = run_prefix_ab(model_path,
                            mode == "--prefix-ab-cpu" ? nullptr : (mode == "--prefix-ab-metal" ? "MTL" : "CUDA"));
     } else if (mode == "--runtime-ab-cpu") {
