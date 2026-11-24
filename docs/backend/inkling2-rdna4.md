@@ -74,9 +74,30 @@ At 131,072 with UD-IQ3_XXS and Q8_0, GPU compute scratch fell from 3,513 to 589 
 
 On the earlier combined build, the gfx1201 memory planner reserved 11,815 MiB of device memory at 32,768 tokens and 13,735 MiB at 131,072 for the UD-IQ3_XXS text target with Q8_0 K/V, compact SWA, one output, and `-b 512 -ub 512`. The 131,072-token plan includes 561 MiB of GPU compute buffers and uses another 398 MiB of host compute buffers.
 
+### 262,144 tokens with DSpark enabled
+
+These plans use stock UD-IQ3_XXS and its separate Q8_0 DSpark GGUF on one gfx1201 device. Both contexts are reserved after enabling target feature capture and the draft sampler, with `-np 1 -fa on -b 512 -ub 128 --spec-draft-n-max 2`. The paired plan includes weights, KV caches, feature buffers and compute scratch. Desktop use and additional driver allocations reduce the available VRAM on a physical card.
+
+| Target K | Target V | Draft K and V | Planned device total |
+| --- | --- | --- | ---: |
+| Q8_0 | Q8_0 | Q4_0 | 16.26 GiB |
+| Q8_0 | Q4_0 | Q4_0 | 15.23 GiB |
+| Q4_0 | Q4_0 | Q4_0 | 14.21 GiB |
+| Q8_0 | PQ2_0M | Q4_0 | 14.66 GiB |
+
+```sh
+build-inkling/bin/llama-server -m inkling-iq3.gguf -md inkling-dspark.gguf \
+    -dev "$dev" -ngl all --spec-draft-device "$dev" --spec-draft-ngl all \
+    --spec-type draft-dspark --spec-draft-n-max 2 \
+    -c 262144 -fa on -np 1 -b 512 -ub 128 -ctk q8_0 -ctv q4_0 \
+    --spec-draft-type-k q4_0 --spec-draft-type-v q4_0 --jinja
+```
+
+Reducing both microbatches to 64 with `-ub 64` brings the Q8_0/Q4_0 target plan to 14.97 GiB. PQ2_0M is an optional CPU/Vulkan KV format from [PrismML #428](https://github.com/PrismML-Eng/llama.cpp/pull/428). Its effect on Inkling’s long-context reasoning has yet to be measured.
+
 ## Measure the card
 
-Build the combined branch’s upstream base `3090e45a8675ebdefbc722f80609c75e5fa259ad` with the same compiler, Vulkan SDK and Release options. Set `baseline` and `patched` to the resulting build directories. This measures prefill and decode at several occupied-context depths separately.
+Build the combined branch’s upstream base `33aeb17f85869279e3821f746bc645357139bc2c` with the same compiler, Vulkan SDK and Release options. Set `baseline` and `patched` to the resulting build directories. This measures prefill and decode at several occupied-context depths separately.
 
 ```sh
 for build in "$baseline" "$patched"; do
