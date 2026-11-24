@@ -8,6 +8,8 @@ cmake --build build-inkling -j --target llama-server llama-bench llama-fit-param
 build-inkling/bin/llama-server --list-devices
 ```
 
+Set `-DLLAMA_BUILD_UI=ON` at configure time to embed this branch’s chat UI, including its optional parallel MCP calls.
+
 Select the device ID reported for the 9070 XT. On a dual-GPU system, pass it explicitly to both the target and the drafter. The examples below use `Vulkan0`.
 
 ## Model and launch
@@ -36,6 +38,8 @@ For a Bonsai 2 GGUF that includes MTP weights, use the same server binary with t
 build-inkling/bin/llama-server -m "$bonsai_mtp" -dev "$dev" -ngl all \
     -fa on -np 1 -c 131072 --spec-type draft-mtp --spec-draft-n-max 1
 ```
+
+Bonsai uses upstream recurrent replay by default. On a single sequence, Qwen3.5 with CPU or Vulkan can use `GGML_GDN_STATE_SNAPSHOTS=1` to keep recent states on device for rollback. This trades cache memory for less replay work during verification.
 
 ## What fits
 
