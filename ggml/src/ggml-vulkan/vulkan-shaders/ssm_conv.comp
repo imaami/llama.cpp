@@ -8,19 +8,21 @@ layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
 layout(constant_id = 2) const bool APPLY_BIAS = false;
 layout(constant_id = 3) const bool APPLY_SILU = false;
+layout(constant_id = 4) const bool APPLY_RES_SCALE = false;
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer Src0 { float src0[]; };
 layout(binding = 1) readonly buffer Src1 { float src1[]; };
-layout(binding = 2) readonly buffer Bias { float bias[]; };
+layout(binding = 2) readonly buffer Addend { float addend[]; };
 layout(binding = 3) buffer Dst { float dst[]; };
 
 layout(push_constant) uniform PushConstants {
     uint nb01; uint nb02;
     uint nb11;
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
-    uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+    uint nc; uint nr; uint n_t; uint n_s;
+    float scale;
 };
 
 void main() {
@@ -49,12 +51,16 @@ void main() {
     }
 
     if (APPLY_BIAS) {
-        sum += bias[i1];
+        sum += addend[i1];
     }
     if (APPLY_SILU) {
         sum = sum / (1.0f + exp(-sum));
     }
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
+    if (APPLY_RES_SCALE) {
+        precise float residual_sum = sum + addend[dst_idx];
+        sum = residual_sum * scale + 0.0f;
+    }
     dst[dst_idx] = sum;
 }

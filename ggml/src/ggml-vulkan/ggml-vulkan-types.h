@@ -602,6 +602,7 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 6, 0, 5 }, // top_k->src[0]   == add
 };
 
+static constexpr std::initializer_list<ggml_op> ssm_conv_res_scale_pattern { GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE };
 static constexpr std::initializer_list<ggml_op> rms_norm_scale_pattern { GGML_OP_RMS_NORM, GGML_OP_SCALE };
 
 static constexpr std::initializer_list<ggml_op> rms_norm_mul_add_mul_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
@@ -1070,6 +1071,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32[3];
     vk_pipeline pipeline_ssm_conv_silu_f32[3];
     vk_pipeline pipeline_ssm_conv_bias_silu_f32[3];
+    vk_pipeline pipeline_ssm_conv_res_scale_f32[3];
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
