@@ -3170,16 +3170,24 @@ struct test_argmax : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
 
+    const bool offset_view;
+
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, offset_view);
     }
 
     test_argmax(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 100, 1, 1}, bool offset_view = false)
+        : type(type), ne(ne), offset_view(offset_view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_tensor * a;
+        if (offset_view) {
+            ggml_tensor * rows = ggml_new_tensor_2d(ctx, type, ne[0], ne[1] + 1);
+            a = ggml_view_2d(ctx, rows, ne[0], ne[1], rows->nb[1], rows->nb[1]);
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+        }
         ggml_set_name(a, "a");
 
         ggml_tensor * out = ggml_argmax(ctx, a);
@@ -11992,6 +12000,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {354,   2, 1, 1}, true));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
