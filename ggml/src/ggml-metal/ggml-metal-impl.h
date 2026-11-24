@@ -146,6 +146,9 @@
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
 #define FC_GROUP_NORM                  2500
+#define FC_GATED_DELTA_NET_ROWS        (FC_GATED_DELTA_NET + 6)
+#define FC_GATED_DELTA_NET_WRITE_ROWS  (FC_GATED_DELTA_NET + 4)
+#define FC_GATED_DELTA_NET_RAW_GATES   (FC_GATED_DELTA_NET + 5)
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8

@@ -216,8 +216,8 @@ void main() {
                     if (idx + tid < Bc * Br) {
                         uint32_t kcol;
                         bool kv_active = fa_kv_index(j * Bc + c, kcol);
-                        if (kv_active && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = mask_zero ? FLOAT_TYPE(0) : FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + kcol]);
+                        if (kv_active && (PACK_GQA_TOKENS ? r < N : (!nem1_bounds_check || i * Br + r < p.nem1))) {
+                            FLOAT_TYPE m = mask_zero ? FLOAT_TYPE(0) : FLOAT_TYPE(data_m[m_offset + fa_mask_row_offset(i * Br + r) + kcol]);
                             max_mask = max(max_mask, float(m));
                             if (USE_BIAS) {
                                 uint32_t bq, bh;
@@ -228,9 +228,9 @@ void main() {
                             masksh[c * masksh_stride + r] = m;
                         } else {
 #if defined(FLOAT16)
-                            masksh[c * masksh_stride + r] = USE_SPARSE ? FLOAT_TYPE(NEG_FLT16_MAX) : FLOAT_TYPE(0);
+                            masksh[c * masksh_stride + r] = (USE_SPARSE || PACK_GQA_TOKENS) ? FLOAT_TYPE(NEG_FLT16_MAX) : FLOAT_TYPE(0);
 #else
-                            masksh[c * masksh_stride + r] = USE_SPARSE ? FLOAT_TYPE(NEG_FLT_MAX_OVER_2) : FLOAT_TYPE(0);
+                            masksh[c * masksh_stride + r] = (USE_SPARSE || PACK_GQA_TOKENS) ? FLOAT_TYPE(NEG_FLT_MAX_OVER_2) : FLOAT_TYPE(0);
 #endif
                         }
                     }

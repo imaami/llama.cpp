@@ -11486,7 +11486,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_state = dst->src[5];
 
     // raw gates: beta and g arrive pre-activation (see ggml_gated_delta_net_set_raw_gates)
-    const bool    raw_gates   = ggml_get_op_params_i32(dst, 1) != 0;
+    const bool    raw_gates   = ggml_gdn_has_raw_gates(dst);
     const float * raw_dt_bias = raw_gates ? (const float *) dst->src[7]->data : nullptr;
     const float * raw_a       = raw_gates ? (const float *) dst->src[8]->data : nullptr;
 
@@ -11520,16 +11520,16 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
-    // rows mode (src[6] set): state is a 2D cache view (D, n_rows) and each
+    // rows mode: state is a 2D cache view (D, n_rows) and each
     // sequence's live state is read at row rows[seq] -- no gathered scratch.
-    const ggml_tensor * src_rows = dst->src[6];
+    const ggml_tensor * src_rows = ggml_gdn_has_rows(dst) ? dst->src[6] : nullptr;
     const int32_t * state_rows_idx = src_rows ? (const int32_t *) src_rows->data : nullptr;
     // scratch mode: per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_rows ? 0 : (int64_t) (src_state->nb[3] / sizeof(float));
     const int64_t state_row_size   = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float)) : 0;
 
     // replay: pending tokens to run before the new ones (see ggml_gated_delta_net_ext)
-    const ggml_tensor * src_pk    = dst->src[6];
+    const ggml_tensor * src_pk    = ggml_gdn_has_replay(dst) ? dst->src[6] : nullptr;
     const ggml_tensor * src_pv    = dst->src[7];
     const ggml_tensor * src_pgb   = dst->src[8];
     const ggml_tensor * src_n_rep = dst->src[9];

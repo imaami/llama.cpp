@@ -723,8 +723,14 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             const size_t  type_size = ggml_type_size(info.t.type);
             const int64_t blck_size = ggml_blck_size(info.t.type);
 
+            if (type_size == 0 || blck_size == 0) {
+                GGML_LOG_ERROR("%s: tensor '%s' has unsupported ggml type %d\n", __func__, info.t.name, type);
+                ok = false;
+                break;
+            }
+
             // check that row size is divisible by block size
-            if (blck_size == 0 || info.t.ne[0] % blck_size != 0) {
+            if (info.t.ne[0] % blck_size != 0) {
                 GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
                     "not a multiple of block size (%" PRId64 ")\n",
                     __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type), info.t.ne[0], blck_size);
@@ -1438,6 +1444,7 @@ void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggm
     const size_t  type_size = ggml_type_size(type);
     const int64_t blck_size = ggml_blck_size(type);
 
+    GGML_ASSERT(type_size > 0 && blck_size > 0 && "unsupported ggml type");
     tensor->type = type;
     GGML_ASSERT(tensor->ne[0] % blck_size == 0 && "tensor row size not divisible by block size of new type");
 

@@ -182,7 +182,7 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 }
 #endif
 
-#if defined(DATA_A_Q2_0)
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
 struct a_tile {
     i32vec4 qs;
     FLOAT_TYPE dm;

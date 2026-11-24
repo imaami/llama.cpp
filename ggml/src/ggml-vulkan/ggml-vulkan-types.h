@@ -571,6 +571,8 @@ static constexpr std::initializer_list<ggml_op> situ_pattern {
     GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL,
 };
 
+static constexpr std::initializer_list<ggml_op> l2_norm_scale_pattern { GGML_OP_L2_NORM, GGML_OP_SCALE };
+
 static constexpr std::initializer_list<ggml_op> row_l2_clip_pattern {
     GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE, GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL,
 };
@@ -728,16 +730,6 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 };
 
 class vk_memory_logger;
-
-// FWHT block widths with a dedicated Vulkan pipeline. The subgroup shader pins its
-// block to the subgroup width, so it keeps n/subgroup_size values per invocation;
-// widths that push that past GGML_VK_FWHT_MAX_SUBGROUP_EL_W stage through shared
-// memory instead. The cutoff has to key on that ratio and not on n alone, because a
-// device reporting a narrow subgroup reaches the same register wall at a smaller n.
-static constexpr uint32_t GGML_VK_FWHT_NUM_SIZES         = 8;
-static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_N    = 2048;
-static constexpr uint32_t GGML_VK_FWHT_MAX_SUBGROUP_EL_W = 64;
-static constexpr uint32_t GGML_VK_FWHT_ROWS              = 4;
 
 struct vk_device_struct {
     std::recursive_mutex mutex;
@@ -897,6 +889,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32_iq3_xxs_tpb8[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32_iq3_xxs_tpb8[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
     uint32_t dmmv_tpb8_min_blocks[DMMV_WG_SIZE_COUNT];
+    vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32_x[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_ext_cols - mul_mat_vec_max_cols];
+    vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32_x[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_ext_cols - mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
@@ -963,6 +957,7 @@ struct vk_device_struct {
     std::array<vk_pipeline, 3> pipeline_rms_norm[2][2];
     // [src/dst 0=fp32,1=bf16][residual 0=fp32,1=bf16][post mul]
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add[2][2][2];
+    std::array<vk_pipeline, 3> pipeline_rms_norm_scale_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
@@ -1017,7 +1012,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
     vk_pipeline pipeline_fwht_f32[num_fwht_pipelines];
     vk_pipeline pipeline_fwht_f16[num_fwht_pipelines];
-    uint32_t    fwht_rows_per_wg[num_fwht_pipelines] = {};
+    vk_pipeline pipeline_fwht_signed_f32[num_fwht_pipelines];
+    vk_pipeline pipeline_fwht_swiglu_f32[num_fwht_pipelines];
+    vk_pipeline pipeline_fwht_q8_f32[num_fwht_pipelines];
+    vk_pipeline pipeline_fwht_signed_q8_f32[num_fwht_pipelines];
+    vk_pipeline pipeline_fwht_swiglu_q8_f32[num_fwht_pipelines];
+    uint32_t fwht_rows_per_wg[num_fwht_pipelines] = {};
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -1041,7 +1041,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
     vk_pipeline pipeline_situ;
-    std::array<vk_pipeline, 3> pipeline_row_l2_clip; // dynamic width, 16, 128
+    std::array<vk_pipeline, 3> pipeline_row_l2_clip[2]; // dynamic width, 16, 128
     vk_pipeline pipeline_snake_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
@@ -1058,6 +1058,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_delta_net_cm_v32[2];
     vk_pipeline pipeline_gated_delta_net_cm_v128[2];
     vk_pipeline pipeline_ssm_scan_f32_d96;
+    vk_pipeline pipeline_gated_delta_net_rows[4][3];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     // [0] = general token tile, [1/2] = one/two-token tiles

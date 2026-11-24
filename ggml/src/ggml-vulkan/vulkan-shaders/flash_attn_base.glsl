@@ -33,6 +33,8 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
 const bool USE_BIAS        = BiasBins != 0;
+// Each tile contains two query tokens, with GQA heads contiguous within a token.
+const bool PACK_GQA_TOKENS = (Flags & 256) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

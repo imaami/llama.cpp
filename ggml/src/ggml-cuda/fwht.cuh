@@ -16,7 +16,7 @@ __device__ __forceinline__ void ggml_cuda_fwht_block_butterfly(float * reg, floa
 #pragma unroll
         for (int j = 0; j < NE; j++) {
             const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
+            const float val2 = ggml_cuda_shfl_xor(val, h, warp_size);
             reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
         }
     }

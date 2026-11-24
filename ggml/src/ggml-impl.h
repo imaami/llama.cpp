@@ -166,6 +166,25 @@ static int32_t ggml_get_op_params_i32(const struct ggml_tensor * tensor, uint32_
     return ((const int32_t *)(tensor->op_params))[i];
 }
 
+// GATED_DELTA_NET reuses sources 6..8 for indexed state rows and raw gates
+// only outside replay. Preserve slots 0..4 of the replay/rollback contract.
+enum {
+    GGML_GDN_PARAM_ROWS      = 5,
+    GGML_GDN_PARAM_RAW_GATES = 6,
+};
+
+static inline bool ggml_gdn_has_rows(const struct ggml_tensor * op) {
+    return ggml_get_op_params_i32(op, GGML_GDN_PARAM_ROWS) != 0;
+}
+
+static inline bool ggml_gdn_has_raw_gates(const struct ggml_tensor * op) {
+    return ggml_get_op_params_i32(op, GGML_GDN_PARAM_RAW_GATES) != 0;
+}
+
+static inline bool ggml_gdn_has_replay(const struct ggml_tensor * op) {
+    return op->src[9] != NULL;
+}
+
 static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t i) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(float));
     return ((const float *)(tensor->op_params))[i];
