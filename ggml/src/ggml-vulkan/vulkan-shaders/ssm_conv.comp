@@ -25,6 +25,11 @@ layout(push_constant) uniform PushConstants {
     float scale;
 };
 
+float add_scale(float conv, float residual) {
+    precise float value = conv + residual;
+    return value * scale + 0.0f;
+}
+
 void main() {
     const uint i1 = gl_GlobalInvocationID.x;
     const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
@@ -59,8 +64,7 @@ void main() {
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
     if (APPLY_RES_SCALE) {
-        precise float residual_sum = sum + addend[dst_idx];
-        sum = residual_sum * scale + 0.0f;
+        sum = add_scale(sum, addend[dst_idx]);
     }
     dst[dst_idx] = sum;
 }
