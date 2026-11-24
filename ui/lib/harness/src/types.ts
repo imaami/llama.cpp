@@ -69,6 +69,10 @@ export interface ToolResult {
 
 export interface Tool {
   definition: ToolDefinition;
+  /** Calls to distinct groups may overlap. An ungrouped call is a serial barrier. */
+  parallelGroup?: string;
+  /** Resolve permissions in call order before starting any tool in the batch. */
+  prepare?(call: ToolCall, signal?: AbortSignal): Promise<void>;
   /** Run the call. Reject with an AbortError to end the run, with any other error to report it to the model. */
   execute(call: ToolCall, context: ToolContext): Promise<ToolResult>;
 }

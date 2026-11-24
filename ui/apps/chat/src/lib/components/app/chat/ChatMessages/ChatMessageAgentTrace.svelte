@@ -126,8 +126,8 @@
 		return pending ? parseExecShellCommandMeta(pending)?.command : undefined;
 	});
 
-	const currentlyExecutingToolCallId = $derived(
-		isStreaming ? agenticStore.getExecutingToolCallId(message.convId) : null
+	const currentlyExecutingToolCallIds = $derived(
+		isStreaming ? agenticStore.getExecutingToolCallIds(message.convId) : []
 	);
 
 	// Cwd the agentic loop passes to tool calls in this conversation; the exec
@@ -206,7 +206,7 @@
 	// happening. It sits where the next row will land, so that row replaces
 	// it and the stats below stay put.
 	const showStatus = $derived(
-		currentlyExecutingToolCallId === null &&
+		currentlyExecutingToolCallIds.length === 0 &&
 			!visiblePermission &&
 			!showContinue &&
 			showsReplyStatus(statusText, sections.at(-1), isStreaming)
@@ -217,7 +217,9 @@
 	const statusInGroup = $derived(showStatus && Array.isArray(lastItem));
 
 	function isExecutingCall(section: AgenticSection): boolean {
-		return section.toolCallId !== undefined && section.toolCallId === currentlyExecutingToolCallId;
+		return (
+			section.toolCallId !== undefined && currentlyExecutingToolCallIds.includes(section.toolCallId)
+		);
 	}
 
 	function isExpanded(index: number, section: AgenticSection, inOpenGroup = false): boolean {
@@ -230,7 +232,7 @@
 
 		return isSectionExpandedByDefault(section, {
 			alwaysShowToolCallContent,
-			executingToolCallId: currentlyExecutingToolCallId,
+			executingToolCallId: isExecutingCall(section) ? section.toolCallId : null,
 			showThoughtInProgress,
 			showToolCallInProgress
 		});
@@ -302,7 +304,7 @@
 		{@const groupOpen = isGroupExpanded(item)}
 		<ChatMessageToolCallGroup
 			elapsedStartedAt={item === lastItem ? taskStartedAt : null}
-			executingToolCallId={currentlyExecutingToolCallId}
+			executingToolCallId={item.map((i) => sections[i]).findLast(isExecutingCall)?.toolCallId}
 			{isStreaming}
 			onToggle={() => toggleGroupExpanded(item)}
 			open={groupOpen}
