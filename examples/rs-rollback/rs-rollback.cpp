@@ -1,16 +1,6 @@
-// Correctness harness for the recurrent-state snapshot ring (n_rs_seq > 0).
-//
-// A forward-only generation never reads the snapshot slots back, so it cannot
-// catch a bad snapshot write. This does:
-//
-//   pass A (reference): greedily generate N tokens straight through.
-//   pass B (rollback):  generate the same N tokens, but every S tokens
-//                       over-generate by R, then llama_memory_seq_rm() those R
-//                       positions away and re-generate them.
-//
-// Pass B only lands on the same tokens if the state restored from the snapshot
-// ring is exactly the state that produced them the first time. Any error in the
-// conv-window or SSM snapshot write shows up as a token mismatch.
+// Compare greedy decoding with and without periodic partial rollback.
+// Each verification batch contains the accepted anchor followed by hypothetical draft tokens.
+// Discarding those drafts must preserve the reference greedy token stream on every sequence.
 #include "llama.h"
 #include "common.h"
 
@@ -40,7 +30,7 @@ int main(int argc, char ** argv) {
     int         n_predict = 128;
     int         stride    = 16;  // roll back every `stride` accepted tokens
     int         rewind    = 4;   // how many tokens to discard and re-generate
-    int         n_rs_seq  = 8;   // snapshot ring depth; must be >= rewind + 1
+    int         n_rs_seq  = 8;   // maximum number of tokens to discard
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) {
@@ -59,6 +49,11 @@ int main(int argc, char ** argv) {
     }
     if (model_path.empty()) {
         fprintf(stderr, "usage: %s -m model.gguf [-n N] [-s stride] [-r rewind] [-k n_rs_seq]\n", argv[0]);
+        return 1;
+    }
+
+    if (rewind <= 0 || stride <= 0 || n_predict <= 0 || n_rs_seq < rewind) {
+        fprintf(stderr, "rewind, stride and length must be positive, and -k must cover -r\n");
         return 1;
     }
 
@@ -90,6 +85,11 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "failed to create context\n");
             return false;
         }
+        if ((uint64_t) n_rs_seq + 1 >= llama_n_ubatch(ctx) || llama_n_rs_seq(ctx) < (uint32_t) rewind) {
+            fprintf(stderr, "rollback depth must fit the model, batch and micro-batch\n");
+            llama_free(ctx);
+            return false;
+        }
         llama_memory_t mem = llama_get_memory(ctx);
 
         common_batch batch = common_batch_get_one(ctx, ptoks);
@@ -104,43 +104,27 @@ int main(int argc, char ** argv) {
             llama_token tok = greedy(ctx, vocab);
             out.push_back(tok);
 
-            batch = common_batch_get_one(ctx, &tok, 1);
+            ++since;
+            const bool verify = with_rollback && since >= stride && (int) out.size() + rewind < n_predict;
+            batch.clear();
+            batch.add(tok, n_pos++, 0, true);
+            if (verify) {
+                // Rollback is bounded by the last verification micro-batch. Only the
+                // accepted anchor produces logits; they remain valid after trimming.
+                for (int r = 0; r < rewind; ++r) {
+                    batch.add(tok, n_pos + r, 0, false);
+                }
+            }
             if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
                 fprintf(stderr, "decode failed\n");
                 return false;
             }
-            n_pos++;
-            since++;
-
-            if (with_rollback && since >= stride && (int) out.size() + rewind < n_predict) {
-                n_rollbacks++;
-                // over-generate `rewind` tokens, then throw them away
-                for (int r = 0; r < rewind; r++) {
-                    llama_token t = greedy(ctx, vocab);
-                    batch         = common_batch_get_one(ctx, &t, 1);
-                    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
-                        fprintf(stderr, "decode(draft) failed\n");
-                        return false;
-                    }
-                    n_pos++;
-                }
-                // Drop the drafts AND the last accepted token in one go, then
-                // re-decode the accepted token so the logits are valid again.
-                // This forces the state to be restored from a snapshot taken
-                // (rewind + 1) steps back -- needs n_rs_seq >= rewind + 1.
-                const llama_pos keep = n_pos - rewind - 1;
-                if (!llama_memory_seq_rm(mem, 0, keep, -1)) {
-                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d n_pos=%d rewind=%d\n", keep, n_pos, rewind);
+            if (verify) {
+                if (!llama_memory_seq_rm(mem, 0, n_pos, -1)) {
+                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d rewind=%d\n", n_pos, rewind);
                     return false;
                 }
-                n_pos = keep;
-
-                batch = common_batch_get_one(ctx, &out.back(), 1);
-                if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
-                    fprintf(stderr, "decode(replay) failed\n");
-                    return false;
-                }
-                n_pos++;
+                ++n_rollbacks;
                 since = 0;
             }
         }

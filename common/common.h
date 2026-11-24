@@ -427,7 +427,8 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE  ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3  ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||

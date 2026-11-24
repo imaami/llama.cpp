@@ -147,6 +147,30 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
+    for (const auto & ldev : model.devices) {
+        if (ldev.dev == nullptr) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name == nullptr) {
+            gdn_state_rows_dev_ok = false;
+            gdn_raw_gates_dev_ok  = false;
+            break;
+        }
+        // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
+        const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        if (is_gpu && strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "Vulkan") != 0) {
+            gdn_state_rows_dev_ok = false;
+        }
+        if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
+            strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 &&
+            strcmp(reg_name, "Vulkan") != 0 && strcmp(reg_name, "CPU") != 0) {
+            gdn_raw_gates_dev_ok = false;
+        }
+    }
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -444,6 +468,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
+    // The fused GDN path consumes raw projections; the chunked path keeps the activated gates.
+    static const bool raw_gates_disable = getenv("GGML_GDN_RAW_GATES_DISABLE") != nullptr;
+    if (!cparams.rs_replay && ggml_is_contiguous(beta_raw) && ggml_is_contiguous(alpha) && !raw_gates_disable && gdn_raw_gates_dev_ok &&
+        model.layers[il].ssm_dt && model.layers[il].ssm_dt->type == GGML_TYPE_F32 &&
+        model.layers[il].ssm_a  && model.layers[il].ssm_a->type  == GGML_TYPE_F32) {
+        gdn_raw_beta    = beta_raw;
+        gdn_raw_alpha   = ggml_reshape_4d(ctx0, alpha, 1, num_v_heads, n_seq_tokens, n_seqs);
+        gdn_raw_dt_bias = model.layers[il].ssm_dt;
+        gdn_raw_a       = model.layers[il].ssm_a;
+    } else {
+        gdn_raw_beta = gdn_raw_alpha = gdn_raw_dt_bias = gdn_raw_a = nullptr;
+    }
+
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
@@ -470,7 +507,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const bool gdn_rows_plain_ok = cparams.gdn_rows_plain && mctx_cur->get_n_rs() == (uint32_t) n_seqs &&
         (cparams.gdn_rows_plain_max_tokens <= 0 || n_seq_tokens <= cparams.gdn_rows_plain_max_tokens);
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && n_seqs == 1 && (cparams.n_rs_seq > 0 || gdn_rows_plain_ok);
+    const bool gdn_state_rows = !cparams.rs_replay && gdn_state_rows_env && gdn_state_rows_dev_ok && n_seqs == 1 && (cparams.n_rs_seq > 0 || gdn_rows_plain_ok);
 
     ggml_tensor * state;
     if (gdn_state_rows) {

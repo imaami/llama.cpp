@@ -453,6 +453,8 @@ static ggml_type fallback_type_for(const ggml_type target_type) {
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_XS: return GGML_TYPE_IQ4_NL;
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_PTQ1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -3123,6 +3125,7 @@ ggml_type llama_ftype_get_default_type(const llama_ftype ftype) {
         // Ternary quants
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   return GGML_TYPE_TQ2_0;
+        case LLAMA_FTYPE_MOSTLY_PTQ1_0:  return GGML_TYPE_PTQ1_0;
         // Lattice and Non-linear quants
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: return GGML_TYPE_IQ2_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  return GGML_TYPE_IQ2_XS;

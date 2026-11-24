@@ -43,7 +43,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * v,
                 ggml_tensor * g,
                 ggml_tensor * b,
-                ggml_tensor * s);
+                ggml_tensor * s,
+                ggml_tensor * state_rows = nullptr);
 
     // read conv state from cache, concat with qkv_mixed, write back (single slot or per-token)
     // qkv_mixed: (qkv_dim, n_seq_tokens, n_seqs); returns conv_input: (kernel_size + n_seq_tokens - 1, channels, n_seqs)
@@ -83,7 +84,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            ggml_tensor *        state_rows = nullptr);
 
     // rs_replay variants: replay the kept pending tokens, then keep or commit the new ones [TAG_RECURRENT_REPLAY]
     // x: [channels, n_seq_tokens, n_seqs] new conv inputs; returns [n_conv + n_seq_tokens, channels, n_seqs]
@@ -653,6 +655,24 @@ struct llama_model_vllm_decision2 : public llama_model_qwen3 {
         ggml_tensor * build_head(ggml_tensor * hidden, input_decision * inp);
 
         const llama_model_vllm_decision2 & model;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+// dspark: EAGLE-style block-diffusion speculative-decoding drafter. Trunk is a
+// small dense Qwen3-style stack (standard llama_layer attn_*/ffn_* tensors);
+// the graph is genuinely novel per-layer (target-tap context re-projected fresh
+// through each layer's own k_proj/v_proj, concatenated with the draft block's
+// own K/V) -- see src/models/dspark.cpp.
+struct llama_model_dspark : public llama_model_base {
+    llama_model_dspark(const struct llama_model_params & params) : llama_model_base(params) {}
+
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -1688,7 +1708,7 @@ struct llama_model_dflash : public llama_model_base {
         void          build_inject_ctx_mix();
         void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
-        ggml_tensor * build_layers(ggml_tensor * inp_tokens);
+        ggml_tensor * build_layers(ggml_tensor * inp_tokens, ggml_tensor ** anchor_embd = nullptr);
         ggml_tensor * build_logits(ggml_tensor * cur);
         ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il);
     };
@@ -2870,6 +2890,9 @@ struct llama_model_qwen35 : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
+        // device-dependent path choices, scanned once per graph build (not per layer)
+        bool gdn_state_rows_dev_ok = true;
+        bool gdn_raw_gates_dev_ok  = true;
     private:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,

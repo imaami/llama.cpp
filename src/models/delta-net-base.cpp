@@ -11,7 +11,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * v,
         ggml_tensor * g,
         ggml_tensor * b,
-        ggml_tensor * s) {
+        ggml_tensor * s,
+        ggml_tensor * state_rows) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
@@ -30,10 +31,23 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(g->ne[0] == 1   || g->ne[0] == S_v);
     GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
-    GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+    if (!state_rows) {
+        GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+    }
 
-    // output carries the final state. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, nullptr, nullptr, nullptr, nullptr, false);
+    // The recurrent cache can roll back only an entire short verification ubatch.
+    // Longer prefills store the final state alone (matching rs_max in find_slot).
+    const int64_t max_slots = (int64_t) cparams.n_rs_seq + 1;
+    const int64_t slots = state_rows && n_tokens <= max_slots ? n_tokens : 1;
+    const bool raw = gdn_raw_alpha != nullptr;
+    ggml_tensor * gate = raw ? gdn_raw_alpha : g;
+    ggml_tensor * beta = raw ? gdn_raw_beta : b;
+    ggml_tensor * result = state_rows
+        ? ggml_gated_delta_net_rows(ctx0, q, k, v, gate, beta, s, state_rows, slots)
+        : ggml_gated_delta_net_ext(ctx0, q, k, v, gate, beta, s, nullptr, nullptr, nullptr, nullptr, false);
+    if (raw) {
+        ggml_gated_delta_net_set_raw_gates(result, gdn_raw_dt_bias, gdn_raw_a);
+    }
     ggml_tensor * output = ggml_view_4d(ctx0, result,
             S_v, H_v, n_tokens, n_seqs,
             ggml_row_size(result->type, S_v),
@@ -41,7 +55,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
 
     ggml_tensor * new_state = ggml_view_4d(ctx0, result,
-            S_v, S_v, H_v, n_seqs,
+            S_v, S_v, H_v, n_seqs * slots,
             ggml_row_size(result->type, S_v),
             ggml_row_size(result->type, S_v * S_v),
             ggml_row_size(result->type, S_v * S_v * H_v),
@@ -248,22 +262,30 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        ggml_tensor *        state_rows) {
     if (cparams.rs_replay) {
         return build_recurrent_attn_replay(inp, ssm_states_all, q, k, v, g, b, s, il);
     }
 
-    // a rollback replays the kept tokens, the gdn op does not write state snapshots
-    GGML_ASSERT(cparams.n_rs_seq == 0);
+    GGML_ASSERT(cparams.n_rs_seq == 0 || (state_rows && q->ne[3] == 1));
 
     const auto    kv_head = inp->mctx->get_head();
-    const int64_t n_seqs  = s->ne[3];
+    const int64_t n_seqs  = q->ne[3];
 
-    auto attn_out = build_delta_net(q, k, v, g, b, s);
+    auto attn_out = build_delta_net(q, k, v, g, b, s, state_rows);
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
+
+    if (state_rows) {
+        const int64_t slots = new_state->ne[3] / n_seqs;
+        ggml_tensor * rows = build_rs_write_rows(inp, slots, q->ne[2], n_seqs);
+        ggml_tensor * snap = ggml_reshape_2d(ctx0, new_state, hparams.n_embd_s(), slots*n_seqs);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ssm_states_all, snap, rows));
+        return output;
+    }
 
     ggml_build_forward_expand(gf,
             ggml_cpy(ctx0, new_state,

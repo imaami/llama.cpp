@@ -1640,9 +1640,19 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
+    const auto allowed_effort = [&](const std::string & effort) {
+        const auto & allow = opt.reasoning_effort_allow;
+        if (effort == "none" || allow.empty() || std::find(allow.begin(), allow.end(), effort) != allow.end()) {
+            return effort;
+        }
+        SRV_INF("reasoning_effort \"%s\" is not in --reasoning-effort-allow: using \"%s\"\n", effort.c_str(), opt.reasoning_effort_fallback.c_str());
+        return opt.reasoning_effort_fallback;
+    };
+
     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
-    if (body.contains("reasoning_effort")) {
-        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+    const std::string requested_effort = json_value(body, "reasoning_effort", std::string());
+    if (!requested_effort.empty()) {
+        const std::string reasoning_effort = allowed_effort(requested_effort);
         const auto levels = caps.at("reasoning_effort_levels").get<std::vector<std::string>>();
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
@@ -1652,30 +1662,20 @@ json oaicompat_chat_params_parse(
             } else {
                 inputs.chat_template_kwargs.erase("reasoning_effort");
             }
-        } else if (!reasoning_effort.empty()) {
+        } else {
             const auto rejected = caps.at("reasoning_effort_rejected").get<std::vector<std::string>>();
             if (std::find(rejected.begin(), rejected.end(), reasoning_effort) != rejected.end()) {
                 throw std::invalid_argument("reasoning_effort \"" + reasoning_effort + "\" is not supported by the chat template, supported levels: " + string_join(levels, ", "));
             }
+            inputs.enable_thinking = true;
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
-    }
-
-    // Replace unsupported effort values before a template can reject the request.
-    if (!opt.reasoning_effort_allow.empty()) {
+    } else if (!opt.reasoning_effort_allow.empty()) {
         auto it = inputs.chat_template_kwargs.find("reasoning_effort");
         if (it != inputs.chat_template_kwargs.end()) {
-            std::string effort;
-            try {
-                effort = json::parse(it->second).get<std::string>();
-            } catch (...) {
-                effort = it->second;
-            }
-            const auto & allow = opt.reasoning_effort_allow;
-            if (std::find(allow.begin(), allow.end(), effort) == allow.end()) {
-                SRV_INF("reasoning_effort \"%s\" is not in --reasoning-effort-allow: using \"%s\"\n", effort.c_str(), opt.reasoning_effort_fallback.c_str());
-                it->second = json(opt.reasoning_effort_fallback).dump();
-            }
+            const auto value = json::parse_no_throw(it->second);
+            const auto effort = value.is_string() ? value.get<std::string>() : it->second;
+            it->second = json(allowed_effort(effort)).dump();
         }
     }
 

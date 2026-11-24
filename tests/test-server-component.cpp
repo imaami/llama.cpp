@@ -936,6 +936,23 @@ static void test_pcm_f32_to_s16(testing & t) {
     t.assert_true ("empty",          pcm_f32_to_s16(nullptr, 0).empty());
 }
 
+static void test_speculative_stats(testing & t) {
+    server_slot_stats stats;
+    t.assert_true("disabled counters absent", !stats.to_json().contains("draft_n"));
+
+    stats.speculative = true;
+    auto counters = stats.to_json();
+    t.assert_equal("enabled draft count", uint64_t(0), counters.at("draft_n").get<uint64_t>());
+    t.assert_equal("enabled acceptance count", uint64_t(0), counters.at("draft_n_accepted").get<uint64_t>());
+
+    stats.speculative = false;
+    stats.n_draft_tokens = 5;
+    stats.n_draft_accepted = 3;
+    counters = stats.to_json();
+    t.assert_equal("completed draft count", uint64_t(5), counters.at("draft_n").get<uint64_t>());
+    t.assert_equal("completed acceptance count", uint64_t(3), counters.at("draft_n_accepted").get<uint64_t>());
+}
+
 int main(int argc, char ** argv) {
     testing t;
 

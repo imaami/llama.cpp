@@ -204,11 +204,11 @@ ggml_tensor * llama_model_dflash::build_dspark_inp_block(const llm_graph_context
 
     if (block_drafts == 0 || n_tokens % n_blocks != 0 || block_drafts > (int64_t) g.hparams.dflash_block_size) {
         // not a draft block (e.g. graph reserve)
-        return ggml_get_rows(ctx0, tok_embd, inp_tokens);
+        return g.build_embd_rows(tok_embd, inp_tokens);
     }
 
     ggml_tensor * anchors = ggml_view_2d(ctx0, inp_tokens, 1, n_blocks, (size_t) block_drafts * inp_tokens->nb[0], 0);
-    anchors = ggml_get_rows(ctx0, tok_embd, ggml_cont_1d(ctx0, anchors, n_blocks));
+    anchors = g.build_embd_rows(tok_embd, ggml_cont_1d(ctx0, anchors, n_blocks));
     if (model.tok_norm) {
         anchors = g.build_norm(anchors, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
     }
@@ -550,7 +550,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llm_graph_params & params) :
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inpL = build_embd_rows(tok_embd, inp->tokens);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -697,7 +697,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llm_graph_params & params) :
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    ggml_tensor * inpL = build_embd_rows(tok_embd, inp->tokens);
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));

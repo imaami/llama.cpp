@@ -217,6 +217,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-batch-alloc.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-kv-cache.cpp LABEL behavior)
     target_include_directories(test-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-dfly-fusion.cpp  LABEL behavior)
     llama_build_and_test(test-chat.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -378,6 +379,7 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 llama_build_and_test(test-quantize-target.cpp  LABEL "main behavior backend"  LINK llama)
+llama_build_and_test(test-mtp-catchup-batch.cpp  LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-mtp-window.cpp LABEL "model behavior"

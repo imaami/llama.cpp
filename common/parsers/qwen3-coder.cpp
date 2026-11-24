@@ -157,7 +157,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             // AC stops at the first complete delimiter, so consume the optional newline outside it.
             auto arg_suffix = p.optional(p.literal("\n"));
             auto arg_string = p.rule("xml-arg-string",
-                p.through(p.tool_arg_string_value(p.until("\n</parameter>\n")), arg_close));
+                p.through(p.tool_arg_string_value(p.until_one_of(arg_close_delims)), arg_close) + arg_suffix);
 
             auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
 

@@ -551,7 +551,7 @@ static bool parse_target_exclude(const char * data, std::vector<ggml_type> & tar
         if (type == GGML_TYPE_COUNT) {
             const bool numeric = !token.empty() && std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isdigit(c); });
             const long ordinal = numeric ? std::strtol(token.c_str(), nullptr, 10) : -1;
-            if (ordinal >= 0 && ordinal < GGML_TYPE_COUNT) {
+            if (ordinal >= 0 && ordinal < GGML_TYPE_COUNT && ggml_blck_size((ggml_type)ordinal) > 0) {
                 type = (ggml_type)ordinal;
             }
         }
