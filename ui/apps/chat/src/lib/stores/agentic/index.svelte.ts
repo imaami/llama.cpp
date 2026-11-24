@@ -91,7 +91,7 @@ import { SvelteMap } from 'svelte/reactivity';
 function createDefaultSession(): AgenticSession {
 	return {
 		currentTurn: 0,
-		executingToolCallId: null,
+		executingToolCallIds: [],
 		flowRootMessageId: null,
 		isRunning: false,
 		lastError: null,
@@ -225,6 +225,7 @@ class AgenticStore {
 
 		return {
 			enabled: hasTools && DEFAULT_AGENTIC_CONFIG.enabled,
+			parallelToolCalls: settings.agenticParallelToolCalls === true,
 			maxTurns
 		};
 	}
@@ -233,8 +234,8 @@ class AgenticStore {
 		return this.sessions.get(conversationId)?.currentTurn ?? 0;
 	}
 
-	getExecutingToolCallId(conversationId: string): string | null {
-		return this.sessions.get(conversationId)?.executingToolCallId ?? null;
+	getExecutingToolCallIds(conversationId: string): string[] {
+		return this.sessions.get(conversationId)?.executingToolCallIds ?? [];
 	}
 
 	// read-only: safe to call from derivations, unlike getSession
@@ -553,7 +554,7 @@ class AgenticStore {
 		};
 		const executionResult = await mcpStore.executeTool(mcpCall, signal);
 
-		return { content: executionResult.content, isError: false };
+		return executionResult;
 	}
 
 	/**
@@ -589,11 +590,37 @@ class AgenticStore {
 		const startedAt = this.sessions.get(conversationId)?.startedAt ?? Date.now();
 		const effectiveModel = options.model || modelsStore.models[0]?.model || '';
 		const harness = createHarness(this.inferenceClient(options, conversationId));
-		const harnessTools: Tool[] = tools.map((definition) => ({
-			definition,
-			execute: (toolCall, context) =>
-				this.executeTool({ callbacks, context, conversationId, effectiveModel, toolCall })
-		}));
+		const permissions = new WeakMap<ToolCall, ToolPermissionDecision>();
+		const harnessTools: Tool[] = tools.map((definition) => {
+			const name = definition.function.name;
+			return {
+				definition,
+				parallelGroup:
+					agenticConfig.parallelToolCalls && toolsStore.getToolSource(name) === ToolSource.MCP
+						? mcpStore.getToolServer(name)
+						: undefined,
+				prepare: async (toolCall, signal) => {
+					const decision = await this.gates.requestPermission(
+						conversationId,
+						name,
+						toolsStore.getToolServerLabel(name),
+						toolCall.id,
+						signal
+					);
+					permissions.set(toolCall, decision);
+					await new Promise((resolve) => setTimeout(resolve, 0));
+				},
+				execute: (toolCall, context) =>
+					this.executeTool({
+						callbacks,
+						context,
+						conversationId,
+						effectiveModel,
+						toolCall,
+						permission: permissions.get(toolCall)!
+					})
+			};
+		});
 		// result messages of streaming tools, created while the tool runs, by tool call id
 		const streamedResults = new SvelteMap<string, { content: string; messageId: string }>();
 		const events = harness.run(toAgenticMessages(messages) as Message[], harnessTools, signal, {
@@ -775,22 +802,9 @@ class AgenticStore {
 		conversationId: string;
 		effectiveModel: string;
 		toolCall: ToolCall;
+		permission: ToolPermissionDecision;
 	}): Promise<ToolResult> {
-		const { callbacks, context, conversationId, effectiveModel, toolCall } = params;
-		const toolName = toolCall.function.name;
-		const serverLabel = toolsStore.getToolServerLabel(toolName);
-		// Ask for permission before executing the tool
-		const permission = await this.gates.requestPermission(
-			conversationId,
-			toolName,
-			serverLabel,
-			toolCall.id,
-			context.signal
-		);
-
-		// Yield to allow Svelte to flush the UI update (hide permission dialog)
-		await new Promise((r) => setTimeout(r, 0));
-
+		const { callbacks, context, conversationId, effectiveModel, toolCall, permission } = params;
 		throwIfAborted(context.signal);
 
 		// the time waiting for permission does not count
@@ -800,7 +814,9 @@ class AgenticStore {
 
 		// Streaming tools (currently only exec_shell_command): mark
 		// the session so the matching renderer can switch to live mode.
-		this.updateSession(conversationId, { executingToolCallId: toolCall.id });
+		this.updateSession(conversationId, {
+			executingToolCallIds: [...this.getExecutingToolCallIds(conversationId), toolCall.id]
+		});
 
 		try {
 			execution =
@@ -821,7 +837,11 @@ class AgenticStore {
 				isError: true
 			};
 		} finally {
-			this.updateSession(conversationId, { executingToolCallId: null });
+			this.updateSession(conversationId, {
+				executingToolCallIds: this.getExecutingToolCallIds(conversationId).filter(
+					(id) => id !== toolCall.id
+				)
+			});
 		}
 
 		const durationMs = performance.now() - toolStartTime;

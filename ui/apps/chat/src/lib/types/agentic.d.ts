@@ -89,11 +89,8 @@ export interface AgenticSession {
 	lastError: Error | null;
 	streamingToolCall: { name: string; arguments: string } | null;
 	pendingPermissionRequest: PendingPermissionRequest | null;
-	/** ID of the tool call whose output is currently being streamed back
-	 *  (e.g. exec_shell_command outputting to /tools?stream=true). Lets the
-	 *  matching tool renderer flip into live-update mode while chunks
-	 *  arrive; cleared when the tool's terminal event lands. */
-	executingToolCallId: string | null;
+	/** IDs of calls executing in this conversation. */
+	executingToolCallIds: string[];
 	/** Live LLM token totals of the running flow: completed turns plus the
 	 *  in-flight turn's streamed counts; null when idle. */
 	liveLlm: ChatMessageAgenticTimings['llm'] | null;

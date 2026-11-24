@@ -48,6 +48,43 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// Start immediately, buffering only the latest progress update until the consumer is ready.
+function startTool(toolCall: ToolCall, tool: Tool | undefined, signal?: AbortSignal) {
+  let pending: string | undefined;
+  let settled = false;
+  let wake: (() => void) | undefined;
+  const started = performance.now();
+  let duration = 0;
+  const notify = () => {
+    wake?.();
+    wake = undefined;
+  };
+  const result: Promise<ToolResult> = Promise.resolve().then(async () => {
+    if (!tool) return { content: `Error: Unknown tool: ${toolCall.function.name}`, isError: true };
+    const context = { signal, update(content: string) { pending = content; notify(); } };
+    return tool.execute(toolCall, context);
+  }).finally(() => {
+    duration = performance.now() - started;
+    settled = true;
+    notify();
+  });
+  // An overlapping tool can fail before we have consumed the preceding tool's result.
+  result.catch(() => {});
+
+  async function* updates() {
+    while (pending !== undefined || !settled) {
+      if (pending === undefined) {
+        await new Promise<void>((resolve) => (wake = resolve));
+      } else {
+        const content = pending;
+        pending = undefined;
+        yield { content, toolCall, type: "tool_update" } as const;
+      }
+    }
+  }
+  return { result, updates, toolCall, elapsed: () => duration };
+}
+
 /**
  * The default loop: stream a turn, run the tools the model called, give it the results, and repeat until it answers
  * without a tool call. It keeps no state between runs and stores nothing: the app owns the conversation.
@@ -235,9 +272,7 @@ async function* run(
       tool_calls: toolCalls,
     });
 
-    for (let i = 0; i < toolCalls.length; i++) {
-      const toolCall = toolCalls[i];
-
+    for (let i = 0; i < toolCalls.length;) {
       if (signal?.aborted) {
         yield done("aborted");
 
@@ -263,97 +298,82 @@ async function* run(
         break;
       }
 
-      yield { toolCall, type: "tool_call" };
-
-      const tool = toolsByName.get(toolCall.function.name);
-      const startTime = performance.now();
-
-      let result: ToolResult;
-
-      if (!tool) {
-        result = { content: `Error: Unknown tool: ${toolCall.function.name}`, isError: true };
-      } else {
-        // only the latest update matters, so a slow consumer skips the ones in between
-        let pendingUpdate: string | undefined;
-        let settled = false;
-        let wake: (() => void) | undefined;
-
-        const notify = () => {
-          wake?.();
-          wake = undefined;
-        };
-        const execution = Promise.resolve()
-          .then(() =>
-            tool.execute(toolCall, {
-              signal,
-              update: (updated) => {
-                pendingUpdate = updated;
-                notify();
-              },
-            }),
-          )
-          .finally(() => {
-            settled = true;
-            notify();
-          });
-
-        // the rejection is handled below, after the updates are drained
-        execution.catch(() => {});
-
-        while (true) {
-          if (pendingUpdate !== undefined) {
-            const updated = pendingUpdate;
-
-            pendingUpdate = undefined;
-            yield { content: updated, toolCall, type: "tool_update" };
-          } else if (settled) {
-            break;
-          } else {
-            await new Promise<void>((resolve) => (wake = resolve));
-          }
-        }
-
-        try {
-          result = await execution;
-        } catch (error) {
-          if (isAbortError(error)) {
-            yield done("aborted");
-
-            return;
-          }
-
-          result = { content: `Error: ${errorMessage(error)}`, isError: true };
-        }
+      const groups = new Set<string>();
+      let end = i;
+      while (end < toolCalls.length) {
+        const group = toolsByName.get(toolCalls[end].function.name)?.parallelGroup;
+        if (!group || groups.has(group)) break;
+        groups.add(group);
+        end++;
       }
-
-      const durationMs = Math.round(result.durationMs ?? performance.now() - startTime);
-      const timing = {
-        duration_ms: durationMs,
-        name: toolCall.function.name,
-        success: !result.isError,
-      };
-
-      totals.toolCalls.push(timing);
-      totals.toolCallsCount++;
-      totals.toolsMs += durationMs;
-      stats.toolCalls.push(timing);
-      stats.toolsMs += durationMs;
-
-      if (signal?.aborted) {
-        yield done("aborted");
-
+      const batch = toolCalls.slice(i, Math.max(end, i + 1));
+      try {
+        for (const call of batch) {
+          yield { toolCall: call, type: "tool_call" };
+          await toolsByName.get(call.function.name)?.prepare?.(call, signal);
+          if (signal?.aborted || interrupted()) break;
+        }
+      } catch (error) {
+        if (signal?.aborted || isAbortError(error)) yield done("aborted");
+        else yield { error: new Error(errorMessage(error)), timings: runTimings(), type: "error" };
         return;
       }
+      if (signal?.aborted || interrupted()) continue;
 
-      yield { result, skipped: false, toolCall, type: "tool_result" };
+      const running = batch.map((call) => startTool(call, toolsByName.get(call.function.name), signal));
+      let batchDuration = 0;
+      let aborted = false;
+      try {
+        for (const { toolCall, result: execution, updates, elapsed } of running) {
+          yield* updates();
+          let result: ToolResult;
+          try {
+            result = await execution;
+          } catch (error) {
+            if (isAbortError(error)) {
+              aborted = true;
+              continue;
+            }
+            result = { content: `Error: ${errorMessage(error)}`, isError: true };
+          }
+          const durationMs = Math.round(result.durationMs ?? elapsed());
+          batchDuration = Math.max(batchDuration, durationMs);
+          const timing = {
+            duration_ms: durationMs,
+            name: toolCall.function.name,
+            success: !result.isError,
+          };
 
-      history.push({
-        content: result.parts?.length
-          ? [{ text: result.content, type: "text" }, ...result.parts]
-          : result.content,
-        role: "tool",
-        tool_call_id: toolCall.id,
-      });
+          totals.toolCalls.push(timing);
+          totals.toolCallsCount++;
+          stats.toolCalls.push(timing);
+
+          if (signal?.aborted && batch.length === 1) {
+            aborted = true;
+            continue;
+          }
+
+          yield { result, skipped: false, toolCall, type: "tool_result" };
+
+          history.push({
+            content: result.parts?.length
+              ? [{ text: result.content, type: "text" }, ...result.parts]
+              : result.content,
+            role: "tool",
+            tool_call_id: toolCall.id,
+          });
+        }
+      } finally {
+        // The app may release its server connections as soon as the iterator closes.
+        await Promise.allSettled(running.map(({ result }) => result));
+      }
+      totals.toolsMs += batchDuration;
+      stats.toolsMs += batchDuration;
+      if (aborted || signal?.aborted) {
+        yield done("aborted");
+        return;
+      }
+      i += batch.length;
     }
 
     if (stats.toolCalls.length > 0) {
