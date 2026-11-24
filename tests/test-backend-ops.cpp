@@ -13526,6 +13526,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }
 
+    // Partial cooperative-matrix tiles with valid cells in both the last row and last column.
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
+        for (int n : {9, 24}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 33, n, 256, {1, 1}, {1, 1}));
+        }
+    }
     // PTQ1_0 integer-dot mat-vec: Bonsai-2 shapes, odd row counts (row tail), batches and multi-column B
     for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
         for (int64_t k : {1024, 5120, 6144, 17408}) {

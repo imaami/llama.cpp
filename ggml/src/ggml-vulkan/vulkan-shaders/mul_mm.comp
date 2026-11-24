@@ -552,32 +552,24 @@ void main() {
                     coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
                 }
             } else {
-                const bool is_aligned = p.stride_d % 4 == 0;  // Assumption: D_TYPE == float
-                const bool is_in_bounds = dr + (cm_row + 1) * TM <= p.M && dc + (cm_col + 1) * TN <= p.N;
-
-                if (is_aligned && is_in_bounds) {
-                    // Full coopMat is within bounds and stride_d is aligned with 16B
-                    coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
-                } else if (is_in_bounds) {
-                    // Full coopMat is within bounds, but stride_d is not aligned
+                // Stage boundary tiles in workgroup-uniform control flow. With divergent
+                // subgroup stores, some drivers leave valid output cells unwritten.
+                const bool direct = p.stride_d % 4 == 0 && (ir + 1) * BM <= p.M && (ic + 1) * BN <= p.N;
+                const uint dst_m = dr + cm_row * TM;
+                const uint dst_n = dc + cm_col * TN;
+                if (direct) {
+                    coopMatStore(cm_dtype, data_d, offsets + dst_n * p.stride_d + dst_m, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+                } else {
                     coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
-
-                    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-                    [[unroll]] for (uint col = 0; col < TN; col += storestride) {
-                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
-                    }
-                    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-                } else if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
-                    // Partial coopMat is within bounds
-                    coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
-
-                    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
-                    [[unroll]] for (uint col = 0; col < TN; col += storestride) {
-                        if (dr + cm_row * TM + store_r < p.M && dc + cm_col * TN + col + store_c < p.N) {
-                            data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    barrier();
+                    [[unroll]] for (uint elem = tiw; elem < TM * TN; elem += WARP) {
+                        const uint m = dst_m + elem % TM;
+                        const uint n = dst_n + elem / TM;
+                        if (m < p.M && n < p.N) {
+                            data_d[offsets + n * p.stride_d + m] = D_TYPE(coopmat_stage[warp_i * TM * TN + elem]);
                         }
                     }
-                    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+                    barrier();
                 }
             }
         }
