@@ -3082,25 +3082,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
-            const int n_seq_in_batch = std::count_if(i_batch_beg.begin(), i_batch_beg.end(),
-                    [](int32_t beg) { return beg >= 0; });
-
-            // Keep a copy of the shifted target rows: flushing an older stash reuses batch.
-            deferred_rows next;
-            if (!dev_rows) {
-                next.tokens.reserve(n_tokens);
-                next.pos.reserve(n_tokens);
-                next.h.resize((size_t) n_tokens * n_embd);
-                for (int k = 0; k < n_tokens; ++k) {
-                    const auto & token = batch_in.tokens[k];
-                    const float * h_row = k == i_batch_beg[token.seq_id]
-                        ? pending_h[token.seq_id].data()
-                        : h_tgt + (size_t) (k - 1) * n_embd;
-                    next.tokens.push_back(token.id);
-                    next.pos.push_back(token.pos[0]);
-                    std::memcpy(next.h.data() + (size_t) k * n_embd, h_row, row_bytes);
-                }
-            }
+            const auto host_row = [&](int32_t row, llama_seq_id seq_id) -> const float * {
+                return row == i_batch_beg[seq_id] ? pending_h[seq_id].data() : h_tgt + (size_t) (row - 1) * n_embd;
+            };
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 auto & d = deferred[seq_id];
@@ -3120,13 +3104,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // common_batch::has_embd() only describes the first row. A later embedded
             // row must not enter deferred_rows, which stores token IDs and scalar positions.
-            const bool has_embd = std::any_of(batch_in.tokens.begin(), batch_in.tokens.end(),
-                    [](const common_batch::token & t) { return t.embd.data != nullptr; });
-            if (can_defer() && !has_embd && n_seq_in_batch == 1 && n_tokens <= this->params.n_max + 1) {
-                const llama_seq_id seq_id = batch_in.tokens[0].seq_id;
+            const auto deferred_seq = batch_in.tokens.front().seq_id;
+            if (can_defer() && n_tokens <= (int64_t) params.n_max + 1 &&
+                    std::all_of(batch_in.tokens.begin(), batch_in.tokens.end(), [&](const common_batch::token & t) {
+                        return t.seq_id == deferred_seq && t.embd.data == nullptr;
+                    })) {
+                auto & next = deferred[deferred_seq];
+                next.tokens.resize(n_tokens);
+                next.pos.resize(n_tokens);
+                next.h.resize((size_t) n_tokens * n_embd);
+                for (int32_t k = 0; k < n_tokens; ++k) {
+                    next.tokens[k] = batch_in.tokens[k].id;
+                    next.pos[k] = batch_in.tokens[k].pos[0];
+                    std::memcpy(next.h.data() + (size_t) k * n_embd, host_row(k, deferred_seq), row_bytes);
+                }
                 next.n_valid = n_tokens;
                 next.pending = true;
-                deferred[seq_id] = std::move(next);
+                next.catchup_failed = false;
             } else {
                 auto * mem_dft = llama_get_memory(ctx_dft);
 
@@ -3158,7 +3152,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                                 const int32_t row = end == i_batch_beg[t.seq_id] ? n_batch_tgt + t.seq_id : end - 1;
                                 batch.set_embd_state_row(idx, row);
                             } else {
-                                batch.set_embd_state(idx, { next.h.data() + (size_t) end * n_embd, 1, (size_t) n_embd });
+                                batch.set_embd_state(idx, { host_row(end, t.seq_id), 1, (size_t) n_embd });
                             }
                             ++end;
                         }
