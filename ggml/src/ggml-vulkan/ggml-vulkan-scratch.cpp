@@ -10,7 +10,17 @@ size_t ggml_vk_scratch_offset(const vk_device & device, size_t nbytes) {
     return ggml_vk_align_size(nbytes, ggml_vk_scratch_align(device));
 }
 
-vk_fa_dequant_kv ggml_vk_fa_dequant_kv(const vk_device & device, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
+vk_fa_dequant_kv ggml_vk_fa_dequant_kv(const vk_device & device, const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+
+    // Read long quantized caches directly in RDNA4 indexed attention. Expanding Inkling's
+    // full-context K/V at 128K requires 512 MiB per operation; compact windows keep the copy path.
+    if (device->architecture == AMD_RDNA4 && k->ne[1] > 4096 && ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        return { false, false, 0 };
+    }
+
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
         return t->nb[0] == ggml_type_size(t->type) &&
                t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
@@ -58,7 +68,7 @@ size_t ggml_vk_op_scratch_size(const vk_device & device, const ggml_tensor * dst
     size_t scratch = 0;
     switch (dst->op) {
         case GGML_OP_FLASH_ATTN_EXT: {
-            const vk_fa_dequant_kv dkv = ggml_vk_fa_dequant_kv(device, dst->src[0], dst->src[1], dst->src[2]);
+            const vk_fa_dequant_kv dkv = ggml_vk_fa_dequant_kv(device, dst);
             if (dkv.use) {
                 const size_t k_sz = (size_t)ggml_nelements(dst->src[1]) * dkv.scratch_ts;
                 const size_t v_sz = (size_t)ggml_nelements(dst->src[2]) * dkv.scratch_ts;

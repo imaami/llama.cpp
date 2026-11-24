@@ -9335,7 +9335,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const bool f32acc = !ctx->device->fp16 || !ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst)) || k->type == GGML_TYPE_BF16;
 
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
-    const vk_fa_dequant_kv dkv = ggml_vk_fa_dequant_kv(ctx->device, q, k, v);
+    const vk_fa_dequant_kv dkv = ggml_vk_fa_dequant_kv(ctx->device, dst);
     const bool   kv_raw_strided = dkv.raw_strided;
     const size_t kv_scratch_ts  = dkv.scratch_ts;
     const bool   use_dequant_kv = dkv.use && ggml_vk_scratch_available(ctx, dst);
