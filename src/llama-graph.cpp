@@ -2642,6 +2642,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
+                    // Schedule the second view of the packed projection before the activation, so both
+                    // inputs are available to backends that fuse the following elementwise operations.
+                    if (gate_up_exps) {
+                        ggml_build_forward_expand(gf, up);
+                    }
                     ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                     act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
                     if (lb > 0.0f) {

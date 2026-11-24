@@ -713,6 +713,14 @@ struct vk_op_conv_transpose_1d_push_constants {
     int32_t s0;
 };
 
+struct vk_op_situ_push_constants {
+    uint32_t cols;
+    uint32_t rows;
+    uint32_t gate_stride, up_stride;
+    uint32_t gate_offset, up_offset, dst_offset;
+    float    gate_in_scale, gate_out_scale, up_in_scale, up_out_scale;
+};
+
 struct vk_op_row_l2_clip_push_constants {
     uint32_t cols;
     uint32_t rows;

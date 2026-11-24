@@ -4739,6 +4739,30 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+struct test_situ_fuse : public test_case {
+    const int64_t cols;
+    const bool reuse_gate_act;
+    test_situ_fuse(int64_t cols, bool reuse_gate_act) : cols(cols), reuse_gate_act(reuse_gate_act) {}
+
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "SITU_FUSE"; }
+    std::string vars() override { return VARS_TO_STR2(cols, reuse_gate_act); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * projection = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * cols, 8, 3);
+        ggml_tensor * gate = ggml_view_3d(ctx, projection, cols, 8, 3, projection->nb[1], projection->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, projection, cols, 8, 3, projection->nb[1], projection->nb[2], cols * sizeof(float));
+        if (gf) {
+            ggml_build_forward_expand(gf, up);
+        }
+        ggml_tensor * capped = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f / 4.0f)), 4.0f);
+        ggml_tensor * act = ggml_mul(ctx, capped, ggml_sigmoid(ctx, gate));
+        up = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f / 25.0f)), 25.0f);
+        ggml_tensor * dst = ggml_mul(ctx, act, up);
+        return reuse_gate_act ? ggml_add(ctx, dst, capped) : dst;
+    }
+};
+
 // Inkling 2 clips query, key and relative-position projections by their row L2 norms.
 struct test_row_l2_clip : public test_case {
     const int64_t cols;
@@ -11317,6 +11341,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    test_cases.emplace_back(new test_situ_fuse(1152, false));
+    test_cases.emplace_back(new test_situ_fuse(131, false));
+    test_cases.emplace_back(new test_situ_fuse(131, true));
 
     test_cases.emplace_back(new test_row_l2_clip(16, 0.5f));
     test_cases.emplace_back(new test_row_l2_clip(128, 0.75f));
