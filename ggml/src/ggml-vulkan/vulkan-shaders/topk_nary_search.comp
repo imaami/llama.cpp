@@ -29,6 +29,8 @@ layout (push_constant) uniform parameter {
     uint nrows;
     uint first_pass;
     uint last_pass;
+    uint src_offset;
+    uint dst_offset;
 } p;
 
 // pairs of (gid, value)
@@ -62,7 +64,7 @@ void topk(const uint row) {
             const uint row_offset = row * p.ncols_input;
             // NaN ranks lowest, like -inf, so that every value has a place in
             // the ordering the search below counts
-            float a = float(data_a[row_offset + gl_GlobalInvocationID.x]);
+            float a = float(data_a[p.src_offset + row_offset + gl_GlobalInvocationID.x]);
             if (isnan(a)) {
                 a = uintBitsToFloat(0xFF800000);
             }
@@ -240,7 +242,7 @@ void topk(const uint row) {
         if (p.last_pass != 0) {
             if (gl_GlobalInvocationID.x < p.ncols_input) {
                 const uint row_offset = row * p.k;
-                data_d[row_offset + tid] = dst_row[tid].x;
+                data_d[p.dst_offset + row_offset + tid] = dst_row[tid].x;
             }
         } else {
             if (gl_WorkGroupID.x * p.k + tid < p.ncols_output) {

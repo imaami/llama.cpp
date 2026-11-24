@@ -12604,6 +12604,9 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
     uint32_t nrows = ggml_nrows(src0);
     uint32_t k = dst->ne[0];
 
+    const uint32_t src_offset = get_misalign_bytes(ctx, src0) / (uint32_t)sizeof(float);
+    const uint32_t dst_offset = get_misalign_bytes(ctx, dst) / (uint32_t)sizeof(int32_t);
+
     // tournament path is faster where it fits; use radix-select only past its k limit
     const uint32_t k_min_pipeline = std::max((uint32_t) log2f(float(k)) + 1, ctx->device->subgroup_size_log2);
     if (k_min_pipeline >= num_topk_pipelines || ctx->device->pipeline_topk_f32[k_min_pipeline] == nullptr) {
@@ -12614,22 +12617,22 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
             ggml_vk_sync_buffers(ctx, subctx);
         }
 
-        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0 };
+        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0, src_offset, dst_offset };
         std::array<uint32_t, 3> elements {
             pipeline->wg_denoms[0],
             std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
             1,
         };
         // the non-QSA path only uses bindings 0/1; bind valid buffers for the unused QSA slots
-        vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0);
-        vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+        vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
+        vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst, true);
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { src0_buf, dst_buf, src0_buf, src0_buf, src0_buf }, pc, elements);
         return;
     }
 
-    vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0 };
+    vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0, src_offset, dst_offset };
 
     if (ctx->prealloc_x_need_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
@@ -12707,13 +12710,13 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
 
         if (num_elements == ncols) {
             pc2.first_pass = 1;
-            src_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+            src_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
         } else {
             src_buf = { ctx->prealloc_x, dbl_buf_index * dbl_buf_size, dbl_buf_size };
         }
         if (num_dst_elements == k) {
             pc2.last_pass = 1;
-            dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+            dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
         } else {
             dst_buf = { ctx->prealloc_x, (dbl_buf_index ^ 1) * dbl_buf_size, dbl_buf_size };
         }
@@ -12766,7 +12769,7 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream };
+    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream, 0, 0 };
     std::array<uint32_t, 3> elements {
         pipeline->wg_denoms[0],
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -17267,6 +17270,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_TOP_K:
             {
                 if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0])) {
+                    return false;
+                }
+                // An unaligned tensor view extends its descriptor back to the preceding aligned offset.
+                const auto & limits = device->properties.limits;
+                if (!device->shader_64b_indexing && ggml_nbytes(op->src[0]) >
+                        limits.maxStorageBufferRange - (limits.minStorageBufferOffsetAlignment - 1)) {
                     return false;
                 }
                 // large k falls back to radix-select
