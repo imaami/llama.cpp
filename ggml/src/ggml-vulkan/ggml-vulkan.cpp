@@ -15437,7 +15437,7 @@ static bool ggml_vk_can_fuse_situ(const ggml_backend_vk_context * ctx, const ggm
         }
     }
     for (int j = 0; j < 8; ++j) {
-        if (n[j]->view_src) {
+        if (n[j]->view_src || n[j] == up) {
             return false;
         }
     }
