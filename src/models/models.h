@@ -2549,7 +2549,14 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        struct mix_bank {
+            ggml_tensor * states;
+            ggml_tensor * states_t;
+        };
+
+        ggml_tensor * normalize_state(ggml_tensor * cur);
+        mix_bank prepare_mix(ggml_tensor * blocks, ggml_tensor * normalized_cur);
+        ggml_tensor * mix(const mix_bank & bank, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
@@ -2568,10 +2575,10 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [LOOP_CTRL_COUNT, n_embd, n_tokens] are mixed into its inputs
-        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
+        // cache slot il of physical layer ip; each controller message mixes into its own input
+        ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, ggml_tensor * & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
-        void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
+        void build_output(ggml_tensor * cur, ggml_tensor * blocks);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_rs                  * recr = nullptr;
