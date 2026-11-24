@@ -742,6 +742,7 @@ struct vk_op_row_l2_clip_push_constants {
     uint32_t dst_offset;
     float    eps;
     float    threshold;
+    float    bias;
 };
 
 struct vk_op_snake_push_constants {

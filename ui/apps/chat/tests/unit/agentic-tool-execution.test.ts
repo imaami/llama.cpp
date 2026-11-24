@@ -97,7 +97,7 @@ function result(content: string, isError = false): ToolExecutionResult {
 
 function start(names: string[], callbacks: AgenticFlowCallbacks = {}, signal?: AbortSignal) {
 	vi.mocked(toolsStore.getEnabledToolsForLLM).mockReturnValue(
-		names.map((name) => ({ function: { name }, type: ToolCallType.FUNCTION }))
+		names.map((name) => ({ function: { name, parameters: {} }, type: ToolCallType.FUNCTION }))
 	);
 	const calls: ApiChatCompletionToolCall[] = names.map((name, i) => ({
 		function: { arguments: '{}', name },

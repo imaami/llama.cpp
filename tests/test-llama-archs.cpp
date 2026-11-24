@@ -1625,7 +1625,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             const double nmse_mtp = check_mtp_masked_rows(model_and_ctx_mtp.first.get(), model_and_ctx_mtp.second.get(), tokens);
                             snprintf(mtp_str, sizeof(mtp_str), "(%.2e)", nmse_mtp);
                             status_mtp = "\033[1;32mOK\033[0m";
-                            if (nmse_mtp > 1e-4) {
+                            if (!(nmse_mtp <= 1e-4)) {
                                 test_ok = false;
                                 status_mtp = "\033[1;31mFAIL\033[0m";
                             }
