@@ -617,7 +617,7 @@ class AgenticStore {
 						conversationId,
 						effectiveModel,
 						toolCall,
-						permission: permissions.get(toolCall)!
+						permission: permissions.get(toolCall) ?? ToolPermissionDecision.DENY
 					})
 			};
 		});
