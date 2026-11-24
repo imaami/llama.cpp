@@ -2167,6 +2167,7 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         }
 
         if (has_markov_context) {
+            llama_set_dspark_greedy(this->params.ctx_dft, !this->params.probabilistic);
             ctx_rows = (size_t) block_size + 1;
             ctx_embd.resize((size_t) n_seq * ctx_rows * (size_t) n_embd_dec);
             ctx_pos.assign((size_t) n_seq * ctx_rows, -1);

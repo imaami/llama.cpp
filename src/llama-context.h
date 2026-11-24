@@ -128,6 +128,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_dspark_greedy(bool value);
 
     // register the ordered set of intermediate layers to capture. pass an empty
     // list to disable. the concatenation order follows the order of layer_ids.

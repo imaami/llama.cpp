@@ -1519,6 +1519,13 @@ void llama_context::set_embeddings(bool value) {
     cparams.embeddings = value;
 }
 
+void llama_context::set_dspark_greedy(bool value) {
+    if (cparams.dspark_greedy != value) {
+        cparams.dspark_greedy = value;
+        sched_need_reserve = true;
+    }
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -5053,6 +5060,10 @@ float * llama_get_embeddings_capture_ith(llama_context * ctx, int32_t i) {
 }
 
 // dspark drafter target-context staging C API --------------------------------
+
+void llama_set_dspark_greedy(llama_context * ctx, bool value) {
+    ctx->set_dspark_greedy(value);
+}
 
 void llama_set_dspark_ctx(llama_context * ctx,
                           const float *   feat,

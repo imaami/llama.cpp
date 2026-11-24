@@ -189,6 +189,9 @@ LLAMA_API float * llama_get_embeddings_capture(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_capture_ith(struct llama_context * ctx, int32_t i);
 
 //
+// Greedy Inkling DSpark proposals need logits only. Injection still exports the Markov context.
+LLAMA_API void llama_set_dspark_greedy(struct llama_context * ctx, bool value);
+
 // dspark drafter: target-tap context window staging
 //
 // The dspark speculative-decoding drafter (EAGLE-style, block-diffusion) attends

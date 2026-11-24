@@ -37,6 +37,7 @@ struct llama_cparams {
 
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
+    bool dspark_greedy = false;   // Inkling DSpark proposals only need the Markov argmax between block positions
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
 
     // multi-layer hidden-state tap (EAGLE3 / dspark target-feature reuse)
